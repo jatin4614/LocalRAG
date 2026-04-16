@@ -1,0 +1,21 @@
+"""Application settings loaded from environment."""
+from __future__ import annotations
+
+from functools import lru_cache
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=None, case_sensitive=False, extra="ignore")
+
+    database_url:   str = Field(..., alias="DATABASE_URL")
+    redis_url:      str = Field(..., alias="REDIS_URL")
+    qdrant_url:     str = Field(..., alias="QDRANT_URL")
+    session_secret: str = Field(..., alias="SESSION_SECRET", min_length=32)
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()  # type: ignore[call-arg]  # fields populated from env
