@@ -72,3 +72,52 @@ async def test_delete_kb(client):
     assert r.status_code == 204
     r = await client.get(f"/api/kb/{kb_id}", headers=ADMIN)
     assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_subtag_crud(client):
+    r = await client.post("/api/kb", headers=ADMIN, json={"name": "K"})
+    kb_id = r.json()["id"]
+
+    r = await client.post(f"/api/kb/{kb_id}/subtags", headers=ADMIN, json={"name": "OFC"})
+    assert r.status_code == 201, r.text
+    sub_id = r.json()["id"]
+
+    r = await client.get(f"/api/kb/{kb_id}/subtags", headers=ADMIN)
+    assert r.status_code == 200
+    assert len(r.json()) == 1
+
+    r = await client.delete(f"/api/kb/{kb_id}/subtags/{sub_id}", headers=ADMIN)
+    assert r.status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_access_grant_and_list(client, engine):
+    SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with SessionLocal() as s:
+        await s.execute(text("INSERT INTO groups (id, name) VALUES (1, 'eng')"))
+        await s.commit()
+
+    r = await client.post("/api/kb", headers=ADMIN, json={"name": "K"})
+    kb_id = r.json()["id"]
+
+    r = await client.post(f"/api/kb/{kb_id}/access", headers=ADMIN,
+                          json={"group_id": 1, "access_type": "read"})
+    assert r.status_code == 201, r.text
+    grant_id = r.json()["id"]
+
+    r = await client.get(f"/api/kb/{kb_id}/access", headers=ADMIN)
+    assert r.status_code == 200
+    assert r.json()[0]["group_id"] == 1
+
+    r = await client.delete(f"/api/kb/{kb_id}/access/{grant_id}", headers=ADMIN)
+    assert r.status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_access_grant_requires_exactly_one(client):
+    r = await client.post("/api/kb", headers=ADMIN, json={"name": "K"})
+    kb_id = r.json()["id"]
+    r = await client.post(f"/api/kb/{kb_id}/access", headers=ADMIN,
+                          json={"user_id": None, "group_id": None, "access_type": "read"})
+    assert r.status_code == 400
