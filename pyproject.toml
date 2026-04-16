@@ -16,6 +16,7 @@ dependencies = [
   "redis>=5.0",
   "qdrant-client>=1.9",
   "python-multipart>=0.0.9",
+  "huggingface_hub>=0.24",
 ]
 
 [project.optional-dependencies]
