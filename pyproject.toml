@@ -37,6 +37,11 @@ dev = [
 asyncio_mode = "auto"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+markers = [
+  "security: upload safety / XSS / CSRF / MIME checks",
+  "concurrency: multi-user parallel operations",
+  "perf: performance benchmarks (non-gating)",
+]
 
 [tool.ruff]
 line-length = 100
