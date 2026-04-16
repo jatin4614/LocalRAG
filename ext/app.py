@@ -23,8 +23,11 @@ def build_app() -> FastAPI:
     async def healthz():
         return {"status": "ok"}
 
-    app.include_router(kb_admin.router)
+    # Retrieval router MUST be registered before the admin router:
+    # admin router's GET /api/kb/{kb_id} would otherwise shadow
+    # retrieval's GET /api/kb/available (FastAPI matches in registration order).
     app.include_router(kb_retrieval.router)
+    app.include_router(kb_admin.router)
     return app
 
 
