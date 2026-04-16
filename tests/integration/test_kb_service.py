@@ -45,3 +45,39 @@ async def test_duplicate_kb_name_rejected(session):
     with pytest.raises(Exception):
         await kb_service.create_kb(session, name="Dup", description=None, admin_id=1)
         await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_create_and_list_subtags(session):
+    await session.execute(text("INSERT INTO users (id, email, password_hash, role) VALUES (1, 'a@x', 'h', 'admin')"))
+    await session.execute(text("INSERT INTO knowledge_bases (id, name, admin_id) VALUES (1, 'K', 1)"))
+    await session.commit()
+    await kb_service.create_subtag(session, kb_id=1, name="OFC", description=None)
+    await kb_service.create_subtag(session, kb_id=1, name="Roadmap", description="q2")
+    await session.commit()
+    subs = await kb_service.list_subtags(session, kb_id=1)
+    assert {s.name for s in subs} == {"OFC", "Roadmap"}
+
+
+@pytest.mark.asyncio
+async def test_duplicate_subtag_within_kb_rejected(session):
+    await session.execute(text("INSERT INTO users (id, email, password_hash, role) VALUES (1, 'a@x', 'h', 'admin')"))
+    await session.execute(text("INSERT INTO knowledge_bases (id, name, admin_id) VALUES (1, 'K', 1)"))
+    await session.execute(text("INSERT INTO kb_subtags (kb_id, name) VALUES (1, 'X')"))
+    await session.commit()
+    with pytest.raises(Exception):
+        await kb_service.create_subtag(session, kb_id=1, name="X", description=None)
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_delete_subtag(session):
+    await session.execute(text("INSERT INTO users (id, email, password_hash, role) VALUES (1, 'a@x', 'h', 'admin')"))
+    await session.execute(text("INSERT INTO knowledge_bases (id, name, admin_id) VALUES (1, 'K', 1)"))
+    await session.execute(text("INSERT INTO kb_subtags (id, kb_id, name) VALUES (10, 1, 'Del')"))
+    await session.commit()
+    ok = await kb_service.delete_subtag(session, kb_id=1, subtag_id=10)
+    await session.commit()
+    assert ok is True
+    subs = await kb_service.list_subtags(session, kb_id=1)
+    assert subs == []

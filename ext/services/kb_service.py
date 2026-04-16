@@ -7,11 +7,11 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Iterable, List, Optional
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..db.models import KnowledgeBase
+from ..db.models import KnowledgeBase, KBSubtag
 
 
 async def create_kb(
@@ -64,5 +64,27 @@ async def soft_delete_kb(session: AsyncSession, *, kb_id: int) -> bool:
         update(KnowledgeBase)
         .where(KnowledgeBase.id == kb_id, KnowledgeBase.deleted_at.is_(None))
         .values(deleted_at=datetime.now(timezone.utc))
+    )
+    return r.rowcount > 0
+
+
+async def create_subtag(
+    session: AsyncSession, *, kb_id: int, name: str, description: Optional[str] = None,
+) -> KBSubtag:
+    sub = KBSubtag(kb_id=kb_id, name=name, description=description)
+    session.add(sub)
+    await session.flush()
+    return sub
+
+
+async def list_subtags(session: AsyncSession, *, kb_id: int) -> List[KBSubtag]:
+    return list((await session.execute(
+        select(KBSubtag).where(KBSubtag.kb_id == kb_id).order_by(KBSubtag.id)
+    )).scalars().all())
+
+
+async def delete_subtag(session: AsyncSession, *, kb_id: int, subtag_id: int) -> bool:
+    r: CursorResult = await session.execute(  # type: ignore[assignment]
+        delete(KBSubtag).where(KBSubtag.id == subtag_id, KBSubtag.kb_id == kb_id)
     )
     return r.rowcount > 0
