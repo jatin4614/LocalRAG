@@ -1,4 +1,4 @@
-.PHONY: help venv install test test-unit test-integration lint preflight up down smoke logs clean
+.PHONY: help venv install test test-unit test-integration test-all test-security test-concurrency test-perf lint preflight up down smoke logs clean
 
 PYTHON ?= python3
 VENV   ?= .venv
@@ -10,6 +10,10 @@ help:
 	@echo "test              run all pytest"
 	@echo "test-unit         run unit tests only"
 	@echo "test-integration  run integration tests only"
+	@echo "test-all          lint + unit + integration (SKIP_GPU_SMOKE=1)"
+	@echo "test-security     only tests marked @security"
+	@echo "test-concurrency  only tests marked @concurrency"
+	@echo "test-perf         only tests marked @perf"
 	@echo "lint              ruff + mypy"
 	@echo "preflight         download + verify model weights (needs internet once)"
 	@echo "up                docker compose up -d"
@@ -32,6 +36,20 @@ test-unit:
 
 test-integration:
 	$(ACTIVATE) && pytest tests/integration -v
+
+test-all:
+	$(ACTIVATE) && ruff check . && mypy .
+	$(ACTIVATE) && pytest tests/unit -v
+	$(ACTIVATE) && SKIP_GPU_SMOKE=1 pytest tests/integration -v
+
+test-security:
+	$(ACTIVATE) && pytest -m security -v
+
+test-concurrency:
+	$(ACTIVATE) && pytest -m concurrency -v
+
+test-perf:
+	$(ACTIVATE) && pytest -m perf -v
 
 lint:
 	$(ACTIVATE) && ruff check . && mypy .
