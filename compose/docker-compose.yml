@@ -131,3 +131,37 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+
+  vllm-vision:
+    image: vllm/vllm-openai:latest
+    container_name: orgchat-vllm-vision
+    restart: unless-stopped
+    ipc: host
+    volumes:
+      - ../volumes/models:/root/.cache/huggingface
+    environment:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    command:
+      - "--model"
+      - "${VISION_MODEL}"
+      - "--served-model-name"
+      - "orgchat-vision"
+      - "--max-model-len"
+      - "4096"
+      - "--gpu-memory-utilization"
+      - "0.25"
+      - "--enable-sleep-mode"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/v1/models || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 15
+      start_period: 240s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
