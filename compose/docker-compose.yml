@@ -70,3 +70,37 @@ services:
       - ../volumes/certs:/certs:ro
     depends_on:
       - postgres   # real dependency added when open-webui lands
+
+  vllm-chat:
+    image: vllm/vllm-openai:latest
+    container_name: orgchat-vllm-chat
+    restart: unless-stopped
+    ipc: host
+    volumes:
+      - ../volumes/models:/root/.cache/huggingface
+    environment:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    command:
+      - "--model"
+      - "${CHAT_MODEL}"
+      - "--served-model-name"
+      - "orgchat-chat"
+      - "--max-model-len"
+      - "8192"
+      - "--gpu-memory-utilization"
+      - "0.40"
+      - "--enable-prefix-caching"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/v1/models || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 15
+      start_period: 180s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
