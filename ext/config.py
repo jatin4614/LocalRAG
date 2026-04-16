@@ -17,5 +17,13 @@ class Settings(BaseSettings):
 
 
 @lru_cache
-def get_settings() -> Settings:
+def _settings_cached() -> Settings:
     return Settings()  # type: ignore[call-arg]  # fields populated from env
+
+
+def get_settings() -> Settings:
+    return _settings_cached()
+
+
+def clear_settings_cache() -> None:
+    _settings_cached.cache_clear()
