@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+.mypy_cache/
+
+# Editor
+.idea/
+.vscode/
+*.swp
+
+# Secrets / local
+.env
+.env.local
+compose/.env
+
+# Upstream submodule not recursively tracked
+upstream/
+
+# Runtime / volumes
+volumes/
+*.log
+
+# Build
+dist/
+build/
+*.egg-info/
