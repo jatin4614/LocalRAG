@@ -26,6 +26,7 @@ dev = [
   "docker>=7.0",
   "ruff>=0.6",
   "mypy>=1.11",
+  "aiosqlite>=0.19",
 ]
 
 [tool.pytest.ini_options]
