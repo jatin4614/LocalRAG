@@ -12,6 +12,9 @@ cd "$(dirname "$0")/.."
 echo ">> fetching upstream"
 (cd upstream && git fetch --tags origin && git checkout "$NEW_TAG")
 
+echo ">> staging new gitlink in parent repo"
+git add upstream
+
 echo ">> updating UPSTREAM_VERSION"
 echo "$NEW_TAG" > UPSTREAM_VERSION
 
