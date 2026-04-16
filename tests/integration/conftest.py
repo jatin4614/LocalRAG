@@ -7,6 +7,7 @@ from typing import AsyncGenerator
 import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from testcontainers.core.container import DockerContainer
 from testcontainers.postgres import PostgresContainer
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -68,3 +69,45 @@ async def session(engine) -> AsyncGenerator[AsyncSession, None]:
     SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     async with SessionLocal() as s:
         yield s
+
+
+@pytest.fixture(scope="session")
+def qdrant():
+    """Session-scoped Qdrant container (reused across tests for speed)."""
+    container = (
+        DockerContainer("qdrant/qdrant:latest")
+        .with_exposed_ports(6333)
+    )
+    container.start()
+    host = container.get_container_host_ip()
+    port = container.get_exposed_port(6333)
+    import time
+    import httpx
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        try:
+            r = httpx.get(f"http://{host}:{port}/readyz", timeout=2)
+            if r.status_code == 200:
+                break
+        except Exception:
+            pass
+        time.sleep(0.5)
+    else:
+        container.stop()
+        raise RuntimeError("qdrant not ready")
+    try:
+        yield f"http://{host}:{port}"
+    finally:
+        container.stop()
+
+
+@pytest_asyncio.fixture(scope="function")
+async def clean_qdrant(qdrant):
+    """Per-test wiper: deletes all collections at teardown."""
+    from qdrant_client import AsyncQdrantClient
+    client = AsyncQdrantClient(url=qdrant)
+    yield qdrant
+    cols = (await client.get_collections()).collections
+    for c in cols:
+        await client.delete_collection(c.name)
+    await client.close()
