@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     redis_url:      str = Field(..., alias="REDIS_URL")
     qdrant_url:     str = Field(..., alias="QDRANT_URL")
     session_secret: str = Field(..., alias="SESSION_SECRET", min_length=32)
+    tei_url:        str = Field("http://tei:80", alias="TEI_URL")
+    vector_size:    int = Field(1024,            alias="RAG_VECTOR_SIZE")
 
 
 @lru_cache
