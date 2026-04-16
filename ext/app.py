@@ -39,3 +39,34 @@ def build_app() -> FastAPI:
 
 
 app = None
+
+
+def build_ext_routers():
+    """Return the list of APIRouters to mount on an external FastAPI app (upstream).
+
+    Caller is responsible for setting env so our settings + services bootstrap cleanly:
+      DATABASE_URL, QDRANT_URL, TEI_URL, RAG_VECTOR_SIZE, WEBUI_SECRET_KEY, AUTH_MODE=jwt.
+    """
+    from .config import clear_settings_cache, get_settings
+    from .db.session import make_engine, make_sessionmaker
+    from .routers import kb_admin, kb_retrieval, rag, upload
+    from .services import auth as auth_svc
+    from .services.embedder import TEIEmbedder
+    from .services.vector_store import VectorStore
+
+    clear_settings_cache()
+    settings = get_settings()
+    engine = make_engine(settings.database_url)
+    SessionLocal = make_sessionmaker(engine)
+
+    vs = VectorStore(url=settings.qdrant_url, vector_size=settings.vector_size)
+    emb = TEIEmbedder(base_url=settings.tei_url)
+
+    auth_svc.configure_jwt(sessionmaker=SessionLocal)
+    kb_admin.set_sessionmaker(SessionLocal)
+    kb_retrieval.set_sessionmaker(SessionLocal)
+    upload.configure(sessionmaker=SessionLocal, vector_store=vs, embedder=emb)
+    rag.configure(sessionmaker=SessionLocal, vector_store=vs, embedder=emb)
+
+    # Retrieval first — avoids /available shadowing by admin's /{kb_id}.
+    return [kb_retrieval.router, kb_admin.router, upload.router, rag.router]

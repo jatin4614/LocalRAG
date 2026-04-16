@@ -1,0 +1,42 @@
+diff --git a/backend/open_webui/main.py b/backend/open_webui/main.py
+index 008178806..ac4bafd88 100644
+--- a/backend/open_webui/main.py
++++ b/backend/open_webui/main.py
+@@ -699,6 +699,17 @@ async def lifespan(app: FastAPI):
+         except Exception as e:
+             log.warning(f'Failed to initialize tool/terminal servers at startup: {e}')
+ 
++    # --- orgchat migrations (Phase 5a) ---
++    try:
++        import subprocess as _sp_orgchat, sys as _s_orgchat, pathlib as _p_orgchat
++        _mig_orgchat = _p_orgchat.Path(__file__).parent.parent.parent.parent / "scripts" / "apply_migrations.py"
++        if _mig_orgchat.exists():
++            _sp_orgchat.run([_s_orgchat.executable, str(_mig_orgchat)], check=True)
++    except Exception as _e_orgchat_mig:
++        import logging as _l_orgchat
++        _l_orgchat.getLogger(__name__).warning("orgchat migrations failed: %s", _e_orgchat_mig)
++    # --- end orgchat migrations ---
++
+     # Mark application as ready to accept traffic from a startup perspective.
+     app.state.startup_complete = True
+ 
+@@ -1523,6 +1534,19 @@ if ENABLE_ADMIN_ANALYTICS:
+ app.include_router(utils.router, prefix='/api/v1/utils', tags=['utils'])
+ app.include_router(terminals.router, prefix='/api/v1/terminals', tags=['terminals'])
+ 
++# --- orgchat extension wiring (Phase 5a) ---
++import os as _os_orgchat
++import sys as _sys_orgchat
++_sys_orgchat.path.insert(0, _os_orgchat.path.abspath(_os_orgchat.path.join(_os_orgchat.path.dirname(__file__), "..", "..", "..")))
++try:
++    from ext.app import build_ext_routers as _build_ext_routers_orgchat  # noqa: E402
++    for _r_orgchat in _build_ext_routers_orgchat():
++        app.include_router(_r_orgchat)
++except Exception as _e_orgchat:
++    import logging as _logging_orgchat
++    _logging_orgchat.getLogger(__name__).exception("orgchat extension wiring failed: %s", _e_orgchat)
++# --- end orgchat extension ---
++
+ # SCIM 2.0 API for identity management
+ if ENABLE_SCIM:
+     app.include_router(scim.router, prefix='/api/v1/scim/v2', tags=['scim'])
