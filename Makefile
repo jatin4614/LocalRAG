@@ -34,7 +34,7 @@ test-integration:
 	$(ACTIVATE) && pytest tests/integration -v
 
 lint:
-	$(ACTIVATE) && ruff check . && mypy ext/ model_manager/ whisper_service/ scripts/
+	$(ACTIVATE) && ruff check . && mypy .
 
 preflight:
 	$(ACTIVATE) && python scripts/preflight_models.py
