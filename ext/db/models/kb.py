@@ -19,6 +19,7 @@ class KnowledgeBase(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
     subtags: Mapped[list["KBSubtag"]] = relationship(
         back_populates="kb", cascade="all, delete-orphan"
