@@ -165,3 +165,28 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+
+  whisper:
+    build:
+      context: ../whisper_service
+    container_name: orgchat-whisper
+    restart: unless-stopped
+    environment:
+      WHISPER_MODEL: ${WHISPER_MODEL}
+      WHISPER_CACHE: /models
+      PORT: "9000"
+    volumes:
+      - ../volumes/models:/models
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9000/health || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
