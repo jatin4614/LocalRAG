@@ -48,6 +48,8 @@ services:
     image: qdrant/qdrant:latest
     container_name: orgchat-qdrant
     restart: unless-stopped
+    ports:
+      - "6333:6333"
     volumes:
       - qdrant_data:/qdrant/storage
     healthcheck:
@@ -76,6 +78,8 @@ services:
     container_name: orgchat-vllm-chat
     restart: unless-stopped
     ipc: host
+    ports:
+      - "8000:8000"
     volumes:
       - ../volumes/models:/root/.cache/huggingface
     environment:
