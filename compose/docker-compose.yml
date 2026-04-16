@@ -194,3 +194,25 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+
+  model-manager:
+    build:
+      context: ../model_manager
+    container_name: orgchat-model-manager
+    restart: unless-stopped
+    environment:
+      VISION_URL: http://vllm-vision:8000
+      WHISPER_URL: http://whisper:9000
+      MODEL_UNLOAD_IDLE_SECS: ${MODEL_UNLOAD_IDLE_SECS:-300}
+      MODEL_MANAGER_POLL_SECS: "15"
+    ports:
+      - "8080:8080"
+    depends_on:
+      - vllm-vision
+      - whisper
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/healthz || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
