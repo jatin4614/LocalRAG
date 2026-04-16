@@ -16,9 +16,6 @@ __pycache__/
 .env.local
 compose/.env
 
-# Upstream submodule not recursively tracked
-upstream/
-
 # Runtime / volumes
 volumes/
 *.log
