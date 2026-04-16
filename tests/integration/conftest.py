@@ -13,6 +13,7 @@ from testcontainers.postgres import PostgresContainer
 ROOT = Path(__file__).resolve().parents[2]
 MIGRATION_001 = ROOT / "ext/db/migrations/001_create_kb_schema.sql"
 MIGRATION_002 = ROOT / "ext/db/migrations/002_soft_delete_kb.sql"
+MIGRATION_003 = ROOT / "ext/db/migrations/003_add_chunk_count.sql"
 
 
 async def _raw_exec(conn, sql: str) -> None:
@@ -60,6 +61,8 @@ async def engine(pg):
         await _raw_exec(conn, MIGRATION_001.read_text())
         if MIGRATION_002.exists():
             await _raw_exec(conn, MIGRATION_002.read_text())
+        if MIGRATION_003.exists():
+            await _raw_exec(conn, MIGRATION_003.read_text())
     yield eng
     await eng.dispose()
 

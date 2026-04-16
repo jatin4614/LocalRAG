@@ -71,6 +71,7 @@ class KBDocument(Base):
         BigInteger, ForeignKey("users.id"), nullable=False
     )
     deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    chunk_count: Mapped[int] = mapped_column(default=0, nullable=False)
 
     kb: Mapped[KnowledgeBase] = relationship(back_populates="documents")
 
