@@ -1,0 +1,95 @@
+# values.yaml — Phase 2 Helm chart values (SKELETON; not wired).
+# Maps the docker-compose services to k8s deployments with Phase-2 sizing
+# (4x48GB GPUs per master plan).
+#
+# To wire this up:
+#   1. Write Helm templates under k8s/templates/
+#   2. Replace secrets (WEBUI_SECRET_KEY, ADMIN_PASSWORD) with ExternalSecret refs
+#   3. Test against a cluster with NVIDIA device plugin installed
+
+image:
+  registry: ghcr.io/your-org
+  tag: latest
+  pullPolicy: IfNotPresent
+
+domain: orgchat.example.com
+
+# --- Always-on services (baseline) ---
+postgres:
+  enabled: true
+  image: postgres:15-alpine
+  persistence:
+    size: 50Gi
+  resources:
+    requests: { cpu: 500m, memory: 2Gi }
+    limits:   { cpu: 2,    memory: 4Gi }
+
+redis:
+  enabled: true
+  image: redis:7-alpine
+  persistence:
+    size: 10Gi
+
+qdrant:
+  enabled: true
+  image: qdrant/qdrant:latest
+  persistence:
+    size: 200Gi
+
+# --- GPU services (Phase 2 sizing) ---
+vllmChat:
+  image: vllm/vllm-openai:latest
+  model: Qwen/Qwen2.5-72B-Instruct
+  gpus: 2
+  replicas: 1
+  env:
+    VLLM_TENSOR_PARALLEL_SIZE: "2"
+  resources:
+    limits: { nvidia.com/gpu: 2 }
+
+vllmVision:
+  image: vllm/vllm-openai:latest
+  model: Qwen/Qwen2-VL-72B-Instruct
+  gpus: 1
+  replicas: 1
+  env:
+    VLLM_ENABLE_SLEEP_MODE: "true"
+  resources:
+    limits: { nvidia.com/gpu: 1 }
+
+tei:
+  image: ghcr.io/huggingface/text-embeddings-inference:1.5
+  model: BAAI/bge-m3
+  resources:
+    limits: { nvidia.com/gpu: 1 }
+
+whisper:
+  enabled: true
+  image: ghcr.io/your-org/whisper-service:latest
+  model: large-v3
+  resources:
+    limits: { nvidia.com/gpu: 1 }
+
+modelManager:
+  enabled: true
+  image: ghcr.io/your-org/model-manager:latest
+  env:
+    MODEL_UNLOAD_IDLE_SECS: "300"
+
+openWebUI:
+  image: ghcr.io/open-webui/open-webui:v0.8.12
+  replicas: 2
+  ingress:
+    enabled: true
+    tls: true
+    host: orgchat.example.com
+
+# --- Secrets (fill with real refs) ---
+secrets:
+  webuiSecretKey:   ""
+  adminPassword:    ""
+  postgresPassword: ""
+
+# --- Autoscaling ---
+autoscaling:
+  enabled: false
