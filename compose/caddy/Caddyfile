@@ -1,0 +1,22 @@
+{
+    # No external ACME — self-signed only.
+    auto_https off
+    admin off
+}
+
+{$DOMAIN}:443 {
+    tls /certs/orgchat.crt /certs/orgchat.key
+
+    encode zstd gzip
+
+    # Open WebUI is the single entry point for the user-facing app.
+    # Upstream listens on :8080 inside the container.
+    reverse_proxy open-webui:8080 {
+        # Preserve streaming responses for chat.
+        flush_interval -1
+    }
+}
+
+:80 {
+    redir https://{host}{uri} permanent
+}

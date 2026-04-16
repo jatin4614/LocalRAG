@@ -55,3 +55,18 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: orgchat-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ../volumes/certs:/certs:ro
+    depends_on:
+      - postgres   # real dependency added when open-webui lands
