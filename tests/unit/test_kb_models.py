@@ -1,15 +1,14 @@
 import pytest
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy import select, Column, Integer, String as SAString, Table
+from sqlalchemy import select
 
 from ext.db.base import Base
 from ext.db.models.kb import KnowledgeBase, KBSubtag, KBDocument, KBAccess
 
-# Minimal stub tables so Base.metadata can resolve FKs (users, groups are Open WebUI tables).
-_stub_meta = Base.metadata
-Table("users",  _stub_meta, Column("id", Integer, primary_key=True), Column("email", SAString), extend_existing=True)
-Table("groups", _stub_meta, Column("id", Integer, primary_key=True), Column("name",  SAString), extend_existing=True)
+# Import compat models so Base.metadata knows about users/groups/chats.
+# This replaces the old inline stub Table() declarations.
+from ext.db.models.compat import User as _User, Group as _Group  # noqa: F401
 
 
 @pytest.mark.asyncio
@@ -19,7 +18,7 @@ async def test_kb_models_create_and_query():
         from sqlalchemy import text
 
         await conn.run_sync(Base.metadata.create_all)
-        await conn.execute(text("INSERT INTO users(id,email)  VALUES (1,'a@x')"))
+        await conn.execute(text("INSERT INTO users(id,email,password_hash,role) VALUES (1,'a@x','stub','admin')"))
         await conn.execute(text("INSERT INTO groups(id,name)  VALUES (1,'eng')"))
 
     Session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
