@@ -81,3 +81,43 @@ async def test_delete_subtag(session):
     assert ok is True
     subs = await kb_service.list_subtags(session, kb_id=1)
     assert subs == []
+
+
+@pytest.mark.asyncio
+async def test_grant_user_and_group_access(session):
+    await session.execute(text("INSERT INTO users (id, email, password_hash, role) VALUES (1, 'a@x', 'h', 'admin'), (2, 'b@x', 'h', 'user')"))
+    await session.execute(text("INSERT INTO groups (id, name) VALUES (1, 'eng')"))
+    await session.execute(text("INSERT INTO knowledge_bases (id, name, admin_id) VALUES (1, 'K', 1)"))
+    await session.commit()
+
+    await kb_service.grant_access(session, kb_id=1, user_id=2, group_id=None)
+    await kb_service.grant_access(session, kb_id=1, user_id=None, group_id=1)
+    await session.commit()
+    grants = await kb_service.list_access(session, kb_id=1)
+    assert len(grants) == 2
+    assert {g.user_id for g in grants if g.user_id is not None} == {2}
+    assert {g.group_id for g in grants if g.group_id is not None} == {1}
+
+
+@pytest.mark.asyncio
+async def test_grant_requires_exactly_one_of_user_or_group(session):
+    await session.execute(text("INSERT INTO users (id, email, password_hash, role) VALUES (1, 'a@x', 'h', 'admin')"))
+    await session.execute(text("INSERT INTO knowledge_bases (id, name, admin_id) VALUES (1, 'K', 1)"))
+    await session.commit()
+    with pytest.raises(ValueError):
+        await kb_service.grant_access(session, kb_id=1, user_id=None, group_id=None)
+    with pytest.raises(ValueError):
+        await kb_service.grant_access(session, kb_id=1, user_id=1, group_id=1)
+
+
+@pytest.mark.asyncio
+async def test_revoke_access(session):
+    await session.execute(text("INSERT INTO users (id, email, password_hash, role) VALUES (1, 'a@x', 'h', 'admin')"))
+    await session.execute(text("INSERT INTO knowledge_bases (id, name, admin_id) VALUES (1, 'K', 1)"))
+    await session.execute(text("INSERT INTO kb_access (id, kb_id, user_id, access_type) VALUES (100, 1, 1, 'read')"))
+    await session.commit()
+    ok = await kb_service.revoke_access(session, grant_id=100)
+    await session.commit()
+    assert ok is True
+    grants = await kb_service.list_access(session, kb_id=1)
+    assert grants == []

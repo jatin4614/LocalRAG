@@ -11,7 +11,7 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..db.models import KnowledgeBase, KBSubtag
+from ..db.models import KnowledgeBase, KBSubtag, KBAccess
 
 
 async def create_kb(
@@ -86,5 +86,31 @@ async def list_subtags(session: AsyncSession, *, kb_id: int) -> List[KBSubtag]:
 async def delete_subtag(session: AsyncSession, *, kb_id: int, subtag_id: int) -> bool:
     r: CursorResult = await session.execute(  # type: ignore[assignment]
         delete(KBSubtag).where(KBSubtag.id == subtag_id, KBSubtag.kb_id == kb_id)
+    )
+    return r.rowcount > 0
+
+
+async def grant_access(
+    session: AsyncSession, *, kb_id: int, user_id: Optional[int],
+    group_id: Optional[int], access_type: str = "read",
+) -> KBAccess:
+    """Grant read/write on a KB to either a user or a group (never both, never neither)."""
+    if (user_id is None) == (group_id is None):
+        raise ValueError("grant_access requires exactly one of user_id or group_id")
+    grant = KBAccess(kb_id=kb_id, user_id=user_id, group_id=group_id, access_type=access_type)
+    session.add(grant)
+    await session.flush()
+    return grant
+
+
+async def list_access(session: AsyncSession, *, kb_id: int) -> List[KBAccess]:
+    return list((await session.execute(
+        select(KBAccess).where(KBAccess.kb_id == kb_id).order_by(KBAccess.id)
+    )).scalars().all())
+
+
+async def revoke_access(session: AsyncSession, *, grant_id: int) -> bool:
+    r: CursorResult = await session.execute(  # type: ignore[assignment]
+        delete(KBAccess).where(KBAccess.id == grant_id)
     )
     return r.rowcount > 0
