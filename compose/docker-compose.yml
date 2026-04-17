@@ -229,6 +229,9 @@ services:
       WEBUI_NAME: ${WEBUI_NAME}
       ENABLE_SIGNUP: ${ENABLE_SIGNUP:-false}
       DEFAULT_USER_ROLE: ${DEFAULT_USER_ROLE:-pending}
+      ENABLE_COMMUNITY_SHARING: "false"
+      ENABLE_MESSAGE_RATING: "false"
+      SHOW_ADMIN_DETAILS: "false"
       ENABLE_OPENAI_API: ${ENABLE_OPENAI_API:-true}
       OPENAI_API_BASE_URL: ${OPENAI_API_BASE_URL:-http://vllm-chat:8000/v1}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-sk-internal-dummy}

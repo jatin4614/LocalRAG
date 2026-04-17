@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>KB Admin</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>tailwind.config={darkMode:'class',theme:{extend:{colors:{gray:{850:'#1a1a2e',900:'#0f0f23'}}}}}</script>
+<style>body{font-family:system-ui,-apple-system,sans-serif;background:#0f0f23;color:#e2e8f0}
+.card{background:#1a1a2e;border:1px solid #2d2d44;border-radius:12px;padding:20px}
+input,select{background:#0f0f23;border:1px solid #2d2d44;color:#e2e8f0;padding:8px 12px;border-radius:8px;width:100%}
+input:focus,select:focus{outline:none;border-color:#3b82f6}
+.btn{padding:8px 16px;border-radius:8px;font-weight:600;cursor:pointer;transition:all 0.2s}
+.btn-blue{background:#3b82f6;color:#fff}.btn-blue:hover{background:#2563eb}
+.btn-red{background:#ef4444;color:#fff}.btn-red:hover{background:#dc2626}
+.btn-green{background:#22c55e;color:#fff}.btn-green:hover{background:#16a34a}
+.btn-sm{padding:4px 10px;font-size:0.8rem}
+.tag{display:inline-block;padding:2px 8px;border-radius:6px;font-size:0.75rem;background:#1e3a5f;color:#93c5fd}
+.success{color:#4ade80}.error{color:#f87171}
+table{width:100%;border-collapse:collapse}th,td{padding:8px 12px;text-align:left;border-bottom:1px solid #2d2d44}
+th{color:#94a3b8;font-size:0.8rem;text-transform:uppercase}
+#toast{position:fixed;top:20px;right:20px;padding:12px 20px;border-radius:8px;font-weight:500;z-index:9999;display:none}
+</style>
+</head>
+<body class="min-h-screen p-6">
+<div id="toast"></div>
+
+<div class="max-w-5xl mx-auto">
+  <div class="flex items-center justify-between mb-6">
+    <div>
+      <h1 class="text-2xl font-bold">Knowledge Base Admin</h1>
+      <p class="text-gray-400 text-sm mt-1">Create KBs, subtags, grant access, upload documents</p>
+    </div>
+    <a href="/" class="btn btn-blue text-sm">Back to Chat</a>
+  </div>
+
+  <!-- Create KB -->
+  <div class="card mb-4">
+    <h2 class="text-lg font-semibold mb-3">Create Knowledge Base</h2>
+    <div class="flex gap-3">
+      <input id="kb-name" placeholder="KB Name (e.g. Engineering)" class="flex-1">
+      <input id="kb-desc" placeholder="Description (optional)" class="flex-1">
+      <button onclick="createKB()" class="btn btn-blue whitespace-nowrap">Create KB</button>
+    </div>
+  </div>
+
+  <!-- KB List -->
+  <div class="card mb-4">
+    <div class="flex items-center justify-between mb-3">
+      <h2 class="text-lg font-semibold">Knowledge Bases</h2>
+      <button onclick="loadKBs()" class="btn btn-sm" style="background:#2d2d44;color:#94a3b8">Refresh</button>
+    </div>
+    <div id="kb-list"><p class="text-gray-500">Loading...</p></div>
+  </div>
+
+  <!-- KB Detail (shown when a KB is selected) -->
+  <div id="kb-detail" class="hidden">
+    <!-- Subtags -->
+    <div class="card mb-4">
+      <h2 class="text-lg font-semibold mb-3">Subtags for: <span id="detail-kb-name" class="text-blue-400"></span></h2>
+      <div class="flex gap-3 mb-3">
+        <input id="subtag-name" placeholder="Subtag name (e.g. Architecture)" class="flex-1">
+        <button onclick="createSubtag()" class="btn btn-blue btn-sm">Add Subtag</button>
+      </div>
+      <div id="subtag-list"></div>
+    </div>
+
+    <!-- Access Grants -->
+    <div class="card mb-4">
+      <h2 class="text-lg font-semibold mb-3">Access Grants</h2>
+      <div class="flex gap-3 mb-3">
+        <select id="grant-type" onchange="toggleGrantField()" class="w-40">
+          <option value="user">User ID</option>
+          <option value="group">Group ID</option>
+        </select>
+        <input id="grant-id" placeholder="User UUID or Group ID" class="flex-1">
+        <button onclick="grantAccess()" class="btn btn-green btn-sm">Grant Read</button>
+      </div>
+      <div id="grant-list"></div>
+    </div>
+
+    <!-- Upload Document -->
+    <div class="card mb-4">
+      <h2 class="text-lg font-semibold mb-3">Upload Document</h2>
+      <div class="flex gap-3 items-center">
+        <select id="upload-subtag" class="w-60"></select>
+        <input type="file" id="upload-file" accept=".txt,.md,.pdf" class="flex-1">
+        <button onclick="uploadDoc()" class="btn btn-blue btn-sm">Upload</button>
+      </div>
+      <div id="upload-result" class="mt-2 text-sm"></div>
+    </div>
+  </div>
+
+  <!-- Users & Groups Quick Reference -->
+  <div class="card mb-4">
+    <h2 class="text-lg font-semibold mb-3">Users & Groups (from Open WebUI)</h2>
+    <div class="flex gap-4">
+      <div class="flex-1">
+        <h3 class="text-sm font-semibold text-gray-400 mb-2">Users</h3>
+        <div id="users-list"><p class="text-gray-500 text-sm">Loading...</p></div>
+      </div>
+      <div class="flex-1">
+        <h3 class="text-sm font-semibold text-gray-400 mb-2">Groups</h3>
+        <div id="groups-list"><p class="text-gray-500 text-sm">Loading...</p></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const TOKEN = localStorage.token || '';
+let currentKBId = null;
+
+function toast(msg, ok=true) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.background = ok ? '#166534' : '#991b1b';
+  t.style.display = 'block';
+  setTimeout(() => t.style.display = 'none', 3000);
+}
+
+async function api(path, opts={}) {
+  const r = await fetch(path, {
+    ...opts,
+    headers: { 'Authorization': `Bearer ${TOKEN}`, 'Content-Type': 'application/json', ...opts.headers }
+  });
+  if (!r.ok) { const e = await r.text(); throw new Error(e); }
+  if (r.status === 204) return null;
+  return r.json();
+}
+
+async function apiForm(path, formData) {
+  const r = await fetch(path, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${TOKEN}` },
+    body: formData
+  });
+  if (!r.ok) { const e = await r.text(); throw new Error(e); }
+  return r.json();
+}
+
+// --- KB CRUD ---
+async function loadKBs() {
+  try {
+    const kbs = await api('/api/kb');
+    const el = document.getElementById('kb-list');
+    if (!kbs.length) { el.innerHTML = '<p class="text-gray-500">No KBs yet. Create one above.</p>'; return; }
+    el.innerHTML = `<table><thead><tr><th>ID</th><th>Name</th><th>Description</th><th>Actions</th></tr></thead><tbody>
+      ${kbs.map(kb => `<tr>
+        <td class="text-gray-400">${kb.id}</td>
+        <td class="font-medium">${kb.name}</td>
+        <td class="text-gray-400">${kb.description || '-'}</td>
+        <td>
+          <button onclick="selectKB(${kb.id},'${kb.name}')" class="btn btn-sm btn-blue">Manage</button>
+          <button onclick="deleteKB(${kb.id})" class="btn btn-sm btn-red ml-1">Delete</button>
+        </td>
+      </tr>`).join('')}
+    </tbody></table>`;
+  } catch(e) { toast('Failed to load KBs: ' + e.message, false); }
+}
+
+async function createKB() {
+  const name = document.getElementById('kb-name').value.trim();
+  const desc = document.getElementById('kb-desc').value.trim();
+  if (!name) { toast('Name required', false); return; }
+  try {
+    await api('/api/kb', { method: 'POST', body: JSON.stringify({ name, description: desc || null }) });
+    document.getElementById('kb-name').value = '';
+    document.getElementById('kb-desc').value = '';
+    toast('KB created');
+    loadKBs();
+  } catch(e) { toast('Error: ' + e.message, false); }
+}
+
+async function deleteKB(id) {
+  if (!confirm('Delete this KB?')) return;
+  try {
+    await api(`/api/kb/${id}`, { method: 'DELETE' });
+    toast('KB deleted');
+    if (currentKBId === id) { document.getElementById('kb-detail').classList.add('hidden'); currentKBId = null; }
+    loadKBs();
+  } catch(e) { toast('Error: ' + e.message, false); }
+}
+
+async function selectKB(id, name) {
+  currentKBId = id;
+  document.getElementById('detail-kb-name').textContent = name;
+  document.getElementById('kb-detail').classList.remove('hidden');
+  loadSubtags();
+  loadGrants();
+}
+
+// --- Subtags ---
+async function loadSubtags() {
+  try {
+    const subs = await api(`/api/kb/${currentKBId}/subtags`);
+    const el = document.getElementById('subtag-list');
+    const sel = document.getElementById('upload-subtag');
+    if (!subs.length) { el.innerHTML = '<p class="text-gray-500 text-sm">No subtags.</p>'; sel.innerHTML = ''; return; }
+    el.innerHTML = subs.map(s => `<span class="tag mr-2 mb-1">${s.name} <button onclick="deleteSubtag(${s.id})" class="ml-1 text-red-400 hover:text-red-300">&times;</button></span>`).join('');
+    sel.innerHTML = subs.map(s => `<option value="${s.id}">${s.name}</option>`).join('');
+  } catch(e) { toast('Error: ' + e.message, false); }
+}
+
+async function createSubtag() {
+  const name = document.getElementById('subtag-name').value.trim();
+  if (!name) return;
+  try {
+    await api(`/api/kb/${currentKBId}/subtags`, { method: 'POST', body: JSON.stringify({ name }) });
+    document.getElementById('subtag-name').value = '';
+    toast('Subtag created');
+    loadSubtags();
+  } catch(e) { toast('Error: ' + e.message, false); }
+}
+
+async function deleteSubtag(id) {
+  try {
+    await api(`/api/kb/${currentKBId}/subtags/${id}`, { method: 'DELETE' });
+    toast('Subtag deleted');
+    loadSubtags();
+  } catch(e) { toast('Error: ' + e.message, false); }
+}
+
+// --- Access Grants ---
+async function loadGrants() {
+  try {
+    const grants = await api(`/api/kb/${currentKBId}/access`);
+    const el = document.getElementById('grant-list');
+    if (!grants.length) { el.innerHTML = '<p class="text-gray-500 text-sm">No access grants. KB is admin-only.</p>'; return; }
+    el.innerHTML = `<table><thead><tr><th>Type</th><th>ID</th><th>Access</th><th></th></tr></thead><tbody>
+      ${grants.map(g => `<tr>
+        <td>${g.user_id ? 'User' : 'Group'}</td>
+        <td class="font-mono text-sm">${g.user_id || g.group_id}</td>
+        <td class="tag">${g.access_type}</td>
+        <td><button onclick="revokeAccess(${g.id})" class="btn btn-sm btn-red">Revoke</button></td>
+      </tr>`).join('')}
+    </tbody></table>`;
+  } catch(e) { toast('Error: ' + e.message, false); }
+}
+
+async function grantAccess() {
+  const type = document.getElementById('grant-type').value;
+  const id = document.getElementById('grant-id').value.trim();
+  if (!id) { toast('ID required', false); return; }
+  const body = type === 'user' ? { user_id: id } : { group_id: id };
+  try {
+    await api(`/api/kb/${currentKBId}/access`, { method: 'POST', body: JSON.stringify(body) });
+    document.getElementById('grant-id').value = '';
+    toast('Access granted');
+    loadGrants();
+  } catch(e) { toast('Error: ' + e.message, false); }
+}
+
+async function revokeAccess(grantId) {
+  try {
+    await api(`/api/kb/${currentKBId}/access/${grantId}`, { method: 'DELETE' });
+    toast('Access revoked');
+    loadGrants();
+  } catch(e) { toast('Error: ' + e.message, false); }
+}
+
+function toggleGrantField() {
+  const type = document.getElementById('grant-type').value;
+  document.getElementById('grant-id').placeholder = type === 'user' ? 'User UUID (copy from Users list below)' : 'Group ID (copy from Groups list below)';
+}
+
+// --- Upload ---
+async function uploadDoc() {
+  const subtagId = document.getElementById('upload-subtag').value;
+  const fileInput = document.getElementById('upload-file');
+  if (!subtagId) { toast('Select a subtag first', false); return; }
+  if (!fileInput.files.length) { toast('Select a file', false); return; }
+  const fd = new FormData();
+  fd.append('file', fileInput.files[0]);
+  try {
+    const r = await apiForm(`/api/kb/${currentKBId}/subtag/${subtagId}/upload`, fd);
+    document.getElementById('upload-result').innerHTML = `<span class="success">Uploaded: ${r.chunks} chunks indexed</span>`;
+    fileInput.value = '';
+    toast('Document uploaded and indexed');
+  } catch(e) { document.getElementById('upload-result').innerHTML = `<span class="error">${e.message}</span>`; }
+}
+
+// --- Load Users & Groups from upstream ---
+async function loadUsers() {
+  try {
+    const users = await api('/api/v1/users');
+    const el = document.getElementById('users-list');
+    if (!users?.length) { el.innerHTML = '<p class="text-gray-500 text-sm">No users.</p>'; return; }
+    el.innerHTML = `<table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>ID</th></tr></thead><tbody>
+      ${users.map(u => `<tr>
+        <td>${u.name}</td>
+        <td class="text-gray-400">${u.email}</td>
+        <td><span class="tag">${u.role}</span></td>
+        <td class="font-mono text-xs text-gray-500">${u.id}</td>
+      </tr>`).join('')}
+    </tbody></table>`;
+  } catch(e) { document.getElementById('users-list').innerHTML = '<p class="text-gray-500 text-sm">Could not load users.</p>'; }
+}
+
+async function loadGroups() {
+  try {
+    const groups = await api('/api/v1/groups');
+    const el = document.getElementById('groups-list');
+    if (!groups?.length) { el.innerHTML = '<p class="text-gray-500 text-sm">No groups. Create one in Admin > Users > Groups.</p>'; return; }
+    el.innerHTML = `<table><thead><tr><th>Name</th><th>ID</th><th>Members</th></tr></thead><tbody>
+      ${groups.map(g => `<tr>
+        <td>${g.name}</td>
+        <td class="font-mono text-xs text-gray-500">${g.id}</td>
+        <td class="text-gray-400">${g.user_ids?.length || 0}</td>
+      </tr>`).join('')}
+    </tbody></table>`;
+  } catch(e) { document.getElementById('groups-list').innerHTML = '<p class="text-gray-500 text-sm">Could not load groups.</p>'; }
+}
+
+// --- Init ---
+document.addEventListener('DOMContentLoaded', () => {
+  if (!TOKEN) {
+    document.body.innerHTML = '<div class="flex items-center justify-center min-h-screen"><div class="card text-center"><h2 class="text-xl font-bold mb-2">Not Logged In</h2><p class="text-gray-400 mb-4">Please log in to Open WebUI first, then return here.</p><a href="/" class="btn btn-blue">Go to Login</a></div></div>';
+    return;
+  }
+  loadKBs();
+  loadUsers();
+  loadGroups();
+});
+</script>
+</body>
+</html>

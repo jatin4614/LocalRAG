@@ -1,7 +1,10 @@
 """FastAPI application entry point for the KB management + retrieval + RAG API."""
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 
 from .config import clear_settings_cache, get_settings
 from .db.session import make_engine, make_sessionmaker
@@ -29,6 +32,11 @@ def build_app() -> FastAPI:
     @app.get("/healthz")
     async def healthz():
         return {"status": "ok"}
+
+    @app.get("/api/kb/admin-ui", response_class=HTMLResponse)
+    async def kb_admin_ui():
+        html = Path(__file__).parent / "static" / "kb-admin.html"
+        return HTMLResponse(html.read_text())
 
     # Retrieval router MUST be registered before admin router to avoid /available shadowing.
     app.include_router(kb_retrieval.router)
@@ -68,5 +76,15 @@ def build_ext_routers():
     upload.configure(sessionmaker=SessionLocal, vector_store=vs, embedder=emb)
     rag.configure(sessionmaker=SessionLocal, vector_store=vs, embedder=emb)
 
+    # Admin UI page (standalone HTML — no Svelte needed)
+    from fastapi import APIRouter
+    from fastapi.responses import HTMLResponse as HR
+    ui_router = APIRouter()
+
+    @ui_router.get("/api/kb/admin-ui", response_class=HR)
+    async def _kb_admin_ui():
+        html = Path(__file__).parent / "static" / "kb-admin.html"
+        return HR(html.read_text())
+
     # Retrieval first — avoids /available shadowing by admin's /{kb_id}.
-    return [kb_retrieval.router, kb_admin.router, upload.router, rag.router]
+    return [ui_router, kb_retrieval.router, kb_admin.router, upload.router, rag.router]

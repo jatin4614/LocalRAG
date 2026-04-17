@@ -163,7 +163,7 @@ index 3c4c87ff2..f205c18dc 100644
  									</div>
  								{/if}
 diff --git a/src/lib/components/chat/Navbar.svelte b/src/lib/components/chat/Navbar.svelte
-index 5c4e1364b..60ec5e240 100644
+index 5c4e1364b..ed9d1443f 100644
 --- a/src/lib/components/chat/Navbar.svelte
 +++ b/src/lib/components/chat/Navbar.svelte
 @@ -39,6 +39,7 @@
@@ -182,8 +182,12 @@ index 5c4e1364b..60ec5e240 100644
  
  	export let onSaveTempChat: () => {};
  	export let archiveChatHandler: (id: string) => void;
-@@ -114,6 +116,14 @@
- 					{#if showModelSelector}
+@@ -111,9 +113,17 @@
+ 			{$showSidebar ? 'ml-1' : ''}
+ 			"
+ 				>
+-					{#if showModelSelector}
++					{#if showModelSelector && $user?.role === 'admin'}
  						<ModelSelector bind:selectedModels showSetDefault={!shareEnabled} />
  					{/if}
 +
