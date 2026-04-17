@@ -10,6 +10,10 @@ from .embedder import Embedder
 from .extractor import extract_text
 from .vector_store import VectorStore
 
+# Stable namespace for deterministic point IDs (UUID5 based on doc_id + chunk_index).
+# Using the well-known URL namespace UUID so the value is fixed across deploys.
+_POINT_NS = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+
 
 async def ingest_bytes(
     *,
@@ -34,13 +38,29 @@ async def ingest_bytes(
 
     now = int(time.time())
     points = []
+    doc_id = payload_base.get("doc_id")
+    chat_id = payload_base.get("chat_id")
     for chunk, vec in zip(chunks, vectors):
         payload = dict(payload_base)
+        # Store doc_id as string for consistent filtering/matching downstream.
+        if doc_id is not None:
+            payload["doc_id"] = str(doc_id)
         payload["chunk_index"] = chunk.index
         payload["text"] = chunk.text
         payload["uploaded_at"] = now
+        payload["deleted"] = False
+
+        # Deterministic point ID: same doc + chunk always maps to the same Qdrant point.
+        # This lets delete_by_doc reconstruct point IDs or use payload filtering to
+        # remove vectors when a document is soft-deleted.
+        if doc_id is not None:
+            id_seed = f"doc:{doc_id}:chunk:{chunk.index}"
+        else:
+            id_seed = f"chat:{chat_id}:chunk:{chunk.index}"
+        point_id = str(uuid.uuid5(_POINT_NS, id_seed))
+
         points.append({
-            "id": str(uuid.uuid4()),
+            "id": point_id,
             "vector": vec,
             "payload": payload,
         })

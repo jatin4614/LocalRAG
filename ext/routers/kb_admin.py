@@ -1,27 +1,40 @@
 """HTTP admin routes for KB CRUD. Admin-only."""
 from __future__ import annotations
 
+import logging
 from typing import AsyncGenerator, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
 
-from sqlalchemy import select, delete as sa_delete
+from sqlalchemy import select
 
 from ..services import kb_service
 from ..db.models import KBDocument
 from ..services.auth import CurrentUser, require_admin
+from ..services.vector_store import VectorStore
 
+log = logging.getLogger("orgchat.kb_admin")
 
 router = APIRouter(prefix="/api/kb", tags=["kb-admin"])
 
 _SESSIONMAKER: async_sessionmaker[AsyncSession] | None = None
+_VS: VectorStore | None = None
 
 
 def set_sessionmaker(sm: async_sessionmaker[AsyncSession]) -> None:
     global _SESSIONMAKER
     _SESSIONMAKER = sm
+
+
+def configure(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    vector_store: VectorStore,
+) -> None:
+    global _SESSIONMAKER, _VS
+    _SESSIONMAKER = sessionmaker
+    _VS = vector_store
 
 
 async def _get_session() -> AsyncGenerator[AsyncSession, None]:
@@ -273,7 +286,14 @@ async def delete_document(
     )
     if r.rowcount == 0:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="doc not found")
-    # TODO: also delete vectors from Qdrant for this doc_id (deferred — vectors become orphans until re-embed)
+
+    # Delete vectors from Qdrant for this doc_id (prevents retrieval of deleted doc's chunks).
+    if _VS is not None:
+        try:
+            await _VS.delete_by_doc(f"kb_{kb_id}", doc_id)
+        except Exception as e:
+            log.warning("failed to delete vectors for doc %s from kb_%s: %s", doc_id, kb_id, e)
+
     await session.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 

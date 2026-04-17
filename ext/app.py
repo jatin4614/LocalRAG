@@ -22,7 +22,7 @@ def build_app() -> FastAPI:
     vs = VectorStore(url=settings.qdrant_url, vector_size=settings.vector_size)
     emb = TEIEmbedder(base_url=settings.tei_url)
 
-    kb_admin.set_sessionmaker(SessionLocal)
+    kb_admin.configure(sessionmaker=SessionLocal, vector_store=vs)
     kb_retrieval.set_sessionmaker(SessionLocal)
     upload.configure(sessionmaker=SessionLocal, vector_store=vs, embedder=emb)
     rag.configure(sessionmaker=SessionLocal, vector_store=vs, embedder=emb)
@@ -71,7 +71,7 @@ def build_ext_routers():
     emb = TEIEmbedder(base_url=settings.tei_url)
 
     auth_svc.configure_jwt(sessionmaker=SessionLocal)
-    kb_admin.set_sessionmaker(SessionLocal)
+    kb_admin.configure(sessionmaker=SessionLocal, vector_store=vs)
     kb_retrieval.set_sessionmaker(SessionLocal)
     upload.configure(sessionmaker=SessionLocal, vector_store=vs, embedder=emb)
     rag.configure(sessionmaker=SessionLocal, vector_store=vs, embedder=emb)

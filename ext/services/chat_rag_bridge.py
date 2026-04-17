@@ -6,7 +6,7 @@ Retrieves KB context and returns it in upstream's source dict format.
 from __future__ import annotations
 
 import logging
-from typing import Any, List, Optional
+from typing import List, Optional
 
 logger = logging.getLogger("orgchat.rag_bridge")
 
