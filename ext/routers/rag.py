@@ -5,10 +5,10 @@ from typing import Any, AsyncGenerator, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
 
-from ..db.models import Chat, validate_selected_kb_config
+from ..db.models import validate_selected_kb_config
 from ..services.auth import CurrentUser, get_current_user
 from ..services.budget import budget_chunks
 from ..services.embedder import Embedder
@@ -45,7 +45,7 @@ async def _get_session() -> AsyncGenerator[AsyncSession, None]:
 
 
 class RetrieveRequest(BaseModel):
-    chat_id: int
+    chat_id: str
     query: str
     selected_kb_config: List[Any] = []
     max_tokens: int = 4000
@@ -74,10 +74,11 @@ async def rag_retrieve(
     if _VS is None or _EMB is None:
         raise RuntimeError("rag router not fully configured")
 
-    chat = (await session.execute(
-        select(Chat).where(Chat.id == body.chat_id, Chat.user_id == user.id)
-    )).scalar_one_or_none()
-    if chat is None:
+    row = (await session.execute(
+        text('SELECT user_id FROM chat WHERE id = :cid'),
+        {"cid": body.chat_id},
+    )).first()
+    if row is None or str(row[0]) != str(user.id):
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="chat not found")
 
     try:

@@ -6,10 +6,10 @@ from typing import AsyncGenerator, Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
 
-from ..db.models import Chat, KBDocument, KBSubtag
+from ..db.models import KBDocument, KBSubtag
 from ..services import kb_service
 from ..services.auth import CurrentUser, get_current_user, require_admin
 from ..services.embedder import Embedder
@@ -129,19 +129,18 @@ async def upload_kb_doc(
     status_code=status.HTTP_201_CREATED,
 )
 async def upload_private_doc(
-    chat_id: int,
+    chat_id: str,
     file: UploadFile = File(...),
     user: CurrentUser = Depends(get_current_user),
     session: AsyncSession = Depends(_get_session),
 ) -> UploadResult:
     if _VS is None or _EMB is None:
         raise RuntimeError("upload router not fully configured")
-    chat = (
-        await session.execute(
-            select(Chat).where(Chat.id == chat_id, Chat.user_id == user.id)
-        )
-    ).scalar_one_or_none()
-    if chat is None:
+    row = (await session.execute(
+        text('SELECT user_id FROM chat WHERE id = :cid'),
+        {"cid": chat_id},
+    )).first()
+    if row is None or str(row[0]) != str(user.id):
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="chat not found")
 
     data = await _read_bounded(file)
