@@ -8,6 +8,8 @@ from typing import Iterable, List, Optional
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http import models as qm
 
+_PAYLOAD_FIELDS = ["text", "kb_id", "subtag_id", "doc_id", "chat_id", "filename", "chunk_index", "deleted"]
+
 
 @dataclass
 class Hit:
@@ -99,7 +101,7 @@ class VectorStore:
             query=query_vector,
             limit=limit,
             query_filter=flt,
-            with_payload=True,
+            with_payload=_PAYLOAD_FIELDS,
         )
         return [Hit(id=r.id, score=r.score, payload=r.payload or {}) for r in response.points]
 

@@ -12,6 +12,8 @@ import tiktoken
 class Chunk:
     index: int
     text: str
+    start: int = 0
+    end: int = 0
 
 
 @lru_cache(maxsize=1)
@@ -34,7 +36,11 @@ def chunk_text(text: str, *, chunk_tokens: int = 800, overlap_tokens: int = 100)
     while start < len(ids):
         end = min(start + chunk_tokens, len(ids))
         chunk_ids = ids[start:end]
-        chunks.append(Chunk(index=idx, text=enc.decode(chunk_ids)))
+        chunk_text_val = enc.decode(chunk_ids)
+        # Char offsets: length-of-decoded-prefix up to start, and up to end
+        char_start = len(enc.decode(ids[:start])) if start > 0 else 0
+        char_end = len(enc.decode(ids[:end]))
+        chunks.append(Chunk(index=idx, text=chunk_text_val, start=char_start, end=char_end))
         idx += 1
         if end == len(ids):
             break

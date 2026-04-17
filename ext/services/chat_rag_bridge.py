@@ -5,10 +5,14 @@ Retrieves KB context and returns it in upstream's source dict format.
 """
 from __future__ import annotations
 
+import contextvars
 import logging
 from typing import List, Optional
 
 logger = logging.getLogger("orgchat.rag_bridge")
+
+request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
+user_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("user_id", default="-")
 
 # Module-level registry — set by ext.app.build_ext_routers() at startup
 _vector_store = None
@@ -71,6 +75,13 @@ async def retrieve_kb_sources(
     # If neither KBs nor chat has private docs, early exit
     if not kb_config and not chat_id:
         return []
+
+    import uuid as _uuid
+    request_id_var.set(str(_uuid.uuid4())[:8])
+    user_id_var.set(user_id)
+    logger.info("rag: request started req=%s user=%s kbs=%d chat=%s",
+                request_id_var.get(), user_id_var.get(),
+                len(kb_config or []), bool(chat_id))
 
     # RBAC check — only if kb_config is non-empty
     selected_kbs = []

@@ -61,7 +61,7 @@ class KBDocument(Base):
     )
     filename: Mapped[str] = mapped_column(String(512), nullable=False)
     mime_type: Mapped[Optional[str]] = mapped_column(String(100))
-    bytes: Mapped[Optional[int]] = mapped_column(BigInteger)
+    bytes: Mapped[Optional[int]] = mapped_column(BigInteger)  # TODO: expose in admin UI as file size
     ingest_status: Mapped[str] = mapped_column(String(20), default="pending", nullable=False)
     error_message: Mapped[Optional[str]] = mapped_column(Text)
     uploaded_at: Mapped[datetime] = mapped_column(

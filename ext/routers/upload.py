@@ -23,6 +23,15 @@ router = APIRouter(tags=["upload"])
 
 MAX_UPLOAD_BYTES = int(os.environ.get("RAG_MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
 
+
+def _safe_truncate(msg: str, max_len: int = 1000) -> str:
+    """Truncate a string at max_len without splitting multi-byte chars."""
+    if len(msg) <= max_len:
+        return msg
+    # Truncate to max_len bytes, decode with error handling to recover from mid-codepoint split
+    encoded = msg.encode("utf-8")[:max_len]
+    return encoded.decode("utf-8", errors="ignore")
+
 _SM: async_sessionmaker[AsyncSession] | None = None
 _VS: VectorStore | None = None
 _EMB: Embedder | None = None
@@ -133,7 +142,7 @@ async def upload_kb_doc(
         )
     except Exception as e:
         doc.ingest_status = "failed"
-        doc.error_message = str(e)[:1000]
+        doc.error_message = _safe_truncate(str(e))
         await session.commit()
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
 

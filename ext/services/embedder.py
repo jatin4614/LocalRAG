@@ -22,12 +22,8 @@ class StubEmbedder:
         return [self._hash_vector(t) for t in texts]
 
     def _hash_vector(self, text: str) -> list[float]:
-        data = b""
-        i = 0
-        while len(data) < self._dim * 4:
-            data += hashlib.sha256(f"{i}:{text}".encode()).digest()
-            i += 1
-        raw = struct.unpack(f"<{self._dim}i", data[: self._dim * 4])
+        data = hashlib.shake_128(text.encode()).digest(self._dim * 4)
+        raw = struct.unpack(f"<{self._dim}i", data)
         vec = [x / 2**31 for x in raw]
         norm = sum(x * x for x in vec) ** 0.5 or 1.0
         return [x / norm for x in vec]

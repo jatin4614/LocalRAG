@@ -34,5 +34,6 @@ def rerank(hits: List[Hit], *, top_k: int = 10) -> List[Hit]:
         m = max_by_kb[kb]
         return h.score / m if m > 0 else h.score
 
+    # Sort by: normalized score desc, then raw score desc, then id (stable tiebreaker for determinism in tests)
     ordered2 = sorted(hits, key=lambda h: (-normalized(h), -h.score, str(h.id)))
     return ordered2[:top_k]

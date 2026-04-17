@@ -36,7 +36,7 @@ async def ingest_bytes(
     texts = [c.text for c in chunks]
     vectors = await embedder.embed(texts)
 
-    now = int(time.time())
+    now = time.time_ns()
     points = []
     doc_id = payload_base.get("doc_id")
     chat_id = payload_base.get("chat_id")

@@ -46,9 +46,6 @@ def build_app() -> FastAPI:
     return app
 
 
-app = None
-
-
 def build_ext_routers():
     """Return the list of APIRouters to mount on an external FastAPI app (upstream).
 
