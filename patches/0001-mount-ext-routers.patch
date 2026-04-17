@@ -21,7 +21,7 @@ index b0545255a..133df9a05 100644
  
  if ENABLE_DB_MIGRATIONS:
 diff --git a/backend/open_webui/main.py b/backend/open_webui/main.py
-index 008178806..ac4bafd88 100644
+index 008178806..da9b3b1ac 100644
 --- a/backend/open_webui/main.py
 +++ b/backend/open_webui/main.py
 @@ -699,6 +699,17 @@ async def lifespan(app: FastAPI):
@@ -49,7 +49,7 @@ index 008178806..ac4bafd88 100644
 +# --- orgchat extension wiring (Phase 5a) ---
 +import os as _os_orgchat
 +import sys as _sys_orgchat
-+_sys_orgchat.path.insert(0, _os_orgchat.path.abspath(_os_orgchat.path.join(_os_orgchat.path.dirname(__file__), "..", "..", "..")))
++_sys_orgchat.path.insert(0, _os_orgchat.path.abspath(_os_orgchat.path.join(_os_orgchat.path.dirname(__file__), "..", "..")))
 +try:
 +    from ext.app import build_ext_routers as _build_ext_routers_orgchat  # noqa: E402
 +    for _r_orgchat in _build_ext_routers_orgchat():

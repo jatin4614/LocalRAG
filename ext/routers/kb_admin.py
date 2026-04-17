@@ -42,7 +42,7 @@ class KBOut(BaseModel):
     id: int
     name: str
     description: Optional[str]
-    admin_id: int
+    admin_id: str
 
 
 def _to_out(kb) -> KBOut:

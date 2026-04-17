@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Optional
 
 
-async def lookup_role_async(sessionmaker, user_id: int) -> Optional[str]:
+async def lookup_role_async(sessionmaker, user_id: str) -> Optional[str]:
     from sqlalchemy import select
     from .db.models import User
     async with sessionmaker() as s:

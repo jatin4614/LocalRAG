@@ -18,7 +18,7 @@ from ..base import Base
 class User(Base):
     __tablename__ = "users"
 
-    id:            Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    id:            Mapped[str] = mapped_column(String, primary_key=True)  # UUID string in upstream
     email:         Mapped[str] = mapped_column(String, unique=True, nullable=False)
     password_hash: Mapped[str] = mapped_column(String, nullable=False)
     role:          Mapped[str] = mapped_column(String, nullable=False, default="user")

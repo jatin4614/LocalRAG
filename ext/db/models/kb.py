@@ -15,7 +15,7 @@ class KnowledgeBase(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     name: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
     description: Mapped[Optional[str]] = mapped_column(Text)
-    admin_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=False)
+    admin_id: Mapped[str] = mapped_column(String(255), nullable=False)  # UUID from upstream "user" table
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -67,9 +67,7 @@ class KBDocument(Base):
     uploaded_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
-    uploaded_by: Mapped[int] = mapped_column(
-        BigInteger, ForeignKey("users.id"), nullable=False
-    )
+    uploaded_by: Mapped[str] = mapped_column(String(255), nullable=False)  # UUID
     deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     chunk_count: Mapped[int] = mapped_column(default=0, nullable=False)
 
@@ -83,12 +81,8 @@ class KBAccess(Base):
     kb_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("knowledge_bases.id", ondelete="CASCADE"), nullable=False
     )
-    user_id: Mapped[Optional[int]] = mapped_column(
-        BigInteger, ForeignKey("users.id", ondelete="CASCADE")
-    )
-    group_id: Mapped[Optional[int]] = mapped_column(
-        BigInteger, ForeignKey("groups.id", ondelete="CASCADE")
-    )
+    user_id: Mapped[Optional[str]] = mapped_column(String(255))  # UUID
+    group_id: Mapped[Optional[str]] = mapped_column(Text)
     access_type: Mapped[str] = mapped_column(String(20), default="read", nullable=False)
     granted_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -97,8 +91,6 @@ class KBAccess(Base):
     kb: Mapped[KnowledgeBase] = relationship(back_populates="access")
 
     def __init__(self, **kwargs):
-        # Enforce "exactly one of user_id / group_id" at model level
-        # (defense in depth; DB has CHECK constraint too).
         u = kwargs.get("user_id")
         g = kwargs.get("group_id")
         if (u is None) == (g is None):

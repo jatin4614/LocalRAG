@@ -222,7 +222,7 @@ services:
     container_name: orgchat-open-webui
     restart: unless-stopped
     ports:
-      - "3000:8080"
+      - "6100:8080"
     environment:
       PORT: "8080"
       WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY}
