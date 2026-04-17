@@ -725,7 +725,7 @@ index 000000000..0d8849183
 +	</div>
 +</div>
 diff --git a/src/lib/components/chat/Chat.svelte b/src/lib/components/chat/Chat.svelte
-index 45c2e01e2..a39e384c7 100644
+index 45c2e01e2..61881f446 100644
 --- a/src/lib/components/chat/Chat.svelte
 +++ b/src/lib/components/chat/Chat.svelte
 @@ -134,6 +134,7 @@
@@ -736,7 +736,19 @@ index 45c2e01e2..a39e384c7 100644
  	let atSelectedModel: Model | undefined;
  	let selectedModelIds = [];
  	$: if (atSelectedModel !== undefined) {
-@@ -2758,6 +2759,7 @@
+@@ -2237,6 +2238,11 @@
+ 					stop: getStopTokens()
+ 				},
+ 
++				// orgchat: inject selected KBs for RAG retrieval in middleware
++				kb_config: (selectedKBIds && selectedKBIds.length > 0)
++					? selectedKBIds.map((id) => ({ kb_id: id, subtag_ids: [] }))
++					: undefined,
++
+ 				files: (files?.length ?? 0) > 0 ? files : undefined,
+ 
+ 				filter_ids: selectedFilterIds.length > 0 ? selectedFilterIds : undefined,
+@@ -2758,6 +2764,7 @@
  						{history}
  						title={$chatTitle}
  						bind:selectedModels
