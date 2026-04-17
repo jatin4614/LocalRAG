@@ -173,16 +173,16 @@ async def delete_subtag(
 # ---------------------------------------------------------------------------
 
 class AccessIn(BaseModel):
-    user_id: Optional[int] = None
-    group_id: Optional[int] = None
+    user_id: Optional[str] = None
+    group_id: Optional[str] = None
     access_type: str = "read"
 
 
 class AccessOut(BaseModel):
     id: int
     kb_id: int
-    user_id: Optional[int]
-    group_id: Optional[int]
+    user_id: Optional[str]
+    group_id: Optional[str]
     access_type: str
 
 
