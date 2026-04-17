@@ -47,6 +47,7 @@ async def retrieve_kb_sources(
     kb_config: list,
     query: str,
     user_id: str,
+    chat_id: Optional[str] = None,  # NEW: enables private chat doc retrieval
 ) -> List[dict]:
     """Retrieve from our KB pipeline and format as upstream-compatible source dicts.
 
@@ -54,6 +55,7 @@ async def retrieve_kb_sources(
         kb_config: [{"kb_id": 1, "subtag_ids": [...]}, ...]
         query: the user's message text
         user_id: for RBAC verification
+        chat_id: current chat ID — if set, private docs in collection chat_{id} are included
 
     Returns:
         List of source dicts in upstream's format:
@@ -63,20 +65,22 @@ async def retrieve_kb_sources(
         logger.warning("RAG bridge not configured — skipping KB retrieval")
         return []
 
-    if not kb_config or not query:
+    if not query:
         return []
 
-    # RBAC check: verify user still has access to these KBs
-    from .rbac import get_allowed_kb_ids
-    async with _sessionmaker() as s:
-        allowed = set(await get_allowed_kb_ids(s, user_id=user_id))
-
-    selected_kbs = [
-        cfg for cfg in kb_config
-        if cfg.get("kb_id") in allowed
-    ]
-    if not selected_kbs:
+    # If neither KBs nor chat has private docs, early exit
+    if not kb_config and not chat_id:
         return []
+
+    # RBAC check — only if kb_config is non-empty
+    selected_kbs = []
+    if kb_config:
+        from .rbac import get_allowed_kb_ids
+        async with _sessionmaker() as s:
+            allowed = set(await get_allowed_kb_ids(s, user_id=user_id))
+        selected_kbs = [cfg for cfg in kb_config if cfg.get("kb_id") in allowed]
+        if not selected_kbs and not chat_id:
+            return []
 
     # Retrieve using our pipeline
     from .retriever import retrieve
@@ -87,7 +91,7 @@ async def retrieve_kb_sources(
         raw_hits = await retrieve(
             query=query,
             selected_kbs=selected_kbs,
-            chat_id=None,  # KB retrieval only, not private docs here
+            chat_id=chat_id,  # NOW PASSED THROUGH
             vector_store=_vector_store,
             embedder=_embedder,
             per_kb_limit=10,
@@ -105,11 +109,23 @@ async def retrieve_kb_sources(
     # Group by source document for cleaner citation display
     sources_by_doc: dict[str, dict] = {}
     for hit in budgeted:
-        doc_id = str(hit.payload.get("doc_id", "unknown"))
-        filename = str(hit.payload.get("filename", f"kb-{hit.payload.get('kb_id', '?')}"))
+        # For private chat docs, payload may have chat_id instead of doc_id
+        doc_id = str(hit.payload.get("doc_id", ""))
+        chat_scope = hit.payload.get("chat_id")
+        filename = str(hit.payload.get("filename", ""))
+        if not filename:
+            if chat_scope is not None:
+                filename = f"private-doc (chat {chat_scope})"
+            else:
+                filename = f"kb-{hit.payload.get('kb_id', '?')}"
         text_content = str(hit.payload.get("text", ""))
 
-        key = f"kb_{hit.payload.get('kb_id')}_{doc_id}"
+        # Key: prefer doc_id for KB docs, fall back to (chat_id, chunk_index) for private
+        if doc_id:
+            key = f"kb_{hit.payload.get('kb_id')}_{doc_id}"
+        else:
+            key = f"chat_{chat_scope}_{hit.payload.get('chunk_index', id(hit))}"
+
         if key not in sources_by_doc:
             sources_by_doc[key] = {
                 "source": {
@@ -124,7 +140,8 @@ async def retrieve_kb_sources(
             "source": filename,
             "kb_id": hit.payload.get("kb_id"),
             "subtag_id": hit.payload.get("subtag_id"),
-            "doc_id": doc_id,
+            "doc_id": doc_id or None,
+            "chat_id": chat_scope,
         })
 
     return list(sources_by_doc.values())
