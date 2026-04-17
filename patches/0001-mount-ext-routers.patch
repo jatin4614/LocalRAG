@@ -1,3 +1,25 @@
+diff --git a/backend/open_webui/internal/db.py b/backend/open_webui/internal/db.py
+index b0545255a..133df9a05 100644
+--- a/backend/open_webui/internal/db.py
++++ b/backend/open_webui/internal/db.py
+@@ -53,7 +53,7 @@ class JSONField(types.TypeDecorator):
+ # Workaround to handle the peewee migration
+ # This is required to ensure the peewee migration is handled before the alembic migration
+ def handle_peewee_migration(DATABASE_URL):
+-    # db = None
++    db = None
+     try:
+         # Replace the postgresql:// with postgres:// to handle the peewee migration
+         db = register_connection(DATABASE_URL.replace('postgresql://', 'postgres://'))
+@@ -72,7 +72,7 @@ def handle_peewee_migration(DATABASE_URL):
+             db.close()
+ 
+         # Assert if db connection has been closed
+-        assert db.is_closed(), 'Database connection is still open.'
++        assert db is None or db.is_closed(), 'Database connection is still open.'
+ 
+ 
+ if ENABLE_DB_MIGRATIONS:
 diff --git a/backend/open_webui/main.py b/backend/open_webui/main.py
 index 008178806..ac4bafd88 100644
 --- a/backend/open_webui/main.py

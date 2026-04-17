@@ -13,7 +13,7 @@ from .services.vector_store import VectorStore
 def build_app() -> FastAPI:
     clear_settings_cache()
     settings = get_settings()
-    engine = make_engine(settings.database_url)
+    engine = make_engine(settings.async_database_url)
     SessionLocal = make_sessionmaker(engine)
 
     vs = VectorStore(url=settings.qdrant_url, vector_size=settings.vector_size)
@@ -56,7 +56,7 @@ def build_ext_routers():
 
     clear_settings_cache()
     settings = get_settings()
-    engine = make_engine(settings.database_url)
+    engine = make_engine(settings.async_database_url)
     SessionLocal = make_sessionmaker(engine)
 
     vs = VectorStore(url=settings.qdrant_url, vector_size=settings.vector_size)

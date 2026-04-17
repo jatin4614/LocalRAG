@@ -11,6 +11,14 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=None, case_sensitive=False, extra="ignore")
 
     database_url:   str = Field(..., alias="DATABASE_URL")
+
+    @property
+    def async_database_url(self) -> str:
+        """Ensure the URL uses asyncpg driver (upstream's env uses sync postgresql://)."""
+        url = self.database_url
+        if "postgresql://" in url and "+asyncpg" not in url:
+            url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        return url
     redis_url:      str = Field(..., alias="REDIS_URL")
     qdrant_url:     str = Field(..., alias="QDRANT_URL")
     session_secret: str = Field(..., alias="SESSION_SECRET", min_length=32)
