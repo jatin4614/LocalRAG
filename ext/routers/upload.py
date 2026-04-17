@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import pathlib
 from typing import AsyncGenerator, Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
@@ -53,13 +54,31 @@ class UploadResult(BaseModel):
 
 
 async def _read_bounded(file: UploadFile) -> bytes:
-    data = await file.read()
-    if len(data) > MAX_UPLOAD_BYTES:
-        raise HTTPException(
-            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"upload exceeds {MAX_UPLOAD_BYTES} bytes",
-        )
-    return data
+    """Stream-read up to MAX_UPLOAD_BYTES; reject larger files early."""
+    chunks: list[bytes] = []
+    total = 0
+    CHUNK_SIZE = 1024 * 1024  # 1 MB
+    while True:
+        chunk = await file.read(CHUNK_SIZE)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"upload exceeds {MAX_UPLOAD_BYTES} bytes",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _safe_filename(name: str | None) -> str:
+    if not name:
+        return "upload"
+    # Strip directory components and control chars
+    clean = pathlib.Path(name).name
+    clean = "".join(c for c in clean if c.isprintable() and c not in "<>&\"'")
+    return clean[:256] or "upload"
 
 
 @router.post(
@@ -88,10 +107,11 @@ async def upload_kb_doc(
 
     data = await _read_bounded(file)
 
+    safe_name = _safe_filename(file.filename)
     doc = KBDocument(
         kb_id=kb_id,
         subtag_id=subtag_id,
-        filename=file.filename or "upload",
+        filename=safe_name,
         mime_type=file.content_type,
         bytes=len(data),
         uploaded_by=user.id,
@@ -105,7 +125,7 @@ async def upload_kb_doc(
         n = await ingest_bytes(
             data=data,
             mime_type=file.content_type or "application/octet-stream",
-            filename=file.filename or "upload",
+            filename=safe_name,
             collection=f"kb_{kb_id}",
             payload_base={"kb_id": kb_id, "subtag_id": subtag_id, "doc_id": doc.id},
             vector_store=_VS,
@@ -148,7 +168,7 @@ async def upload_private_doc(
     n = await ingest_bytes(
         data=data,
         mime_type=file.content_type or "application/octet-stream",
-        filename=file.filename or "upload",
+        filename=_safe_filename(file.filename),
         collection=f"chat_{chat_id}",
         payload_base={"chat_id": chat_id, "owner_user_id": user.id},
         vector_store=_VS,

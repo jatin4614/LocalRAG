@@ -51,7 +51,6 @@ EXTRACTORS: dict[str, Callable[[bytes], str]] = {
     "application/pdf": _extract_pdf,
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document": _extract_docx,
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": _extract_xlsx,
-    "application/msword": _extract_docx,  # .doc (best effort via python-docx)
 }
 
 
@@ -61,13 +60,17 @@ _EXT_FALLBACK = {
     ".markdown": "text/markdown",
     ".pdf": "application/pdf",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    ".doc": "application/msword",
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     ".csv": "text/csv",
 }
 
 
 def extract_text(data: bytes, mime_type: str, filename: str) -> str:
+    # Legacy .doc (binary) is not supported — must be converted to .docx first
+    if filename.lower().endswith(".doc") and not filename.lower().endswith(".docx"):
+        raise UnsupportedMimeType(
+            f"legacy .doc format not supported (convert to .docx first): {filename}"
+        )
     fn = EXTRACTORS.get(mime_type)
     if fn is None:
         for ext, m in _EXT_FALLBACK.items():
