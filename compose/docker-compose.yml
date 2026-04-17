@@ -229,6 +229,7 @@ services:
       WEBUI_NAME: ${WEBUI_NAME}
       ENABLE_SIGNUP: ${ENABLE_SIGNUP:-false}
       DEFAULT_USER_ROLE: ${DEFAULT_USER_ROLE:-pending}
+      DEFAULT_MODELS: ${DEFAULT_MODELS:-orgchat-chat}
       ENABLE_COMMUNITY_SHARING: "false"
       ENABLE_MESSAGE_RATING: "false"
       SHOW_ADMIN_DETAILS: "false"

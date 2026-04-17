@@ -20,10 +20,38 @@ def _extract_pdf(data: bytes) -> str:
     return "\n\n".join(page.extract_text() or "" for page in reader.pages)
 
 
+def _extract_docx(data: bytes) -> str:
+    from docx import Document
+
+    doc = Document(io.BytesIO(data))
+    return "\n\n".join(para.text for para in doc.paragraphs if para.text.strip())
+
+
+def _extract_xlsx(data: bytes) -> str:
+    from openpyxl import load_workbook
+
+    wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    parts: list[str] = []
+    for ws in wb.worksheets:
+        for row in ws.iter_rows(values_only=True):
+            cells = [str(c) if c is not None else "" for c in row]
+            if any(cells):
+                parts.append("\t".join(cells))
+    return "\n".join(parts)
+
+
+def _extract_csv(data: bytes) -> str:
+    return data.decode("utf-8", errors="replace")
+
+
 EXTRACTORS: dict[str, Callable[[bytes], str]] = {
     "text/plain": _extract_txt,
     "text/markdown": _extract_txt,
+    "text/csv": _extract_csv,
     "application/pdf": _extract_pdf,
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": _extract_docx,
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": _extract_xlsx,
+    "application/msword": _extract_docx,  # .doc (best effort via python-docx)
 }
 
 
@@ -32,6 +60,10 @@ _EXT_FALLBACK = {
     ".md": "text/markdown",
     ".markdown": "text/markdown",
     ".pdf": "application/pdf",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".doc": "application/msword",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".csv": "text/csv",
 }
 
 

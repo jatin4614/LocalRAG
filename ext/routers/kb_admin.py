@@ -7,7 +7,10 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
 
+from sqlalchemy import select, delete as sa_delete
+
 from ..services import kb_service
+from ..db.models import KBDocument
 from ..services.auth import CurrentUser, require_admin
 
 
@@ -228,3 +231,66 @@ async def revoke_access(
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="grant not found")
     await session.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+class DocOut(BaseModel):
+    id: int
+    kb_id: int
+    subtag_id: int
+    filename: str
+    mime_type: Optional[str]
+    ingest_status: str
+    chunk_count: int
+
+
+@router.get("/{kb_id}/documents", response_model=list[DocOut])
+async def list_documents(
+    kb_id: int,
+    user: CurrentUser = Depends(require_admin),
+    session: AsyncSession = Depends(_get_session),
+):
+    rows = (await session.execute(
+        select(KBDocument).where(KBDocument.kb_id == kb_id, KBDocument.deleted_at.is_(None))
+        .order_by(KBDocument.id.desc())
+    )).scalars().all()
+    return [DocOut(id=d.id, kb_id=d.kb_id, subtag_id=d.subtag_id, filename=d.filename,
+                   mime_type=d.mime_type, ingest_status=d.ingest_status, chunk_count=d.chunk_count)
+            for d in rows]
+
+
+@router.delete("/{kb_id}/documents/{doc_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_document(
+    kb_id: int, doc_id: int,
+    user: CurrentUser = Depends(require_admin),
+    session: AsyncSession = Depends(_get_session),
+):
+    # Soft-delete the DB row
+    from datetime import datetime, timezone
+    from sqlalchemy import update
+    r = await session.execute(
+        update(KBDocument).where(KBDocument.id == doc_id, KBDocument.kb_id == kb_id)
+        .values(deleted_at=datetime.now(timezone.utc))
+    )
+    if r.rowcount == 0:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="doc not found")
+    # TODO: also delete vectors from Qdrant for this doc_id (deferred — vectors become orphans until re-embed)
+    await session.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/{kb_id}/documents/{doc_id}/reembed")
+async def reembed_document(
+    kb_id: int, doc_id: int,
+    user: CurrentUser = Depends(require_admin),
+    session: AsyncSession = Depends(_get_session),
+):
+    doc = (await session.execute(
+        select(KBDocument).where(KBDocument.id == doc_id, KBDocument.kb_id == kb_id,
+                                 KBDocument.deleted_at.is_(None))
+    )).scalar_one_or_none()
+    if doc is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="doc not found")
+    # Re-embed requires the original file — which we don't store on disk in Phase 4.
+    # For now: return an error directing the admin to re-upload.
+    raise HTTPException(status.HTTP_501_NOT_IMPLEMENTED,
+                        detail="Re-embed requires re-upload (original files not stored on disk in this version)")

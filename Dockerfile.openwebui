@@ -38,7 +38,7 @@ RUN pip install --no-cache-dir uv && \
 # Our extra Python deps (not in upstream)
 RUN uv pip install --system --no-cache-dir \
     pyjwt pypdf tiktoken qdrant-client httpx pydantic-settings asyncpg \
-    'sqlalchemy[asyncio]' argon2-cffi
+    'sqlalchemy[asyncio]' argon2-cffi python-docx openpyxl
 
 # Frontend build output
 COPY --from=build /app/build /app/build
