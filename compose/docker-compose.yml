@@ -71,7 +71,7 @@ services:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - ../volumes/certs:/certs:ro
     depends_on:
-      - postgres   # real dependency added when open-webui lands
+      - open-webui
 
   vllm-chat:
     image: vllm/vllm-openai:latest
@@ -216,3 +216,52 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+
+  open-webui:
+    build:
+      context: ..
+      dockerfile: Dockerfile.openwebui
+    container_name: orgchat-open-webui
+    restart: unless-stopped
+    ports:
+      - "3000:8080"
+    environment:
+      PORT: "8080"
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY}
+      WEBUI_NAME: ${WEBUI_NAME}
+      ENABLE_SIGNUP: ${ENABLE_SIGNUP:-false}
+      DEFAULT_USER_ROLE: ${DEFAULT_USER_ROLE:-pending}
+      ENABLE_OPENAI_API: ${ENABLE_OPENAI_API:-true}
+      OPENAI_API_BASE_URL: ${OPENAI_API_BASE_URL:-http://vllm-chat:8000/v1}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-sk-internal-dummy}
+      ENABLE_OLLAMA_API: ${ENABLE_OLLAMA_API:-false}
+      ENABLE_WEB_SEARCH: ${ENABLE_WEB_SEARCH:-false}
+      ENABLE_IMAGE_GENERATION: ${ENABLE_IMAGE_GENERATION:-false}
+      ENABLE_RAG_WEB_LOADER: ${ENABLE_RAG_WEB_LOADER:-false}
+      AUDIO_STT_ENGINE: ${AUDIO_STT_ENGINE:-whisper-local}
+      RAG_EMBEDDING_ENGINE: ${RAG_EMBEDDING_ENGINE:-openai}
+      RAG_EMBEDDING_OPENAI_API_BASE_URL: ${RAG_EMBEDDING_OPENAI_API_BASE_URL:-http://tei:80/v1}
+      RAG_EMBEDDING_MODEL: ${RAG_EMBEDDING_MODEL:-BAAI/bge-m3}
+      VECTOR_DB: ${VECTOR_DB:-qdrant}
+      DATABASE_URL: ${DATABASE_URL}
+      QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
+      TEI_URL: ${TEI_URL:-http://tei:80}
+      AUTH_MODE: ${AUTH_MODE:-jwt}
+      RAG_VECTOR_SIZE: ${RAG_VECTOR_SIZE:-1024}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      SESSION_SECRET: ${SESSION_SECRET}
+    volumes:
+      - ../volumes/uploads:/app/backend/data/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s

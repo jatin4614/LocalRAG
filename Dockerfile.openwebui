@@ -1,0 +1,60 @@
+# Custom build: upstream Open WebUI + our KB extension
+# Extends upstream's multi-stage pattern.
+
+######## Frontend build ########
+FROM node:22-alpine3.20 AS build
+WORKDIR /app
+
+COPY upstream/package.json upstream/package-lock.json ./
+RUN npm ci --force
+
+# Copy ALL source (including our new Svelte files + patched backend files)
+COPY upstream/ .
+
+RUN npm run build
+
+######## Backend ########
+FROM python:3.11-slim-bookworm
+
+ARG UID=0
+ARG GID=0
+
+ENV ENV=prod \
+    PORT=8080 \
+    WEBUI_AUTH=true
+
+WORKDIR /app/backend
+
+# System deps (matching upstream)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl gcc g++ ffmpeg pandoc netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
+
+# Upstream Python deps
+COPY upstream/backend/requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir uv && \
+    uv pip install --system --no-cache-dir -r requirements.txt
+
+# Our extra Python deps (not in upstream)
+RUN uv pip install --system --no-cache-dir \
+    pyjwt pypdf tiktoken qdrant-client httpx pydantic-settings asyncpg \
+    'sqlalchemy[asyncio]' argon2-cffi
+
+# Frontend build output
+COPY --from=build /app/build /app/build
+COPY --from=build /app/CHANGELOG.md /app/CHANGELOG.md
+COPY --from=build /app/package.json /app/package.json
+
+# Upstream backend (with our patches already applied)
+COPY upstream/backend/ .
+
+# Our extension code
+COPY ext/ /app/ext/
+COPY scripts/apply_migrations.py /app/scripts/apply_migrations.py
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=10s --retries=5 --start-period=120s \
+  CMD curl -sf http://localhost:${PORT}/health || exit 1
+
+CMD ["bash", "start.sh"]
