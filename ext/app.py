@@ -76,6 +76,10 @@ def build_ext_routers():
     upload.configure(sessionmaker=SessionLocal, vector_store=vs, embedder=emb)
     rag.configure(sessionmaker=SessionLocal, vector_store=vs, embedder=emb)
 
+    # Configure RAG bridge for middleware injection
+    from .services import chat_rag_bridge
+    chat_rag_bridge.configure(vector_store=vs, embedder=emb, sessionmaker=SessionLocal)
+
     # Admin UI page (standalone HTML — no Svelte needed)
     from fastapi import APIRouter
     from fastapi.responses import HTMLResponse as HR

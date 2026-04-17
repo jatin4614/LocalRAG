@@ -62,3 +62,42 @@ index 008178806..da9b3b1ac 100644
  # SCIM 2.0 API for identity management
  if ENABLE_SCIM:
      app.include_router(scim.router, prefix='/api/v1/scim/v2', tags=['scim'])
+diff --git a/backend/open_webui/utils/middleware.py b/backend/open_webui/utils/middleware.py
+index b64febd67..3555e61e2 100644
+--- a/backend/open_webui/utils/middleware.py
++++ b/backend/open_webui/utils/middleware.py
+@@ -2701,6 +2701,34 @@ async def process_chat_payload(request, form_data, user, metadata, model):
+         except Exception as e:
+             log.exception(e)
+ 
++    # --- orgchat KB RAG injection (Phase 5b) ---
++    # Reads kb_config from: (1) top-level form_data field, (2) chat.meta in DB
++    try:
++        from ext.services.chat_rag_bridge import get_kb_config_for_chat, retrieve_kb_sources
++        _user_id = user.id if user else ''
++        _kb_config = None
++
++        # Method 1: kb_config passed as top-level field in the request body
++        _kb_config = form_data.pop('kb_config', None)
++
++        # Method 2: Fallback — read from chat.meta in DB
++        if not _kb_config and _user_id:
++            _chat_id = metadata.get('chat_id') or ''
++            if _chat_id:
++                _kb_config = await get_kb_config_for_chat(str(_chat_id), str(_user_id))
++
++        if _kb_config and prompt and _user_id:
++            log.info("orgchat: retrieving KB sources for %d KB(s)", len(_kb_config))
++            _kb_sources = await retrieve_kb_sources(_kb_config, prompt, str(_user_id))
++            if _kb_sources:
++                sources.extend(_kb_sources)
++                log.info("orgchat: injected %d KB source(s)", len(_kb_sources))
++            else:
++                log.info("orgchat: no KB sources found for query")
++    except Exception as _e_kb:
++        log.warning("orgchat KB RAG injection failed (non-fatal): %s", _e_kb, exc_info=True)
++    # --- end orgchat KB RAG injection ---
++
+     # Save the pre-RAG message state so the native tool call loop can
+     # restore to the true original (before file-source injection) rather
+     # than a snapshot that already has the RAG template baked in.
