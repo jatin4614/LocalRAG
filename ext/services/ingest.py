@@ -20,8 +20,15 @@ from .vector_store import VectorStore
 
 
 def _hybrid_enabled() -> bool:
-    """Read RAG_HYBRID at call time so tests can toggle it without reimport."""
-    return os.environ.get("RAG_HYBRID", "0") == "1"
+    """Read RAG_HYBRID at call time so tests can toggle it without reimport.
+
+    Default on as of 2026-04-19 — eval showed +12pp chunk_recall at +3ms.
+    Set RAG_HYBRID=0 to force dense-only. Any non-"0" value means "on".
+    Runtime fallback: even with hybrid on, ingest only computes sparse vectors
+    when the target collection was created with sparse support (via
+    ``_collection_has_sparse``) — legacy collections remain dense-only.
+    """
+    return os.environ.get("RAG_HYBRID", "1") != "0"
 
 # Stable namespace for deterministic point IDs (UUID5 based on doc_id + chunk_index).
 # Using the well-known URL namespace UUID so the value is fixed across deploys.

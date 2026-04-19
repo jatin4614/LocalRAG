@@ -7,11 +7,17 @@ It typically improves recall@10 on queries that mix named entities, acronyms,
 or rare terms (where dense retrieval under-weights exact matches) while
 preserving the semantic strength of pure-dense search.
 
-This feature is **off by default** — controlled by the `RAG_HYBRID`
-environment variable. Legacy collections that pre-date this change continue
-working via the dense-only path. See "Re-indexing legacy collections" below.
+This feature is **on by default** (as of 2026-04-19) — controlled by the
+`RAG_HYBRID` environment variable. An eval run on `kb_eval` (50 queries, k=10)
+showed +12pp chunk_recall and +10pp MRR at +3ms p50 vs. dense-only, which
+motivated flipping the default. Legacy collections that pre-date this change
+continue working via the dense-only path (the retriever probes for sparse
+support per-collection and falls back transparently). See "Re-indexing legacy
+collections" and "Falling back to dense-only" below.
 
 ## Enabling hybrid
+
+Hybrid is on by default. To prepare a new deployment:
 
 1. **Install the `hybrid` extra.** Pulls in `fastembed` (~150 MB including
    `onnxruntime`, `pillow`, `mmh3`, `py_rust_stemmers`). The BM25 model itself
@@ -19,17 +25,33 @@ working via the dense-only path. See "Re-indexing legacy collections" below.
    ```bash
    pip install '.[hybrid]'
    ```
-2. **Set the flag.**
+2. **(Optional) confirm the flag.** The default is on; you only need to set
+   this if a prior operator set it to `0`:
    ```bash
-   export RAG_HYBRID=1
+   export RAG_HYBRID=1   # or unset it — unset also means on
    ```
 3. **Create new KBs with sparse support.** Collections created via the upload
-   path after this flag is set are created with both dense AND sparse named
+   path while hybrid is on are created with both dense AND sparse named
    vectors; these automatically take the hybrid retrieval path. See the
    ingest path in `ext/services/ingest.py` — it calls
    `vector_store.ensure_collection(name, with_sparse=True)` when hybrid is on.
 4. **Restart the service.** The flag is read at call-time but hot-reloading
    of collections in an already-running process is not yet implemented.
+
+## Falling back to dense-only
+
+Hybrid is now default-on. To force dense-only (e.g. when benchmarking
+pure-dense recall, or during an incident where fastembed misbehaves):
+
+    export RAG_HYBRID=0
+
+Legacy collections without sparse vectors AUTOMATICALLY fall back to
+dense-only even with `RAG_HYBRID=1` (the retriever probes for sparse
+support per collection via `_collection_has_sparse`).
+
+Semantics note: the flag is permissive — any non-`"0"` value (including
+empty string, `"yes"`, `"true"`) means **on**. Only the literal string
+`"0"` disables hybrid.
 
 ## Re-indexing legacy collections
 
@@ -98,6 +120,7 @@ curl http://localhost:6333/collections/kb_new | jq .result.config.params
 ### Regression: dense-only queries mismatch pre-hybrid output
 
 They shouldn't — the `RAG_HYBRID=0` path is byte-identical to pre-P1.1
-behaviour. If you see differences, confirm the env var is actually 0 (not
-"false" or "False" — only "0" disables) and that `ensure_collection` was
-called WITHOUT `with_sparse=True` for the collection in question.
+behaviour. If you see differences, confirm the env var is actually set
+to the literal string `"0"` (any other value — including unset, empty,
+`"false"`, `"False"` — now means **on**) and that `ensure_collection`
+was called WITHOUT `with_sparse=True` for the collection in question.

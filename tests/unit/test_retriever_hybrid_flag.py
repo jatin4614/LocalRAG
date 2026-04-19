@@ -33,8 +33,12 @@ def _make_vs_stub(*, sparse_support: bool):
 
 @pytest.mark.asyncio
 async def test_hybrid_flag_off_uses_dense_search(monkeypatch) -> None:
-    """Default (no env var / flag=0): retriever must call vs.search only."""
-    monkeypatch.delenv("RAG_HYBRID", raising=False)
+    """Flag explicitly off ("0"): retriever must call vs.search only.
+
+    As of 2026-04-19 the default flipped to on; this test now sets the flag
+    to "0" explicitly to cover the force-dense-only path.
+    """
+    monkeypatch.setenv("RAG_HYBRID", "0")
     vs = _make_vs_stub(sparse_support=True)  # Even if collection supports sparse.
     hits = await retrieve(
         query="hello",

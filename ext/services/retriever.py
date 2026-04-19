@@ -10,8 +10,13 @@ from .vector_store import Hit, VectorStore
 
 
 def _hybrid_enabled() -> bool:
-    """Read RAG_HYBRID at call time (not import time) so tests can toggle it."""
-    return os.environ.get("RAG_HYBRID", "0") == "1"
+    """Read RAG_HYBRID at call time (not import time) so tests can toggle it.
+
+    Default on as of 2026-04-19 — eval showed +12pp chunk_recall at +3ms.
+    Set RAG_HYBRID=0 to force dense-only. Any non-"0" value (including empty,
+    "yes", "true") means "on" — more forgiving and matches user intent.
+    """
+    return os.environ.get("RAG_HYBRID", "1") != "0"
 
 
 async def retrieve(
@@ -30,10 +35,11 @@ async def retrieve(
         empty subtag_ids → search all subtags in that KB.
     Returns a flat list of Hit objects sorted by raw score descending, trimmed to total_limit.
 
-    When RAG_HYBRID=1 is set in the environment AND a given collection was
-    created with sparse-vector support, retrieval uses hybrid RRF fusion. Any
-    collection that lacks sparse support silently falls back to dense-only
-    search (preserves backward compatibility with legacy collections).
+    Hybrid retrieval is on by default (RAG_HYBRID unset → on). When hybrid is
+    enabled AND a given collection was created with sparse-vector support,
+    retrieval uses hybrid RRF fusion. Any collection that lacks sparse support
+    silently falls back to dense-only search (preserves backward compatibility
+    with legacy collections). Set RAG_HYBRID=0 to force dense-only globally.
     """
     [qvec] = await embedder.embed([query])
     hybrid = _hybrid_enabled()
