@@ -7,9 +7,14 @@ from __future__ import annotations
 
 import contextvars
 import logging
+import os as _os
 from typing import List, Optional
 
 logger = logging.getLogger("orgchat.rag_bridge")
+
+# P0.5 — history-aware query rewrite (flag-gated OFF by default).
+# When RAG_DISABLE_REWRITE=1 (default), behavior is byte-identical to pre-P0.5.
+_RAG_DISABLE_REWRITE = _os.environ.get("RAG_DISABLE_REWRITE", "1") == "1"
 
 request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
 user_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("user_id", default="-")
@@ -52,6 +57,7 @@ async def retrieve_kb_sources(
     query: str,
     user_id: str,
     chat_id: Optional[str] = None,  # NEW: enables private chat doc retrieval
+    history: Optional[List[dict]] = None,  # P0.5: prior turns for query rewrite
 ) -> List[dict]:
     """Retrieve from our KB pipeline and format as upstream-compatible source dicts.
 
@@ -60,6 +66,9 @@ async def retrieve_kb_sources(
         query: the user's message text
         user_id: for RBAC verification
         chat_id: current chat ID — if set, private docs in collection chat_{id} are included
+        history: prior conversation turns (role/content dicts). When set AND
+            RAG_DISABLE_REWRITE=0, the query is rewritten into a standalone form
+            before retrieval. Default None preserves pre-P0.5 behavior.
 
     Returns:
         List of source dicts in upstream's format:
@@ -71,6 +80,19 @@ async def retrieve_kb_sources(
 
     if not query:
         return []
+
+    # P0.5: optionally rewrite the query using conversation history.
+    # Default OFF (RAG_DISABLE_REWRITE=1) → code path below is byte-identical
+    # to the previous release. Flip the flag to engage.
+    if not _RAG_DISABLE_REWRITE and history:
+        from .query_rewriter import rewrite_query as _rewrite_query
+        query = await _rewrite_query(
+            latest_turn=query,
+            history=history,
+            chat_url=_os.environ.get("OPENAI_API_BASE_URL", "http://vllm-chat:8000/v1"),
+            chat_model=_os.environ.get("REWRITE_MODEL", _os.environ.get("CHAT_MODEL", "orgchat-chat")),
+            api_key=_os.environ.get("OPENAI_API_KEY"),
+        )
 
     # If neither KBs nor chat has private docs, early exit
     if not kb_config and not chat_id:
