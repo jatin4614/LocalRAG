@@ -38,7 +38,7 @@ async def _retrieve_kb_eval(
 ) -> list[Hit]:
     [qvec] = await emb.embed([query])
     use_hybrid = False
-    if os.environ.get("RAG_HYBRID", "0") == "1":
+    if os.environ.get("RAG_HYBRID", "1") != "0":
         try:
             use_hybrid = await vs._refresh_sparse_cache(COLLECTION)
         except Exception:
