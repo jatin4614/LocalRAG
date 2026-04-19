@@ -13,6 +13,9 @@ _PAYLOAD_FIELDS = [
     "filename", "chunk_index", "deleted",
     # P0.4 structural metadata + pipeline provenance.
     "page", "heading_path", "sheet", "model_version",
+    # P2.2 tenant-owner attribution — indexed as tenant field for RBAC
+    # hot-path filters (admin-wide scoped queries skip other owners' subgraphs).
+    "owner_user_id",
 ]
 
 # Name of the named dense vector when a collection is created with sparse vectors
@@ -93,7 +96,28 @@ class VectorStore:
                 raise
         # Create payload indexes for fast filtered queries (idempotent — Qdrant
         # silently ignores duplicate index creation).
-        for field in ("kb_id", "subtag_id", "doc_id", "chat_id", "deleted"):
+        #
+        # Tenant fields get ``KeywordIndexParams(is_tenant=True)``: hints to
+        # Qdrant 1.11+ that each unique value partitions the data into a
+        # tenant sub-graph, unlocking filtered-HNSW optimizations that skip
+        # cross-tenant sub-graphs during search. Within-tenant filters
+        # (subtag/doc/deleted) stay as plain KEYWORD — those discriminate
+        # rows within a tenant, not between tenants.
+        tenant_fields = ("kb_id", "chat_id", "owner_user_id")
+        filter_fields = ("subtag_id", "doc_id", "deleted")
+        for field in tenant_fields:
+            try:
+                await self._client.create_payload_index(
+                    collection_name=name,
+                    field_name=field,
+                    field_schema=qm.KeywordIndexParams(
+                        type="keyword",
+                        is_tenant=True,
+                    ),
+                )
+            except Exception:
+                pass  # index already exists
+        for field in filter_fields:
             try:
                 await self._client.create_payload_index(
                     collection_name=name,
