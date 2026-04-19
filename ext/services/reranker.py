@@ -24,14 +24,21 @@ def rerank(hits: List[Hit], *, top_k: int = 10) -> List[Hit]:
     if len(ordered) >= 2 and ordered[1].score > 0 and (ordered[0].score / ordered[1].score) > FAST_PATH_RATIO:
         return ordered[:top_k]
 
-    max_by_kb: dict[int, float] = defaultdict(float)
+    def _kb_key(h: Hit) -> Any:
+        v = h.payload.get("kb_id", -1)
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return v  # non-numeric (e.g., "eval") — group by raw value
+
+    max_by_kb: dict[Any, float] = defaultdict(float)
     for h in hits:
-        kb = int(h.payload.get("kb_id", -1))
+        kb = _kb_key(h)
         if h.score > max_by_kb[kb]:
             max_by_kb[kb] = h.score
 
     def normalized(h: Hit) -> float:
-        kb = int(h.payload.get("kb_id", -1))
+        kb = _kb_key(h)
         m = max_by_kb[kb]
         return h.score / m if m > 0 else h.score
 

@@ -208,15 +208,32 @@ class VectorStore:
         limit: int = 10,
         subtag_ids: Optional[list[int]] = None,
     ) -> List[Hit]:
-        """Dense-only search — preserved byte-identically for legacy / flag-off paths."""
+        """Dense-only search.
+
+        For legacy collections (unnamed single vector) this is byte-identical to
+        before. For hybrid-shaped collections (named ``dense`` + ``bm25``), Qdrant
+        requires the caller to name which vector it's querying — we route via
+        ``using=_DENSE_NAME`` when the sparse cache indicates this collection
+        was created with ``with_sparse=True``.
+        """
         flt = self._build_filter(subtag_ids=subtag_ids)
-        response = await self._client.query_points(
-            collection_name=name,
-            query=query_vector,
-            limit=limit,
-            query_filter=flt,
-            with_payload=_PAYLOAD_FIELDS,
-        )
+        # Warm the sparse cache lazily (cheap, cached on first call) so legacy
+        # callers that only use dense still route correctly against hybrid collections.
+        if name not in self._sparse_cache:
+            try:
+                await self._refresh_sparse_cache(name)
+            except Exception:
+                pass
+        kwargs = {
+            "collection_name": name,
+            "query": query_vector,
+            "limit": limit,
+            "query_filter": flt,
+            "with_payload": _PAYLOAD_FIELDS,
+        }
+        if self._sparse_cache.get(name):
+            kwargs["using"] = _DENSE_NAME
+        response = await self._client.query_points(**kwargs)
         return [Hit(id=r.id, score=r.score, payload=r.payload or {}) for r in response.points]
 
     async def hybrid_search(
