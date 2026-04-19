@@ -40,7 +40,25 @@ set -a; source compose/.env; set +a
 
 say "Step 1/6: preflight model weights"
 if [[ $SKIP_PULL -eq 0 ]]; then
-  do_run "python scripts/preflight_models.py"
+  # Gate: if every expected model already exists in the cache, skip the (slow)
+  # download. Otherwise run the full preflight. --verify-only exits 0 on hit,
+  # 2 on miss; any other code indicates a real error we should not swallow.
+  if [[ $DRY_RUN -eq 1 ]]; then
+    do_run "python scripts/preflight_models.py --dry-run"
+  else
+    if python scripts/preflight_models.py --verify-only; then
+      say "  preflight: all models present, skipping download"
+    else
+      rc=$?
+      if [[ $rc -eq 2 ]]; then
+        say "  preflight: missing models, downloading (this may take a while)"
+        python scripts/preflight_models.py
+      else
+        echo "!! preflight --verify-only exited with $rc (not a missing-cache signal); aborting" >&2
+        exit $rc
+      fi
+    fi
+  fi
 else
   say "  (--skip-pull: assuming weights already cached)"
 fi
