@@ -55,15 +55,23 @@ async def ingest_bytes(
 
     now = time.time_ns()
     pv = current_version()
+
+    # Defensive coercion — main historically passed str(doc.id); we now store
+    # doc_id as int consistently. If the caller supplied a numeric string
+    # (legacy callers, worker retries), coerce it; non-numeric values are
+    # left untouched so we don't mask genuine misuse.
+    if "doc_id" in payload_base and payload_base["doc_id"] is not None:
+        try:
+            payload_base = {**payload_base, "doc_id": int(payload_base["doc_id"])}
+        except (ValueError, TypeError):
+            pass  # non-numeric doc_id — leave as-is (shouldn't happen in practice)
+
     doc_id = payload_base.get("doc_id")
     chat_id = payload_base.get("chat_id")
 
     points = []
     for gidx, ((chunk, block), vec) in enumerate(zip(paired, vectors)):
         payload = dict(payload_base)
-        # Store doc_id as string for consistent filtering/matching downstream.
-        if doc_id is not None:
-            payload["doc_id"] = str(doc_id)
         payload["chunk_index"] = gidx
         payload["text"] = chunk.text
         payload["uploaded_at"] = now
