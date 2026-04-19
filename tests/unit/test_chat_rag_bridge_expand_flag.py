@@ -50,7 +50,7 @@ async def _fake_allowed(session, *, user_id):  # noqa: ARG001
     return [1]
 
 
-async def _fake_retrieve(*, query, selected_kbs, chat_id, vector_store, embedder, per_kb_limit=10, total_limit=30):  # noqa: ARG001
+async def _fake_retrieve(*, query, selected_kbs, chat_id, vector_store, embedder, per_kb_limit=10, total_limit=30, **kwargs):  # noqa: ARG001
     return [
         _FakeHit(
             id=1,

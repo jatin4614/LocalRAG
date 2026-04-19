@@ -28,6 +28,7 @@ async def retrieve(
     embedder: Embedder,
     per_kb_limit: int = 10,
     total_limit: int = 30,
+    owner_user_id: Optional[int | str] = None,
 ) -> List[Hit]:
     """Run parallel searches against each selected KB and an optional chat namespace.
 
@@ -40,6 +41,13 @@ async def retrieve(
     retrieval uses hybrid RRF fusion. Any collection that lacks sparse support
     silently falls back to dense-only search (preserves backward compatibility
     with legacy collections). Set RAG_HYBRID=0 to force dense-only globally.
+
+    P2.2: ``owner_user_id`` is forwarded ONLY to chat-scoped namespace searches
+    (``chat_{chat_id}``) — KB collections stay shared across all users with
+    access. When None (default) no owner filter is applied anywhere, making
+    the default path byte-identical to pre-P2.2. This is the per-user isolation
+    invariant for private chat docs: even within a consolidated chat collection
+    (P2.3), two users' docs cannot cross-pollinate.
 
     Semantic cache (P2.6) is gated behind RAG_SEMCACHE=1. Default OFF — the
     module is only imported when the flag is on, so the default path has zero
@@ -65,7 +73,12 @@ async def retrieve(
                     for c in cached
                 ][:total_limit]
 
-    async def _search_one(collection: str, subtag_ids: Optional[list[int]] = None) -> List[Hit]:
+    async def _search_one(
+        collection: str,
+        subtag_ids: Optional[list[int]] = None,
+        *,
+        owner_filter: Optional[int | str] = None,
+    ) -> List[Hit]:
         use_hybrid = False
         if hybrid:
             # Warm the sparse-support cache for this collection; on failure
@@ -84,9 +97,11 @@ async def retrieve(
                 return await vector_store.hybrid_search(
                     collection, qvec, query,
                     limit=per_kb_limit, subtag_ids=subtag_ids,
+                    owner_user_id=owner_filter,
                 )
             return await vector_store.search(
                 collection, qvec, limit=per_kb_limit, subtag_ids=subtag_ids,
+                owner_user_id=owner_filter,
             )
         except Exception:
             return []
@@ -94,12 +109,20 @@ async def retrieve(
     async def _search_kb(cfg: dict) -> List[Hit]:
         kb_id = cfg["kb_id"]
         subtag_ids = cfg.get("subtag_ids") or None
+        # KB collections are shared — do NOT filter by owner_user_id.
         return await _search_one(f"kb_{kb_id}", subtag_ids=subtag_ids)
 
     async def _search_chat() -> List[Hit]:
         if chat_id is None:
             return []
-        return await _search_one(f"chat_{chat_id}")
+        # Chat-scoped namespace — enforce per-user isolation when an owner
+        # is provided. With a dedicated ``chat_{chat_id}`` collection and a
+        # single owner, this is redundant today but becomes load-bearing once
+        # P2.3 merges all private chat docs into a single ``chat_private``
+        # collection sharded only by ``owner_user_id`` + ``chat_id``.
+        return await _search_one(
+            f"chat_{chat_id}", owner_filter=owner_user_id,
+        )
 
     tasks = [_search_kb(cfg) for cfg in selected_kbs]
     tasks.append(_search_chat())

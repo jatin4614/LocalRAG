@@ -141,6 +141,18 @@ async def upload_kb_doc(
     session.add(doc)
     await session.flush()
 
+    # P2.2: stamp the uploading admin's id on every chunk as an audit trail.
+    # Retrieval does NOT filter KB collections by owner (KBs stay shared across
+    # all users with kb_access grants), but the field is recorded for future
+    # audit queries, data-export scrubbing, and consistency with the private
+    # chat path.
+    kb_payload_base = {
+        "kb_id": kb_id,
+        "subtag_id": subtag_id,
+        "doc_id": doc.id,
+        "owner_user_id": user.id,
+    }
+
     if RAG_SYNC_INGEST:
         try:
             await _VS.ensure_collection(f"kb_{kb_id}")
@@ -149,7 +161,7 @@ async def upload_kb_doc(
                 mime_type=file.content_type or "application/octet-stream",
                 filename=safe_name,
                 collection=f"kb_{kb_id}",
-                payload_base={"kb_id": kb_id, "subtag_id": subtag_id, "doc_id": doc.id},
+                payload_base=kb_payload_base,
                 vector_store=_VS,
                 embedder=_EMB,
             )
@@ -176,7 +188,7 @@ async def upload_kb_doc(
         file.content_type or "application/octet-stream",
         safe_name,
         f"kb_{kb_id}",
-        {"kb_id": kb_id, "subtag_id": subtag_id, "doc_id": doc.id},
+        kb_payload_base,
     )
     doc.ingest_status = "queued"
     await session.commit()

@@ -73,8 +73,10 @@ def _mk_hits(n: int) -> list[_FakeHit]:
 
 
 async def _fake_retrieve_30(*, query, selected_kbs, chat_id, vector_store, embedder,  # noqa: ARG001
-                            per_kb_limit=10, total_limit=30):
+                            per_kb_limit=10, total_limit=30, **kwargs):
     # Return 30 so rerank can pull 20 when MMR is on.
+    # ``**kwargs`` swallows extra kwargs (e.g. P2.2's owner_user_id) without
+    # this fake having to track signature changes in ``retrieve()``.
     return _mk_hits(30)
 
 

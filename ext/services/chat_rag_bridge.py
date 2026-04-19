@@ -155,6 +155,10 @@ async def retrieve_kb_sources(
                     embedder=_embedder,
                     per_kb_limit=10,
                     total_limit=30,
+                    # P2.2: enforce per-user isolation on chat-scoped hits.
+                    # KB hits are unaffected (retriever only applies the owner
+                    # filter to chat namespaces).
+                    owner_user_id=user_id,
                 )
 
             # Per-hit KB counter. Fails open — any bad payload is silently

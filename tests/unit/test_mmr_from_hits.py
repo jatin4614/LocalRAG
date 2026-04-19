@@ -208,7 +208,7 @@ async def test_default_flag_path_does_not_import_mmr_module(monkeypatch):
         score: float
         payload: dict
 
-    async def _fake_retrieve(*, query, selected_kbs, chat_id, vector_store, embedder, per_kb_limit=10, total_limit=30):  # noqa: ARG001
+    async def _fake_retrieve(*, query, selected_kbs, chat_id, vector_store, embedder, per_kb_limit=10, total_limit=30, **kwargs):  # noqa: ARG001
         return [
             _FakeHit(
                 id=1, score=0.9,
@@ -293,7 +293,7 @@ async def test_flag_on_imports_and_reorders_via_mmr(monkeypatch):
         score: float
         payload: dict
 
-    async def _fake_retrieve(*, query, selected_kbs, chat_id, vector_store, embedder, per_kb_limit=10, total_limit=30):  # noqa: ARG001
+    async def _fake_retrieve(*, query, selected_kbs, chat_id, vector_store, embedder, per_kb_limit=10, total_limit=30, **kwargs):  # noqa: ARG001
         return [
             _FakeHit(id=i, score=0.9 - i * 0.1, payload={
                 "text": f"t{i}", "kb_id": 1, "subtag_id": None,

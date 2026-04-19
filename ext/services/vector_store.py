@@ -262,12 +262,39 @@ class VectorStore:
 
     @staticmethod
     def _build_filter(
-        *, subtag_ids: Optional[list[int]] = None
+        *,
+        subtag_ids: Optional[list[int]] = None,
+        owner_user_id: Optional[int | str] = None,
     ) -> qm.Filter:
+        """Build the standard Qdrant filter for every read path.
+
+        When ``owner_user_id`` is passed, a ``must`` condition pins matches to
+        that owner. Numeric strings are coerced to int so callers that pass
+        ``"7"`` still match points stamped with integer ``7`` (defensive —
+        mirrors ingest's ``doc_id`` coercion). Non-numeric strings (UUIDs from
+        upstream Open WebUI) pass through unchanged.
+
+        Default ``owner_user_id=None`` means no owner filter — byte-identical
+        to the pre-P2.2 behaviour. This preserves KB retrieval semantics where
+        every user with KB access sees every chunk regardless of uploader.
+        """
         must_conditions = []
         if subtag_ids:
             must_conditions.append(
                 qm.FieldCondition(key="subtag_id", match=qm.MatchAny(any=subtag_ids))
+            )
+        if owner_user_id is not None:
+            match_val: int | str = owner_user_id
+            if isinstance(owner_user_id, str):
+                try:
+                    match_val = int(owner_user_id)
+                except (ValueError, TypeError):
+                    match_val = owner_user_id  # UUID string — leave alone
+            must_conditions.append(
+                qm.FieldCondition(
+                    key="owner_user_id",
+                    match=qm.MatchValue(value=match_val),
+                )
             )
         must_not_conditions = [
             qm.FieldCondition(key="deleted", match=qm.MatchValue(value=True))
@@ -284,6 +311,7 @@ class VectorStore:
         *,
         limit: int = 10,
         subtag_ids: Optional[list[int]] = None,
+        owner_user_id: Optional[int | str] = None,
     ) -> List[Hit]:
         """Dense-only search.
 
@@ -292,8 +320,11 @@ class VectorStore:
         requires the caller to name which vector it's querying — we route via
         ``using=_DENSE_NAME`` when the sparse cache indicates this collection
         was created with ``with_sparse=True``.
+
+        P2.2: ``owner_user_id`` adds a ``must`` condition on the owner field.
+        Default None = no owner filter = byte-identical to pre-P2.2.
         """
-        flt = self._build_filter(subtag_ids=subtag_ids)
+        flt = self._build_filter(subtag_ids=subtag_ids, owner_user_id=owner_user_id)
         # Warm the sparse cache lazily (cheap, cached on first call) so legacy
         # callers that only use dense still route correctly against hybrid collections.
         if name not in self._sparse_cache:
@@ -323,6 +354,7 @@ class VectorStore:
         *,
         limit: int = 10,
         subtag_ids: Optional[list[int]] = None,
+        owner_user_id: Optional[int | str] = None,
     ) -> List[Hit]:
         """Server-side RRF fusion of dense + BM25 sparse results.
 
@@ -330,10 +362,14 @@ class VectorStore:
         Uses Qdrant's ``query_points`` with two ``Prefetch`` arms (dense + sparse)
         fused via ``FusionQuery(Fusion.RRF)``. Each prefetch pulls ``limit*2``
         candidates to give RRF enough material to rerank. Requires Qdrant ≥ 1.11.
+
+        P2.2: ``owner_user_id`` propagates to both prefetch arms and the outer
+        filter so RRF can only surface chunks owned by the given user. Default
+        None = byte-identical to pre-P2.2.
         """
         from .sparse_embedder import embed_sparse_query
 
-        flt = self._build_filter(subtag_ids=subtag_ids)
+        flt = self._build_filter(subtag_ids=subtag_ids, owner_user_id=owner_user_id)
         indices, values = embed_sparse_query(query_text)
         # P2.4: apply hnsw_ef to the dense prefetch arm. Sparse uses BM25
         # (no HNSW), so SearchParams on that arm is a no-op — we still attach
