@@ -14,7 +14,6 @@ EXPECTED_DIRS = [
     "compose",
     "compose/caddy",
     "branding",
-    "volumes",  # gitignored, but present for bind mounts
 ]
 
 EXPECTED_INITS = [
