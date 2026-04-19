@@ -1,12 +1,48 @@
 """Thin async wrapper over qdrant-client."""
 from __future__ import annotations
 
+import os
 import uuid
 from dataclasses import dataclass
 from typing import Iterable, List, Optional
 
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http import models as qm
+
+
+# --- P2.4 HNSW tuning knobs ---------------------------------------------------
+# Env-tunable with sane defaults. Defaults match Qdrant's built-in defaults
+# EXCEPT ``ef_construct`` (200, up from 100 — +2-3pp recall at modest index-time
+# cost). All knobs are read lazily at call time so tests / operators can flip
+# them via env without re-importing the module.
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (ValueError, TypeError):
+        return default
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    val = os.environ.get(name, "").strip().lower()
+    if not val:
+        return default
+    return val in ("1", "true", "yes", "on")
+
+
+def _hnsw_config_diff() -> qm.HnswConfigDiff:
+    """Build the HNSW config applied at collection creation."""
+    return qm.HnswConfigDiff(
+        m=_env_int("RAG_QDRANT_M", 16),
+        ef_construct=_env_int("RAG_QDRANT_EF_CONSTRUCT", 200),
+        full_scan_threshold=_env_int("RAG_QDRANT_FULL_SCAN_THRESHOLD", 10000),
+    )
+
+
+def _search_params() -> qm.SearchParams:
+    """Build the per-query SearchParams (hnsw_ef)."""
+    return qm.SearchParams(hnsw_ef=_env_int("RAG_QDRANT_EF", 128))
 
 _PAYLOAD_FIELDS = [
     "text", "kb_id", "subtag_id", "doc_id", "chat_id",
@@ -34,7 +70,15 @@ class Hit:
 
 class VectorStore:
     def __init__(self, *, url: str, vector_size: int, distance: str = "Cosine") -> None:
-        self._client = AsyncQdrantClient(url=url)
+        # P2.4: configurable connection pool + longer timeout so batch upserts
+        # under high concurrency don't starve or time out. ``pool_size`` maps
+        # to httpx's max_connections; ``timeout`` is the per-request deadline
+        # (the default 5s is fine for reads but tight for big upsert batches).
+        self._client = AsyncQdrantClient(
+            url=url,
+            timeout=30.0,
+            pool_size=_env_int("RAG_QDRANT_MAX_CONNS", 32),
+        )
         self._vector_size = vector_size
         self._distance = distance
         self._known: set[str] = set()
@@ -63,6 +107,11 @@ class VectorStore:
         """
         if name in self._known:
             return
+        # P2.4: HNSW tuning — built from env on every create call so operators
+        # can change defaults without restarting. ``on_disk_payload`` lets very
+        # large KBs spill payloads to disk (keep RAM for HNSW graph).
+        hnsw = _hnsw_config_diff()
+        on_disk_payload = _env_bool("RAG_QDRANT_ON_DISK_PAYLOAD", False)
         try:
             if with_sparse:
                 await self._client.create_collection(
@@ -78,6 +127,8 @@ class VectorStore:
                             modifier=qm.Modifier.IDF,
                         ),
                     },
+                    hnsw_config=hnsw,
+                    on_disk_payload=on_disk_payload,
                 )
                 self._sparse_cache[name] = True
             else:
@@ -87,6 +138,8 @@ class VectorStore:
                         size=self._vector_size,
                         distance=qm.Distance[self._distance.upper()],
                     ),
+                    hnsw_config=hnsw,
+                    on_disk_payload=on_disk_payload,
                 )
                 self._sparse_cache[name] = False
         except Exception:
@@ -254,6 +307,8 @@ class VectorStore:
             "limit": limit,
             "query_filter": flt,
             "with_payload": _PAYLOAD_FIELDS,
+            # P2.4: per-query HNSW ``ef`` knob. Higher → better recall, slower.
+            "search_params": _search_params(),
         }
         if self._sparse_cache.get(name):
             kwargs["using"] = _DENSE_NAME
@@ -280,12 +335,17 @@ class VectorStore:
 
         flt = self._build_filter(subtag_ids=subtag_ids)
         indices, values = embed_sparse_query(query_text)
+        # P2.4: apply hnsw_ef to the dense prefetch arm. Sparse uses BM25
+        # (no HNSW), so SearchParams on that arm is a no-op — we still attach
+        # it to the dense arm only to keep the call site explicit.
+        sp = _search_params()
         prefetch = [
             qm.Prefetch(
                 query=query_vector,
                 using=_DENSE_NAME,
                 filter=flt,
                 limit=limit * 2,
+                params=sp,
             ),
             qm.Prefetch(
                 query=qm.SparseVector(indices=indices, values=values),
@@ -333,3 +393,20 @@ class VectorStore:
             return 1
         except Exception:
             return 0
+
+    async def optimize_collection(self, name: str) -> None:
+        """P2.4: nudge Qdrant to re-balance the HNSW graph.
+
+        Setting ``indexing_threshold=0`` forces the optimizer to index the
+        full graph immediately — useful after bulk upserts or after raising
+        ``ef_construct`` on an existing collection (the change only affects
+        new inserts until a rebuild). Best-effort: errors are swallowed so
+        callers can fire-and-forget from admin scripts.
+        """
+        try:
+            await self._client.update_collection(
+                collection_name=name,
+                optimizer_config=qm.OptimizersConfigDiff(indexing_threshold=0),
+            )
+        except Exception:
+            pass
