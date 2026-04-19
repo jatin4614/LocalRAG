@@ -133,6 +133,25 @@ async def retrieve_kb_sources(
         # P1.2 — dispatch through rerank_with_flag. Default (RAG_RERANK unset/0)
         # calls ``rerank`` which is byte-identical to the previous behaviour.
         reranked = rerank_with_flag(query, raw_hits, top_k=10, fallback_fn=rerank)
+
+        # P1.3 — MMR diversification (flag-gated). Reads the flag at call time
+        # so tests can monkeypatch the env without module reload. When the flag
+        # is off (default) the ``mmr`` module is never imported. Fails open:
+        # any MMR error is swallowed and we keep the reranker output.
+        if _os.environ.get("RAG_MMR", "0") == "1" and reranked:
+            try:
+                from .mmr import mmr_rerank_from_hits
+                _mmr_lambda = float(_os.environ.get("RAG_MMR_LAMBDA", "0.7"))
+                reranked = await mmr_rerank_from_hits(
+                    query, reranked, _embedder,
+                    top_k=len(reranked), lambda_=_mmr_lambda,
+                )
+            except Exception:
+                # Fail open: on any MMR error, stick with reranker output.
+                pass
+
+        # P1.4 context-expansion hook goes here — leave a blank line.
+
         budgeted = budget_chunks(reranked, max_tokens=4000)
     except Exception as e:
         logger.exception("KB retrieval failed: %s", e)
