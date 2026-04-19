@@ -51,6 +51,10 @@ from ext.services.pipeline_version import current_version  # noqa: E402
 # Stable namespace for deterministic point IDs (matches ext/services/ingest.py).
 _POINT_NS = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
 
+# Named-vector keys for hybrid (must match VectorStore constants).
+_DENSE_NAME = "dense"
+_SPARSE_NAME = "bm25"
+
 
 # Fixed allowlist of in-worktree docs we always try to include. Missing files
 # are silently skipped so the script works on lightly-populated checkouts.
@@ -156,17 +160,35 @@ async def _tei_embed(client: httpx.AsyncClient, texts: list[str]) -> list[list[f
 
 
 async def _ensure_collection(
-    qdrant: AsyncQdrantClient, name: str, *, vector_size: int
+    qdrant: AsyncQdrantClient, name: str, *, vector_size: int, with_sparse: bool
 ) -> None:
-    """Create the collection if missing. Payload indexes match VectorStore."""
+    """Create the collection if missing. Payload indexes match VectorStore.
+
+    ``with_sparse=True`` creates a hybrid-shaped collection (named ``dense``
+    + named ``bm25`` sparse). Default is legacy unnamed single-vector shape
+    (byte-identical to the pre-hybrid path).
+    """
     cols = (await qdrant.get_collections()).collections
     if not any(c.name == name for c in cols):
-        await qdrant.create_collection(
-            collection_name=name,
-            vectors_config=qm.VectorParams(
-                size=vector_size, distance=qm.Distance.COSINE
-            ),
-        )
+        if with_sparse:
+            await qdrant.create_collection(
+                collection_name=name,
+                vectors_config={
+                    _DENSE_NAME: qm.VectorParams(
+                        size=vector_size, distance=qm.Distance.COSINE
+                    ),
+                },
+                sparse_vectors_config={
+                    _SPARSE_NAME: qm.SparseVectorParams(modifier=qm.Modifier.IDF),
+                },
+            )
+        else:
+            await qdrant.create_collection(
+                collection_name=name,
+                vectors_config=qm.VectorParams(
+                    size=vector_size, distance=qm.Distance.COSINE
+                ),
+            )
     # Payload indexes — idempotent.
     for field in ("kb_id", "subtag_id", "doc_id", "chat_id", "deleted"):
         try:
@@ -177,6 +199,21 @@ async def _ensure_collection(
             )
         except Exception:
             pass
+
+
+async def _collection_has_sparse(qdrant: AsyncQdrantClient, name: str) -> Optional[bool]:
+    """Return True/False/None for (hybrid, legacy, missing).
+
+    Used to decide whether the on-disk shape matches the ``--with-sparse``
+    request; a mismatch requires ``--force`` to wipe-and-recreate because
+    Qdrant cannot upgrade a collection's vector config in place.
+    """
+    try:
+        info = await qdrant.get_collection(collection_name=name)
+    except Exception:
+        return None
+    sparse = getattr(info.config.params, "sparse_vectors", None) if info and info.config else None
+    return bool(sparse) and _SPARSE_NAME in sparse
 
 
 async def _collection_point_count(
@@ -201,35 +238,78 @@ async def seed(args) -> int:
         print("no source files found — nothing to seed", file=sys.stderr)
         return 3
 
+    # Lazy import so dense-only callers don't need fastembed installed.
+    embed_sparse = None
+    if args.with_sparse:
+        try:
+            from ext.services.sparse_embedder import embed_sparse as _es
+            embed_sparse = _es
+        except Exception as e:  # ImportError or SparseEmbeddingNotAvailable
+            print(
+                f"--with-sparse requires fastembed: {e}. "
+                f"Install via `pip install 'fastembed>=0.4'` or `pip install '.[hybrid]'`.",
+                file=sys.stderr,
+            )
+            return 4
+
     qdrant = AsyncQdrantClient(url=args.qdrant_url)
     tei = httpx.AsyncClient(base_url=args.tei_url, timeout=args.timeout)
 
     try:
-        # Idempotency check: bail early if collection looks seeded already.
+        # Shape-mismatch guard: if the collection already exists with a
+        # different shape than --with-sparse asks for, we cannot upgrade
+        # in place — Qdrant's UpdateCollection won't change vector config.
+        # Force the caller to --force (wipe + recreate) so the choice is
+        # explicit and auditable.
+        existing_shape = await _collection_has_sparse(qdrant, args.collection_name)
+        if existing_shape is not None and not args.force:
+            if existing_shape != bool(args.with_sparse):
+                want = "hybrid (dense+bm25)" if args.with_sparse else "dense-only"
+                have = "hybrid (dense+bm25)" if existing_shape else "dense-only"
+                print(
+                    f"{args.collection_name} exists with shape={have} but "
+                    f"--with-sparse={args.with_sparse} asks for shape={want}. "
+                    f"Qdrant cannot change vector config in place; pass --force "
+                    f"to wipe-and-recreate.",
+                    file=sys.stderr,
+                )
+                return 2
+
+        # Idempotency check: bail early if collection looks seeded already
+        # AND the shape matches the request.
         if not args.force:
             n = await _collection_point_count(qdrant, args.collection_name)
             if n is not None and n > 0:
                 print(
-                    f"{args.collection_name} already has {n} points — "
+                    f"{args.collection_name} already has {n} points "
+                    f"(shape matches --with-sparse={args.with_sparse}) — "
                     f"pass --force to wipe-and-re-ingest",
                     file=sys.stderr,
                 )
                 return 0
 
+        created_fresh = False
         if args.force:
             # Wipe collection first so old chunks don't linger.
             try:
                 await qdrant.delete_collection(args.collection_name)
             except Exception:
                 pass
+            created_fresh = True
+        elif existing_shape is None:
+            created_fresh = True
 
         await _ensure_collection(
-            qdrant, args.collection_name, vector_size=args.vector_size
+            qdrant,
+            args.collection_name,
+            vector_size=args.vector_size,
+            with_sparse=bool(args.with_sparse),
         )
 
         now = time.time_ns()
         pv = current_version()
         total_chunks = 0
+        total_sparse_attached = 0
         per_file: list[tuple[str, int]] = []
 
         for path in files:
@@ -252,8 +332,14 @@ async def seed(args) -> int:
             for batch in _batched(texts, args.batch_size):
                 vectors.extend(await _tei_embed(tei, batch))
 
+            # Sparse embeddings are computed once per file if requested;
+            # fastembed runs on CPU so batching at the file level is fine.
+            sparse_pairs: list[tuple[list[int], list[float]]] | None = None
+            if args.with_sparse and embed_sparse is not None:
+                sparse_pairs = list(embed_sparse(texts))
+
             points = []
-            for chunk, vec in zip(chunks, vectors):
+            for i, (chunk, vec) in enumerate(zip(chunks, vectors)):
                 point_id = str(
                     uuid.uuid5(_POINT_NS, f"doc:{doc_id}:chunk:{chunk.index}")
                 )
@@ -271,9 +357,20 @@ async def seed(args) -> int:
                     "sheet": None,
                     "model_version": pv,
                 }
-                points.append(
-                    qm.PointStruct(id=point_id, vector=vec, payload=payload)
-                )
+                if args.with_sparse and sparse_pairs is not None:
+                    idx, vals = sparse_pairs[i]
+                    vec_map: dict = {_DENSE_NAME: vec}
+                    vec_map[_SPARSE_NAME] = qm.SparseVector(
+                        indices=list(idx), values=list(vals)
+                    )
+                    points.append(
+                        qm.PointStruct(id=point_id, vector=vec_map, payload=payload)
+                    )
+                    total_sparse_attached += 1
+                else:
+                    points.append(
+                        qm.PointStruct(id=point_id, vector=vec, payload=payload)
+                    )
 
             # Upsert each file as one batch — simple and cheap for our sizes.
             await qdrant.upsert(
@@ -286,6 +383,15 @@ async def seed(args) -> int:
         print(
             f"\nseeded {args.collection_name}: {len(files)} files, "
             f"{total_chunks} chunks",
+            file=sys.stderr,
+        )
+        print(
+            f"  sparse attached: {'y' if args.with_sparse else 'n'} "
+            f"({total_sparse_attached}/{total_chunks} points)",
+            file=sys.stderr,
+        )
+        print(
+            f"  collection: {'created' if created_fresh else 'reused'}",
             file=sys.stderr,
         )
         if total_chunks < 50:
@@ -333,6 +439,16 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--force",
         action="store_true",
         help="drop the collection and re-ingest from scratch",
+    )
+    p.add_argument(
+        "--with-sparse",
+        action="store_true",
+        help=(
+            "Create kb_eval with dense+bm25 (hybrid) vectors so RAG_HYBRID=1 "
+            "eval runs work. Requires fastembed installed. If the collection "
+            "already exists with the opposite shape, --force is required "
+            "(Qdrant cannot change vector config in place). Default: dense-only."
+        ),
     )
     p.add_argument("--timeout", type=float, default=60.0)
     return p.parse_args(argv)
