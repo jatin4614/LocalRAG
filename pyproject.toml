@@ -42,6 +42,13 @@ dev = [
 hybrid = [
   "fastembed>=0.4",
 ]
+# Cross-encoder rerank extra. Install only if you plan to run with RAG_RERANK=1.
+# Pulls in sentence-transformers + torch (~1 GB+ on first install). The model
+# itself (BAAI/bge-reranker-v2-m3) is ~560 MB and downloads on first call.
+# Flag-gated: unset or RAG_RERANK=0 keeps the legacy per-KB normalizer path.
+rerank = [
+  "sentence-transformers>=3.0",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

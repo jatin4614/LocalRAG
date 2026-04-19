@@ -6,8 +6,9 @@ Strategy:
 """
 from __future__ import annotations
 
+import os
 from collections import defaultdict
-from typing import List
+from typing import Any, Callable, List, Sequence
 
 from .vector_store import Hit
 
@@ -37,3 +38,37 @@ def rerank(hits: List[Hit], *, top_k: int = 10) -> List[Hit]:
     # Sort by: normalized score desc, then raw score desc, then id (stable tiebreaker for determinism in tests)
     ordered2 = sorted(hits, key=lambda h: (-normalized(h), -h.score, str(h.id)))
     return ordered2[:top_k]
+
+
+def _read_rerank_flag() -> bool:
+    """Read RAG_RERANK at call time so tests can monkeypatch env without reload."""
+    return os.environ.get("RAG_RERANK", "0") == "1"
+
+
+def rerank_with_flag(
+    query: str,
+    hits: Sequence[Any],
+    *,
+    top_k: int = 10,
+    fallback_fn: Callable[..., list[Any]] | None = None,
+) -> list[Any]:
+    """Dispatch to the cross-encoder reranker if ``RAG_RERANK=1``, else ``fallback_fn``.
+
+    Default behaviour (``RAG_RERANK`` unset or ``0``) is byte-identical to the
+    legacy ``rerank(hits, top_k=...)`` path — the cross-encoder module is not
+    imported at all.
+
+    Fail-open: if the cross-encoder import or inference raises for any reason
+    (missing ``sentence-transformers``, model download failure, etc.) we log
+    nothing and silently fall back to the legacy reranker. This keeps
+    retrieval working even when the optional dependency is unavailable.
+    """
+    fn = fallback_fn or rerank
+    if not _read_rerank_flag():
+        return fn(hits, top_k=top_k)
+    try:
+        from ext.services.cross_encoder_reranker import rerank_cross_encoder
+        return rerank_cross_encoder(query, hits, top_k=top_k)
+    except Exception:
+        # Fail open: model load or inference failure → legacy path still serves.
+        return fn(hits, top_k=top_k)

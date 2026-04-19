@@ -117,7 +117,7 @@ async def retrieve_kb_sources(
 
     # Retrieve using our pipeline
     from .retriever import retrieve
-    from .reranker import rerank
+    from .reranker import rerank, rerank_with_flag
     from .budget import budget_chunks
 
     try:
@@ -130,7 +130,9 @@ async def retrieve_kb_sources(
             per_kb_limit=10,
             total_limit=30,
         )
-        reranked = rerank(raw_hits, top_k=10)
+        # P1.2 — dispatch through rerank_with_flag. Default (RAG_RERANK unset/0)
+        # calls ``rerank`` which is byte-identical to the previous behaviour.
+        reranked = rerank_with_flag(query, raw_hits, top_k=10, fallback_fn=rerank)
         budgeted = budget_chunks(reranked, max_tokens=4000)
     except Exception as e:
         logger.exception("KB retrieval failed: %s", e)
