@@ -47,22 +47,60 @@ start). They do not need to be set for the feature flag to engage.
   (`BAAI/bge-reranker-v2-m3`).
 * `RAG_RERANK_MAX_LEN` — max sequence length passed to the CrossEncoder
   (default `512`).
+* `RAG_RERANK_DEVICE` — `auto` (default) | `cpu` | `cuda` | `cuda:N`. In
+  `auto` mode the reranker picks `cuda:0` when `torch.cuda.is_available()`
+  and falls back to `cpu` otherwise. Explicit values bypass the probe.
+* `RAG_RERANK_BATCH_SIZE` — override the auto default (32 on GPU, 8 on CPU).
+  Read every call; adjustable without restart.
+
+## GPU auto-select
+
+With `RAG_RERANK_DEVICE=auto` (the default), the cross-encoder pins to
+`cuda:0` whenever CUDA is available. First call loads the ~560 MB model
+onto the GPU (~1-3 s after the HuggingFace cache is warm); subsequent
+queries stay hot.
+
+Force CPU with `RAG_RERANK_DEVICE=cpu` if you need to keep the GPU
+exclusively for vLLM chat / embeddings. On shared-GPU deployments the
+reranker uses ~1.2 GB of VRAM (weights + activations), which is
+comfortable on an RTX 6000 Ada (32 GB) alongside Qwen2.5-14B-AWQ + TEI.
+
+## Redis score cache
+
+Cross-encoder scores are cached in Redis per `(model, query, passage)`
+tuple. Repeated queries — or overlapping chunks across adjacent queries
+— skip model inference entirely.
+
+* Key format: `rerank:{model}:{sha1(query)[:16]}:{sha1(passage)[:16]}`
+* Value: float score (ASCII bytes)
+* TTL: `RAG_RERANK_CACHE_TTL` seconds (default 300)
+* Connection URL: `RAG_REDIS_URL` (default `redis://redis:6379/0` — the
+  in-cluster alias; override when running tests from the host)
+* Kill switch: `RAG_RERANK_CACHE_DISABLED=1` bypasses entirely
+
+The cache is **fail-open**: any Redis exception (timeout, connection
+refused, corrupt value) is swallowed and the score is recomputed by the
+model. Retrieval never fails because of the cache.
+
+Warm queries (full cache hit over 30 pairs) complete in **<10 ms** —
+dominated by the `MGET` + local deserialization.
 
 ## Latency
 
 Cross-encoder scoring is `O(N)` model passes over `(query, passage)` pairs.
-The pipeline reranks the top-30 retrieval candidates, so expect:
+The pipeline reranks the top-30 retrieval candidates. Measured on a single
+RTX 6000 Ada (Ampere, 32 GB) running Qwen2.5-14B-AWQ + TEI + bge-reranker-v2-m3:
 
-* CPU inference, **batch size 8**: ~300-700 ms per query for top-30 on a
-  modern x86 server. First call pays ~5-15 s for model download + load.
-* GPU inference (if `torch.cuda.is_available()`): ~50-150 ms per query after
-  warmup. Not the default target — keep the reranker on CPU so it does not
-  compete with vLLM chat / embeddings for VRAM.
+| Scenario                           | Latency (top-30)   |
+| ---------------------------------- | ------------------ |
+| CPU, batch 8, cache cold           | ~11 000 ms         |
+| CPU, batch 8, cache hit            | <10 ms             |
+| GPU (cuda:0), batch 32, cache cold | **~30-50 ms**      |
+| GPU (cuda:0), cache hit            | **<10 ms**         |
+| Very first call (model download)   | ~5-15 s (one-time) |
 
-Even on CPU the reranker fits comfortably within typical RAG query budgets
-(~1 s total). The worst case is the very first query after a cold start —
-the ~560 MB model download dominates. Pre-warm in your deploy hook if this
-matters:
+Pre-warm in your deploy hook to pay the model-load cost at startup, not on
+the first user query:
 
 ```python
 from ext.services.cross_encoder_reranker import score_pairs
@@ -125,10 +163,36 @@ exceptions by design.
 
 ### Memory usage
 
-The reranker loads ~1.2 GB of RAM when running (model weights + activations).
-For a 32 GB host this is negligible, but note that each additional uvicorn
-worker will hold its own copy. Consider running the reranker in a single
-worker behind a semaphore for very memory-tight deploys.
+The reranker loads ~1.2 GB when running (weights + activations). On CPU
+this is host RAM; on GPU it's VRAM. For a 32 GB RTX 6000 Ada sharing with
+Qwen2.5-14B-AWQ (12 GB) + TEI (3 GB), there is ample headroom.
+
+Each additional uvicorn worker holds its own copy. For memory-tight deploys
+(or to avoid duplicating the VRAM allocation), run the reranker in a single
+worker behind a semaphore.
+
+### Batch size
+
+Default is **32 on GPU** and **8 on CPU** — both honoured automatically
+based on `_resolve_device()`. Override with `RAG_RERANK_BATCH_SIZE=N`
+(read every call, no restart needed).
+
+Larger batches improve GPU utilisation but increase per-query latency for
+very small result sets. The default 32 is a good fit for the typical
+top-30 rerank window.
+
+### Cache tuning
+
+* Default TTL (300 s) is aimed at short-lived duplicate queries during an
+  interactive chat. Bump it for retrieval patterns with heavy replay (agent
+  loops, stable knowledge bases): `RAG_RERANK_CACHE_TTL=3600`.
+* Flush on model swap: when `RAG_RERANK_MODEL` changes, old entries are
+  keyed under the old model name and are simply dead weight (the new model
+  won't find them). They expire naturally via TTL; for an immediate flush
+  call `rerank_cache.clear_all(model="old-model")` or drop the `rerank:*`
+  keys directly.
+* Cache hit verification: `redis-cli --scan --pattern 'rerank:*' | head`
+  from inside the orgchat-net (e.g. `docker exec orgchat-redis redis-cli`).
 
 ### Interaction with hybrid retrieval
 

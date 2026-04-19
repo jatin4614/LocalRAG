@@ -34,6 +34,9 @@ dev = [
   "python-docx>=1.1",
   "openpyxl>=3.1",
   "celery[redis]>=5.3",
+  # Used by tests/unit/test_rerank_cache.py to exercise the Redis-backed
+  # score cache without a live Redis. Tests skip cleanly if absent.
+  "fakeredis>=2.20",
 ]
 # Hybrid-retrieval extra. Install only if you plan to run with RAG_HYBRID=1
 # (sparse BM25 + dense fusion via Qdrant's server-side RRF). The fastembed

@@ -20,9 +20,17 @@ from ext.services import cross_encoder_reranker as cer
 # without downloading any real model.
 # ---------------------------------------------------------------------------
 class _FakeCrossEncoder:
-    def __init__(self, model_name: str, max_length: int = 512) -> None:  # noqa: D401
+    def __init__(
+        self,
+        model_name: str,
+        max_length: int = 512,
+        device: str | None = None,
+        **_kwargs,
+    ) -> None:  # noqa: D401
         self.model_name = model_name
         self.max_length = max_length
+        # Mirror the ST 5.x attribute so _default_batch_size sees it.
+        self.device = device or "cpu"
 
     def predict(self, pairs, batch_size: int = 8, show_progress_bar: bool = False):
         # Very small fake "relevance" signal: check whether any prefix of each
