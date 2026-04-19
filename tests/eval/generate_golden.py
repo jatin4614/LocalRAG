@@ -10,14 +10,20 @@ regressions in the pipeline (bad filtering, broken embedder, etc.) but say
 almost nothing about real-world quality. Human-labeled queries are still
 required before the CI regression gate can be treated as meaningful.
 
+Default target collection is ``kb_eval`` — seed it first with
+``scripts/seed_eval_corpus.py`` for ≥ 50 docs / ≥ 100 chunks. If ``kb_eval``
+is missing, we fall back to scanning ``kb_*`` collections (the live org KBs).
+
 Usage:
   python -m tests.eval.generate_golden \\
       --qdrant-url http://localhost:6333 \\
       --chat-url http://localhost:8000/v1 \\
       --chat-model Qwen/Qwen2.5-14B-Instruct-AWQ \\
-      --collections kb_1,kb_3,kb_4,kb_5 \\
-      --samples-per-collection 10 \\
+      --collections kb_eval \\
+      --samples-per-collection 100 \\
       --out tests/eval/golden.jsonl
+
+``--collections`` accepts a comma-separated list, e.g. ``kb_1,kb_3,kb_4``.
 """
 from __future__ import annotations
 
@@ -141,6 +147,43 @@ def _coerce_int(v) -> Optional[int]:
         return None
 
 
+async def _resolve_collections(
+    qdrant: AsyncQdrantClient, requested: str
+) -> list[str]:
+    """Expand the --collections arg to an actual list of live collection names.
+
+    Behaviour:
+    * If the user passed an explicit CSV list and all of those collections
+      exist in Qdrant, use them verbatim.
+    * If the default (``kb_eval``) is passed but the collection does not
+      exist yet, fall back to scanning all ``kb_*`` collections (minus
+      ``chat_*`` private scopes). Warn loudly so the user knows.
+    * If nothing matches, return an empty list — caller exits with an error.
+    """
+    wanted = [c.strip() for c in requested.split(",") if c.strip()]
+    live = {c.name for c in (await qdrant.get_collections()).collections}
+    present = [c for c in wanted if c in live]
+    if present:
+        return present
+
+    # Fallback: scan kb_* (excluding chat_* session scopes) when nothing
+    # explicit matched. Makes the script usable against a fresh stack that
+    # has live KBs but no kb_eval seed yet.
+    fallback = sorted(
+        c for c in live
+        if c.startswith("kb_") and c != "kb_eval" and not c.startswith("chat_")
+    )
+    if fallback:
+        print(
+            f"WARN: requested {wanted} but none present in Qdrant; "
+            f"falling back to {fallback}. Run scripts/seed_eval_corpus.py "
+            f"to seed kb_eval for denser golden sets.",
+            file=sys.stderr,
+        )
+        return fallback
+    return []
+
+
 async def build_golden(args) -> int:
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -158,7 +201,16 @@ async def build_golden(args) -> int:
     if args.chat_api_key:
         chat.headers["Authorization"] = f"Bearer {args.chat_api_key}"
 
-    collections = [c.strip() for c in args.collections.split(",") if c.strip()]
+    collections = await _resolve_collections(qdrant, args.collections)
+    if not collections:
+        print(
+            f"no usable collections matched --collections={args.collections!r}; "
+            f"seed kb_eval via scripts/seed_eval_corpus.py or pass an explicit CSV",
+            file=sys.stderr,
+        )
+        await qdrant.close()
+        await chat.aclose()
+        return 4
     total_rows = 0
     total_skipped = 0
 
@@ -215,7 +267,14 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--chat-model", default="Qwen/Qwen2.5-14B-Instruct-AWQ")
     p.add_argument("--chat-api-key", default=None,
                    help="Optional bearer token (e.g. the sk-internal-dummy from compose/.env)")
-    p.add_argument("--collections", default="kb_1,kb_3,kb_4,kb_5")
+    p.add_argument(
+        "--collections",
+        default="kb_eval",
+        help=(
+            "comma-separated Qdrant collection names (default: kb_eval). "
+            "Falls back to scanning kb_* collections if kb_eval is absent."
+        ),
+    )
     p.add_argument("--samples-per-collection", type=int, default=10)
     p.add_argument("--out", default="tests/eval/golden.jsonl")
     p.add_argument("--force", action="store_true",
