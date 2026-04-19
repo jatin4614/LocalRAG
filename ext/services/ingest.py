@@ -30,6 +30,70 @@ def _hybrid_enabled() -> bool:
     """
     return os.environ.get("RAG_HYBRID", "1") != "0"
 
+
+def _contextualize_enabled() -> bool:
+    """Read RAG_CONTEXTUALIZE_KBS at call time.
+
+    Default OFF. When OFF, the contextualizer module is not imported here,
+    so the default ingest path stays byte-identical to the pre-P2.7
+    behaviour (no chat-model calls, no httpx churn, no extra imports).
+    """
+    return os.environ.get("RAG_CONTEXTUALIZE_KBS", "0") == "1"
+
+
+async def _maybe_contextualize_chunks(
+    chunks_and_blocks: list[tuple[object, object]],
+    *,
+    doc_title: str,
+) -> bool:
+    """Optionally augment chunks in place with a per-chunk LLM context prefix.
+
+    Returns True when augmentation ran (so ``pipeline_version`` can stamp
+    ``ctx=contextual-v1``), False otherwise. Mutates ``chunks_and_blocks``
+    by replacing each chunk's ``text`` with its augmented version.
+
+    Fail-open at the batch level: if the whole call errors (e.g. the
+    contextualizer module can't be imported, env vars missing, etc.)
+    we log and return False so ingest continues with raw chunks and the
+    default ``ctx=none`` version stamp.
+
+    Extracted into a helper so the main ingest body stays linear and
+    ``ingest.py`` has no top-level dependency on ``contextualizer.py``
+    when the flag is off.
+    """
+    try:
+        from .contextualizer import contextualize_batch  # local import — off-path has no cost
+        chat_url = os.environ.get("OPENAI_API_BASE_URL")
+        chat_model = os.environ.get("CHAT_MODEL", "orgchat-chat")
+        if not chat_url:
+            return False
+        api_key = os.environ.get("OPENAI_API_KEY")
+        concurrency = int(os.environ.get("RAG_CONTEXTUALIZE_CONCURRENCY", "8"))
+        pairs = [(c.text, doc_title) for c, _ in chunks_and_blocks]
+        augmented = await contextualize_batch(
+            pairs,
+            chat_url=chat_url,
+            chat_model=chat_model,
+            api_key=api_key,
+            concurrency=concurrency,
+        )
+        # Contextualizer already falls open per-chunk; we just copy the
+        # resulting (maybe-augmented, maybe-unchanged) text back onto the
+        # chunk objects. Chunks are dataclasses with frozen=True, so we
+        # rebuild via a tuple-replace pattern: replace the chunk object
+        # in the paired list with a new one whose ``text`` has been bumped.
+        from dataclasses import replace as dc_replace
+        for idx, (c, b) in enumerate(chunks_and_blocks):
+            new_text = augmented[idx]
+            if new_text is not c.text:
+                # Chunk is frozen; build a copy. token_count stays stale
+                # (now slightly larger) — acceptable because retrieval only
+                # uses text; budget.py re-tokenizes when it cares.
+                chunks_and_blocks[idx] = (dc_replace(c, text=new_text), b)
+        return True
+    except Exception:  # noqa: BLE001 — fail-open
+        return False
+
 # Stable namespace for deterministic point IDs (UUID5 based on doc_id + chunk_index).
 # Using the well-known URL namespace UUID so the value is fixed across deploys.
 _POINT_NS = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
@@ -63,6 +127,19 @@ async def ingest_bytes(
     if not paired:
         return 0
 
+    # P2.7: optional per-chunk context augmentation (Anthropic Contextual
+    # Retrieval). OFF by default — the default path does not import the
+    # contextualizer module at all. When the flag is on, each chunk gets
+    # a short LLM-generated prefix ("this chunk is about X from section Y
+    # of document Z") that is then embedded + stored + indexed together
+    # with the raw chunk body. Fail-open at both chunk and batch level so
+    # a chat endpoint hiccup doesn't crash ingest.
+    context_augmented = False
+    if _contextualize_enabled():
+        context_augmented = await _maybe_contextualize_chunks(
+            paired, doc_title=filename
+        )
+
     texts = [c.text for c, _ in paired]
     vectors = await embedder.embed(texts)
 
@@ -90,7 +167,7 @@ async def ingest_bytes(
                     sparse_vectors = [None] * len(paired)
 
     now = time.time_ns()
-    pv = current_version()
+    pv = current_version(context_augmented=context_augmented)
 
     # Defensive coercion — main historically passed str(doc.id); we now store
     # doc_id as int consistently. If the caller supplied a numeric string

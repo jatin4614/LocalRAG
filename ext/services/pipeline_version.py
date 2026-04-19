@@ -25,17 +25,25 @@ EMBEDDER_MODEL = "bge-m3"
 CONTEXT_AUGMENTATION = "none"
 
 
-def current_version() -> str:
+def current_version(context_augmented: bool = False) -> str:
     """Return the composite pipeline version string.
 
     Reads the module-level constants at call time so monkeypatching works
     in tests (``monkeypatch.setattr(pipeline_version, "CHUNKER_VERSION", ...)``).
+
+    Args:
+        context_augmented: when True (P2.7 contextual retrieval flag), stamp
+            ``ctx=contextual-v1`` instead of the module-level constant. This
+            lets ingest toggle the provenance tag per-call without mutating
+            module state. Default False preserves the module-level constant
+            (``ctx=none``), keeping the default-off path byte-identical.
     """
+    ctx = "contextual-v1" if context_augmented else CONTEXT_AUGMENTATION
     return (
         f"chunker={CHUNKER_VERSION}|"
         f"extractor={EXTRACTOR_VERSION}|"
         f"embedder={EMBEDDER_MODEL}|"
-        f"ctx={CONTEXT_AUGMENTATION}"
+        f"ctx={ctx}"
     )
 
 
