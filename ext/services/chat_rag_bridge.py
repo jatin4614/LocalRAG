@@ -153,6 +153,13 @@ async def retrieve_kb_sources(
                 filename = f"kb-{hit.payload.get('kb_id', '?')}"
         text_content = str(hit.payload.get("text", ""))
 
+        # P0.6 — spotlighting against indirect prompt injection.
+        # Read flag at call time so tests can toggle via monkeypatch.setenv
+        # without module reload. Default (flag=0) → byte-identical to pre-P0.6.
+        if _os.environ.get("RAG_SPOTLIGHT", "0") == "1" and text_content:
+            from .spotlight import wrap_context as _spotlight_wrap
+            text_content = _spotlight_wrap(text_content)
+
         # Key: prefer doc_id for KB docs, fall back to (chat_id, chunk_index) for private
         if doc_id:
             key = f"kb_{hit.payload.get('kb_id')}_{doc_id}"
