@@ -150,7 +150,20 @@ async def retrieve_kb_sources(
                 # Fail open: on any MMR error, stick with reranker output.
                 pass
 
-        # P1.4 context-expansion hook goes here — leave a blank line.
+        # P1.4: context expansion (flag-gated). Reads the flag at call time
+        # so tests can monkeypatch without module reload. When off (default)
+        # the ``context_expand`` module is never imported. Fails open: any
+        # exception keeps the reranker/MMR output untouched.
+        if _os.environ.get("RAG_CONTEXT_EXPAND", "0") == "1" and reranked:
+            try:
+                from .context_expand import expand_context
+                _window = int(_os.environ.get("RAG_CONTEXT_EXPAND_WINDOW", "1"))
+                reranked = await expand_context(
+                    reranked, vs=_vector_store, window=_window,
+                )
+            except Exception:
+                # Fail open: on any error, keep reranker/MMR output unchanged.
+                pass
 
         budgeted = budget_chunks(reranked, max_tokens=4000)
     except Exception as e:
