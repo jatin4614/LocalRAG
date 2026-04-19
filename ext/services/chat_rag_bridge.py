@@ -132,23 +132,42 @@ async def retrieve_kb_sources(
         )
         # P1.2 — dispatch through rerank_with_flag. Default (RAG_RERANK unset/0)
         # calls ``rerank`` which is byte-identical to the previous behaviour.
-        reranked = rerank_with_flag(query, raw_hits, top_k=10, fallback_fn=rerank)
+        #
+        # P2 — MMR candidate-pool widening. When MMR is on, ask the reranker
+        # for more candidates than the final budget so MMR actually has room
+        # to diversify. When MMR is off, the old top-10 behaviour is preserved
+        # byte-identically. An operator may override via ``RAG_RERANK_TOP_K``.
+        _final_k = 10
+        _rerank_top_k_env = _os.environ.get("RAG_RERANK_TOP_K")
+        _mmr_on = _os.environ.get("RAG_MMR", "0") == "1"
+        if _rerank_top_k_env is not None:
+            _rerank_k = max(int(_rerank_top_k_env), _final_k)
+        elif _mmr_on:
+            _rerank_k = max(_final_k * 2, 20)
+        else:
+            _rerank_k = _final_k
+        reranked = rerank_with_flag(query, raw_hits, top_k=_rerank_k, fallback_fn=rerank)
 
         # P1.3 — MMR diversification (flag-gated). Reads the flag at call time
         # so tests can monkeypatch the env without module reload. When the flag
         # is off (default) the ``mmr`` module is never imported. Fails open:
         # any MMR error is swallowed and we keep the reranker output.
-        if _os.environ.get("RAG_MMR", "0") == "1" and reranked:
+        if _mmr_on and reranked:
             try:
                 from .mmr import mmr_rerank_from_hits
                 _mmr_lambda = float(_os.environ.get("RAG_MMR_LAMBDA", "0.7"))
                 reranked = await mmr_rerank_from_hits(
                     query, reranked, _embedder,
-                    top_k=len(reranked), lambda_=_mmr_lambda,
+                    top_k=_final_k, lambda_=_mmr_lambda,
                 )
             except Exception:
                 # Fail open: on any MMR error, stick with reranker output.
                 pass
+        elif len(reranked) > _final_k:
+            # No MMR — trim rerank's extra candidates (e.g. RAG_RERANK_TOP_K
+            # set by operator) back to _final_k so downstream budget sees the
+            # same count as the pre-P2 pipeline.
+            reranked = reranked[:_final_k]
 
         # P1.4: context expansion (flag-gated). Reads the flag at call time
         # so tests can monkeypatch without module reload. When off (default)

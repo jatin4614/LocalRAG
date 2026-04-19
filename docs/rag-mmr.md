@@ -49,21 +49,61 @@ return S
 
 ## How it interacts with the rest of the pipeline
 
-MMR runs *after* the reranker and *before* budget truncation:
+MMR runs *after* the reranker and *before* budget truncation. When MMR
+is on the bridge widens the reranker's candidate pool so MMR has actual
+surplus to diversify over — otherwise `rerank(top=k) -> MMR(top=k)` is a
+pass-through, which is what the pre-P2 pipeline accidentally did.
 
 ```
 retrieve (top-30)
-  -> rerank_with_flag (legacy OR cross-encoder, top-10)
-  -> mmr_rerank_from_hits (flag-gated; reorders within top-10)
+  -> rerank_with_flag (legacy OR cross-encoder, top-rerank_k)
+       rerank_k = max(2 * final_k, 20) when RAG_MMR=1 (default: 20)
+       rerank_k = final_k             when RAG_MMR=0 (default: 10)
+       rerank_k = RAG_RERANK_TOP_K    when the env var is set (clamped to >= final_k)
+  -> mmr_rerank_from_hits (flag-gated; trims rerank_k -> final_k with diversity)
   -> budget_chunks (token-fit the final list)
 ```
 
-At the current bridge invocation (`top_k=len(reranked)`) MMR **reorders**
-the reranker's output of length *k* rather than narrowing it. This is
-intentionally conservative — if you want MMR to aggressively subset (for
-example feeding 30 candidates and emitting 10), bump the reranker's top_k
-before MMR or call `mmr_rerank_from_hits` directly in a custom
-orchestration.
+### Why the widening was needed
+
+Before P2 the bridge called `rerank_with_flag(..., top_k=10)` followed by
+`mmr_rerank_from_hits(..., top_k=len(reranked))`. Since the reranker had
+already narrowed to ten candidates, MMR's "pick the best k from C" was
+just "reorder the ten already selected". That is why the eval matrix
+showed identical metrics with `RAG_MMR=0` vs `RAG_MMR=1`. With the P2
+widening, MMR actually has a surplus of ten extra candidates (20 -> 10)
+to trade relevance for diversity.
+
+### Operator override (`RAG_RERANK_TOP_K`)
+
+If reranker cost is a concern — for instance on a cold cross-encoder
+cache or during an outage where reranking is on the hot path — pin the
+candidate pool:
+
+```bash
+# Cheap mode: only score 12 pairs, MMR still trims to 10.
+export RAG_MMR=1
+export RAG_RERANK_TOP_K=12
+
+# Expensive / high-recall mode: score 30, MMR picks a diverse 10.
+export RAG_MMR=1
+export RAG_RERANK_TOP_K=30
+```
+
+`RAG_RERANK_TOP_K` is clamped *up* to `final_k` (pointless to rerank
+fewer candidates than the final budget). When MMR is off and the
+override yields more than `final_k` candidates, the bridge trims the
+tail back to `final_k` before the budget stage so downstream sees the
+same count as the pre-P2 pipeline.
+
+### Cost of widening
+
+The reranker scores `rerank_k` query/passage pairs instead of `final_k`.
+For the cross-encoder path that is at most 2x more pairs on the default
+(`final_k=10` -> `rerank_k=20`); with a GPU and the P2 rerank cache this
+is typically single-digit milliseconds. MMR itself still embeds only the
+top `rerank_k` passages (one batched TEI call) — same pattern as before,
+just 20 passages instead of 10.
 
 ## Cost
 
@@ -114,10 +154,11 @@ block in `ext/services/chat_rag_bridge.py`.
 
 ## Flags
 
-| Flag              | Default | Meaning                                              |
-|-------------------|---------|------------------------------------------------------|
-| `RAG_MMR`         | `0`     | `1` to enable; anything else is off                  |
-| `RAG_MMR_LAMBDA`  | `0.7`   | Float in `[0, 1]`; higher = more relevance, less diversity |
+| Flag                | Default                 | Meaning                                              |
+|---------------------|-------------------------|------------------------------------------------------|
+| `RAG_MMR`           | `0`                     | `1` to enable; anything else is off                  |
+| `RAG_MMR_LAMBDA`    | `0.7`                   | Float in `[0, 1]`; higher = more relevance, less diversity |
+| `RAG_RERANK_TOP_K`  | `max(2*final_k, 20)` when `RAG_MMR=1`, else `final_k` | Integer; how many candidates the reranker emits before MMR trims. Clamped to `>= final_k`. |
 
 ## Troubleshooting
 
@@ -125,13 +166,17 @@ block in `ext/services/chat_rag_bridge.py`.
 
 Check the flag is actually engaged. Only the exact string `"1"` enables
 MMR (not `"true"`, not `"yes"`). If the flag is set but results look
-unchanged, two common causes:
+unchanged, three common causes:
 
-1. **The reranker returned fewer hits than the bridge's `top_k`.** If
-   `len(reranked) <= top_k` MMR short-circuits to a pure passthrough
-   (there is no subset selection to diversify). Lift the reranker's
-   top_k or lower the MMR top_k.
-2. **Retrieval returned no near-duplicates.** MMR only reorders when
+1. **`RAG_RERANK_TOP_K` pinned to `final_k`.** The operator override
+   collapses the candidate pool back to the final budget, which
+   degenerates MMR into a reorder-in-place. Unset the variable or raise
+   it above `final_k`.
+2. **The reranker returned fewer hits than `rerank_k`.** If the
+   retriever surfaced `<= final_k` candidates, MMR short-circuits to a
+   passthrough (nothing to subset). Raise `per_kb_limit`/`total_limit`
+   in retrieval.
+3. **Retrieval returned no near-duplicates.** MMR only reorders when
    pairwise passage similarity is high enough to trigger the diversity
    penalty. A healthy KB with diverse documents will see minimal
    reordering — this is the desired behaviour, not a bug.

@@ -77,9 +77,20 @@ async def _run_one(row: dict, *, vs: VectorStore, emb: TEIEmbedder, k: int) -> d
     t0 = time.perf_counter()
     try:
         hits = await _retrieve_kb_eval(query=query, vs=vs, emb=emb, limit=max(k * 3, 30))
-        # Rerank stage (flag-gated — falls back to legacy max-normalize)
-        hits = rerank_with_flag(query, hits, top_k=min(len(hits), max(k, 10)), fallback_fn=rerank)
-        # MMR stage
+        # Rerank stage (flag-gated — falls back to legacy max-normalize).
+        # P2 — widen the candidate pool when MMR is on so MMR actually has
+        # surplus to diversify over (otherwise rerank(top=k) -> MMR(top=k)
+        # is a pass-through).
+        rerank_top_k_env = os.environ.get("RAG_RERANK_TOP_K")
+        mmr_on = os.environ.get("RAG_MMR", "0") == "1"
+        if rerank_top_k_env is not None:
+            rerank_k = max(int(rerank_top_k_env), k)
+        elif mmr_on:
+            rerank_k = max(k * 2, 20)
+        else:
+            rerank_k = k
+        hits = rerank_with_flag(query, hits, top_k=min(len(hits), rerank_k), fallback_fn=rerank)
+        # MMR stage — always trims down to k.
         hits = await _maybe_mmr(query, hits, emb, top_k=min(len(hits), k))
         # Context expansion stage (after rerank/MMR, before budget; budget is a no-op for eval metrics)
         hits = await _maybe_expand(hits, vs)
