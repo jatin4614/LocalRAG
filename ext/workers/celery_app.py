@@ -19,7 +19,7 @@ app = Celery(
     "orgchat_ingest",
     broker=broker,
     backend=backend,
-    include=["ext.workers.ingest_worker"],
+    include=["ext.workers.ingest_worker", "ext.workers.blob_gc_task"],
 )
 
 app.conf.update(

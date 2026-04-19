@@ -73,6 +73,10 @@ class KBDocument(Base):
     # P0.4: composite pipeline version stamped at ingest time. NULL for rows
     # inserted before the column existed. See ext/services/pipeline_version.py.
     pipeline_version: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # P2.8: sha256 of the original upload bytes in the BlobStore. NULL for
+    # legacy rows and for sync-ingest uploads (no blob persisted). Used by
+    # ext/services/blob_gc.py to free the blob after soft-delete retention.
+    blob_sha: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     kb: Mapped[KnowledgeBase] = relationship(back_populates="documents")
 
