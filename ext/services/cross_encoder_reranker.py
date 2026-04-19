@@ -103,12 +103,26 @@ def score_pairs(query: str, passages: Sequence[str], *, batch_size: int | None =
     if cache_on:
         keys = [(query, p or "") for p in passages]
         found = get_many(model_name, keys)  # list[Optional[float]]
+        _hits = 0
+        _misses = 0
         for i, v in enumerate(found):
             if v is not None:
                 cached_scores[i] = v
+                _hits += 1
             else:
                 missing_indices.append(i)
                 missing_passages.append(passages[i] or "")
+                _misses += 1
+        # Batched counter increment — metrics call is best-effort.
+        try:
+            from ext.services.metrics import rerank_cache_total
+
+            if _hits:
+                rerank_cache_total.labels(outcome="hit").inc(_hits)
+            if _misses:
+                rerank_cache_total.labels(outcome="miss").inc(_misses)
+        except Exception:
+            pass
     else:
         missing_indices = list(range(len(passages)))
         missing_passages = [p or "" for p in passages]

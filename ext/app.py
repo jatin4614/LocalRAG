@@ -1,6 +1,7 @@
 """FastAPI application entry point for the KB management + retrieval + RAG API."""
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -11,6 +12,24 @@ from .db.session import make_engine, make_sessionmaker
 from .routers import kb_admin, kb_retrieval, rag, upload
 from .services.embedder import TEIEmbedder
 from .services.vector_store import VectorStore
+
+_logger = logging.getLogger(__name__)
+
+
+def _mount_metrics(app: FastAPI) -> None:
+    """Mount ``/metrics`` via prometheus_client's ASGI app.
+
+    Fail-open: if ``prometheus_client`` is not installed (it is listed
+    in ``[project].dependencies`` but may be absent in slim test envs)
+    we log a warning and skip mounting — the rest of the app still
+    boots normally.
+    """
+    try:
+        from prometheus_client import make_asgi_app
+
+        app.mount("/metrics", make_asgi_app())
+    except Exception as e:  # pragma: no cover - defensive
+        _logger.warning("prometheus_client unavailable — /metrics disabled: %s", e)
 
 
 def build_app() -> FastAPI:
@@ -43,6 +62,9 @@ def build_app() -> FastAPI:
     app.include_router(kb_admin.router)
     app.include_router(upload.router)
     app.include_router(rag.router)
+
+    # P2.5 — Prometheus metrics. Fail-open if prometheus_client missing.
+    _mount_metrics(app)
     return app
 
 

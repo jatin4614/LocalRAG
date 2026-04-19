@@ -119,72 +119,116 @@ async def retrieve_kb_sources(
     from .retriever import retrieve
     from .reranker import rerank, rerank_with_flag
     from .budget import budget_chunks
+    # P2.5 — Prometheus metrics. Metric calls are wrapped in try/except
+    # inside the helpers themselves; importing never raises because the
+    # module falls back to no-op metrics if prometheus_client is absent.
+    from .metrics import flag_state, retrieval_hits_total, time_stage
+
+    # Snapshot current flag state for /metrics (best-effort — any failure
+    # must not break retrieval).
+    try:
+        _hybrid_flag = _os.environ.get("RAG_HYBRID", "1") != "0"
+        flag_state.labels(flag="hybrid").set(1 if _hybrid_flag else 0)
+        flag_state.labels(flag="rerank").set(
+            1 if _os.environ.get("RAG_RERANK", "0") == "1" else 0
+        )
+        flag_state.labels(flag="mmr").set(
+            1 if _os.environ.get("RAG_MMR", "0") == "1" else 0
+        )
+        flag_state.labels(flag="context_expand").set(
+            1 if _os.environ.get("RAG_CONTEXT_EXPAND", "0") == "1" else 0
+        )
+        flag_state.labels(flag="spotlight").set(
+            1 if _os.environ.get("RAG_SPOTLIGHT", "0") == "1" else 0
+        )
+    except Exception:
+        _hybrid_flag = True  # best-effort for hit-counter label below
 
     try:
-        raw_hits = await retrieve(
-            query=query,
-            selected_kbs=selected_kbs,
-            chat_id=chat_id,  # NOW PASSED THROUGH
-            vector_store=_vector_store,
-            embedder=_embedder,
-            per_kb_limit=10,
-            total_limit=30,
-        )
-        # P1.2 — dispatch through rerank_with_flag. Default (RAG_RERANK unset/0)
-        # calls ``rerank`` which is byte-identical to the previous behaviour.
-        #
-        # P2 — MMR candidate-pool widening. When MMR is on, ask the reranker
-        # for more candidates than the final budget so MMR actually has room
-        # to diversify. When MMR is off, the old top-10 behaviour is preserved
-        # byte-identically. An operator may override via ``RAG_RERANK_TOP_K``.
-        _final_k = 10
-        _rerank_top_k_env = _os.environ.get("RAG_RERANK_TOP_K")
-        _mmr_on = _os.environ.get("RAG_MMR", "0") == "1"
-        if _rerank_top_k_env is not None:
-            _rerank_k = max(int(_rerank_top_k_env), _final_k)
-        elif _mmr_on:
-            _rerank_k = max(_final_k * 2, 20)
-        else:
-            _rerank_k = _final_k
-        reranked = rerank_with_flag(query, raw_hits, top_k=_rerank_k, fallback_fn=rerank)
-
-        # P1.3 — MMR diversification (flag-gated). Reads the flag at call time
-        # so tests can monkeypatch the env without module reload. When the flag
-        # is off (default) the ``mmr`` module is never imported. Fails open:
-        # any MMR error is swallowed and we keep the reranker output.
-        if _mmr_on and reranked:
-            try:
-                from .mmr import mmr_rerank_from_hits
-                _mmr_lambda = float(_os.environ.get("RAG_MMR_LAMBDA", "0.7"))
-                reranked = await mmr_rerank_from_hits(
-                    query, reranked, _embedder,
-                    top_k=_final_k, lambda_=_mmr_lambda,
+        with time_stage("total"):
+            with time_stage("retrieve"):
+                raw_hits = await retrieve(
+                    query=query,
+                    selected_kbs=selected_kbs,
+                    chat_id=chat_id,  # NOW PASSED THROUGH
+                    vector_store=_vector_store,
+                    embedder=_embedder,
+                    per_kb_limit=10,
+                    total_limit=30,
                 )
-            except Exception:
-                # Fail open: on any MMR error, stick with reranker output.
-                pass
-        elif len(reranked) > _final_k:
-            # No MMR — trim rerank's extra candidates (e.g. RAG_RERANK_TOP_K
-            # set by operator) back to _final_k so downstream budget sees the
-            # same count as the pre-P2 pipeline.
-            reranked = reranked[:_final_k]
 
-        # P1.4: context expansion (flag-gated). Reads the flag at call time
-        # so tests can monkeypatch without module reload. When off (default)
-        # the ``context_expand`` module is never imported. Fails open: any
-        # exception keeps the reranker/MMR output untouched.
-        if _os.environ.get("RAG_CONTEXT_EXPAND", "0") == "1" and reranked:
+            # Per-hit KB counter. Fails open — any bad payload is silently
+            # tagged as kb="unknown" so the counter is never "missing".
             try:
-                from .context_expand import expand_context
-                _window = int(_os.environ.get("RAG_CONTEXT_EXPAND_WINDOW", "1"))
-                reranked = await expand_context(
-                    reranked, vs=_vector_store, window=_window,
-                )
+                _path = "hybrid" if _hybrid_flag else "dense"
+                for _h in raw_hits:
+                    _payload = getattr(_h, "payload", None) or {}
+                    _kb = _payload.get("kb_id")
+                    if _kb is None:
+                        _kb = "chat" if _payload.get("chat_id") is not None else "unknown"
+                    retrieval_hits_total.labels(kb=str(_kb), path=_path).inc()
             except Exception:
-                # Fail open: on any error, keep reranker/MMR output unchanged.
                 pass
 
-        budgeted = budget_chunks(reranked, max_tokens=4000)
+            # P1.2 — dispatch through rerank_with_flag. Default (RAG_RERANK unset/0)
+            # calls ``rerank`` which is byte-identical to the previous behaviour.
+            #
+            # P2 — MMR candidate-pool widening. When MMR is on, ask the reranker
+            # for more candidates than the final budget so MMR actually has room
+            # to diversify. When MMR is off, the old top-10 behaviour is preserved
+            # byte-identically. An operator may override via ``RAG_RERANK_TOP_K``.
+            _final_k = 10
+            _rerank_top_k_env = _os.environ.get("RAG_RERANK_TOP_K")
+            _mmr_on = _os.environ.get("RAG_MMR", "0") == "1"
+            if _rerank_top_k_env is not None:
+                _rerank_k = max(int(_rerank_top_k_env), _final_k)
+            elif _mmr_on:
+                _rerank_k = max(_final_k * 2, 20)
+            else:
+                _rerank_k = _final_k
+            with time_stage("rerank"):
+                reranked = rerank_with_flag(query, raw_hits, top_k=_rerank_k, fallback_fn=rerank)
+
+            # P1.3 — MMR diversification (flag-gated). Reads the flag at call time
+            # so tests can monkeypatch the env without module reload. When the flag
+            # is off (default) the ``mmr`` module is never imported. Fails open:
+            # any MMR error is swallowed and we keep the reranker output.
+            if _mmr_on and reranked:
+                try:
+                    from .mmr import mmr_rerank_from_hits
+                    _mmr_lambda = float(_os.environ.get("RAG_MMR_LAMBDA", "0.7"))
+                    with time_stage("mmr"):
+                        reranked = await mmr_rerank_from_hits(
+                            query, reranked, _embedder,
+                            top_k=_final_k, lambda_=_mmr_lambda,
+                        )
+                except Exception:
+                    # Fail open: on any MMR error, stick with reranker output.
+                    pass
+            elif len(reranked) > _final_k:
+                # No MMR — trim rerank's extra candidates (e.g. RAG_RERANK_TOP_K
+                # set by operator) back to _final_k so downstream budget sees the
+                # same count as the pre-P2 pipeline.
+                reranked = reranked[:_final_k]
+
+            # P1.4: context expansion (flag-gated). Reads the flag at call time
+            # so tests can monkeypatch without module reload. When off (default)
+            # the ``context_expand`` module is never imported. Fails open: any
+            # exception keeps the reranker/MMR output untouched.
+            if _os.environ.get("RAG_CONTEXT_EXPAND", "0") == "1" and reranked:
+                try:
+                    from .context_expand import expand_context
+                    _window = int(_os.environ.get("RAG_CONTEXT_EXPAND_WINDOW", "1"))
+                    with time_stage("expand"):
+                        reranked = await expand_context(
+                            reranked, vs=_vector_store, window=_window,
+                        )
+                except Exception:
+                    # Fail open: on any error, keep reranker/MMR output unchanged.
+                    pass
+
+            with time_stage("budget"):
+                budgeted = budget_chunks(reranked, max_tokens=4000)
     except Exception as e:
         logger.exception("KB retrieval failed: %s", e)
         return []
