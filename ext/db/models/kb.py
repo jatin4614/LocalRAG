@@ -70,6 +70,9 @@ class KBDocument(Base):
     uploaded_by: Mapped[str] = mapped_column(String(255), nullable=False)  # UUID
     deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     chunk_count: Mapped[int] = mapped_column(default=0, nullable=False)
+    # P0.4: composite pipeline version stamped at ingest time. NULL for rows
+    # inserted before the column existed. See ext/services/pipeline_version.py.
+    pipeline_version: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     kb: Mapped[KnowledgeBase] = relationship(back_populates="documents")
 

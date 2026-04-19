@@ -15,6 +15,7 @@ from ..services import kb_service
 from ..services.auth import CurrentUser, get_current_user, require_admin
 from ..services.embedder import Embedder
 from ..services.ingest import ingest_bytes
+from ..services.pipeline_version import current_version
 from ..services.vector_store import VectorStore
 
 
@@ -133,6 +134,9 @@ async def upload_kb_doc(
         bytes=len(data),
         uploaded_by=user.id,
         ingest_status="chunking",
+        # Stamp the pipeline version that will process this upload. Rows
+        # inserted before migration 004 ran will carry NULL.
+        pipeline_version=current_version(),
     )
     session.add(doc)
     await session.flush()

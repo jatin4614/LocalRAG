@@ -1,4 +1,10 @@
-"""Extract → chunk → embed → upsert pipeline."""
+"""Extract → chunk → embed → upsert pipeline.
+
+Each extracted block carries structural metadata (``page`` / ``heading_path`` /
+``sheet``). We chunk the block's text independently and inherit the block's
+metadata onto every resulting chunk so Qdrant payloads can surface hints like
+"from page 7" or "under heading 'Rollout'" at retrieval time.
+"""
 from __future__ import annotations
 
 import time
@@ -7,7 +13,8 @@ from typing import Mapping
 
 from .chunker import chunk_text
 from .embedder import Embedder
-from .extractor import extract_text
+from .extractor import extract
+from .pipeline_version import current_version
 from .vector_store import VectorStore
 
 # Stable namespace for deterministic point IDs (UUID5 based on doc_id + chunk_index).
@@ -28,35 +35,53 @@ async def ingest_bytes(
     overlap_tokens: int = 100,
 ) -> int:
     """Full ingest: returns number of chunks upserted."""
-    text = extract_text(data, mime_type, filename)
-    chunks = chunk_text(text, chunk_tokens=chunk_tokens, overlap_tokens=overlap_tokens)
-    if not chunks:
+    blocks = extract(data, mime_type, filename)
+    if not blocks:
         return 0
 
-    texts = [c.text for c in chunks]
+    # Chunk per block; carry the source block forward so we can stamp its
+    # structural metadata onto each resulting chunk.
+    paired: list[tuple[object, object]] = []  # (Chunk, ExtractedBlock)
+    for b in blocks:
+        for c in chunk_text(
+            b.text, chunk_tokens=chunk_tokens, overlap_tokens=overlap_tokens
+        ):
+            paired.append((c, b))
+    if not paired:
+        return 0
+
+    texts = [c.text for c, _ in paired]
     vectors = await embedder.embed(texts)
 
     now = time.time_ns()
-    points = []
+    pv = current_version()
     doc_id = payload_base.get("doc_id")
     chat_id = payload_base.get("chat_id")
-    for chunk, vec in zip(chunks, vectors):
+
+    points = []
+    for gidx, ((chunk, block), vec) in enumerate(zip(paired, vectors)):
         payload = dict(payload_base)
         # Store doc_id as string for consistent filtering/matching downstream.
         if doc_id is not None:
             payload["doc_id"] = str(doc_id)
-        payload["chunk_index"] = chunk.index
+        payload["chunk_index"] = gidx
         payload["text"] = chunk.text
         payload["uploaded_at"] = now
         payload["deleted"] = False
+        # Structural metadata from the source block (may be None / []).
+        payload["page"] = block.page
+        payload["heading_path"] = list(block.heading_path)
+        payload["sheet"] = block.sheet
+        payload["model_version"] = pv
 
-        # Deterministic point ID: same doc + chunk always maps to the same Qdrant point.
-        # This lets delete_by_doc reconstruct point IDs or use payload filtering to
-        # remove vectors when a document is soft-deleted.
+        # Deterministic point ID: same doc + global chunk index always maps
+        # to the same Qdrant point. This lets delete_by_doc reconstruct point
+        # IDs or use payload filtering to remove vectors when a document is
+        # soft-deleted.
         if doc_id is not None:
-            id_seed = f"doc:{doc_id}:chunk:{chunk.index}"
+            id_seed = f"doc:{doc_id}:chunk:{gidx}"
         else:
-            id_seed = f"chat:{chat_id}:chunk:{chunk.index}"
+            id_seed = f"chat:{chat_id}:chunk:{gidx}"
         point_id = str(uuid.uuid5(_POINT_NS, id_seed))
 
         points.append({

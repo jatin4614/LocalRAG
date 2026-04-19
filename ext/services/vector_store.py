@@ -8,7 +8,12 @@ from typing import Iterable, List, Optional
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http import models as qm
 
-_PAYLOAD_FIELDS = ["text", "kb_id", "subtag_id", "doc_id", "chat_id", "filename", "chunk_index", "deleted"]
+_PAYLOAD_FIELDS = [
+    "text", "kb_id", "subtag_id", "doc_id", "chat_id",
+    "filename", "chunk_index", "deleted",
+    # P0.4 structural metadata + pipeline provenance.
+    "page", "heading_path", "sheet", "model_version",
+]
 
 
 @dataclass
