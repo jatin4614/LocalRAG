@@ -40,9 +40,30 @@ async def retrieve(
     retrieval uses hybrid RRF fusion. Any collection that lacks sparse support
     silently falls back to dense-only search (preserves backward compatibility
     with legacy collections). Set RAG_HYBRID=0 to force dense-only globally.
+
+    Semantic cache (P2.6) is gated behind RAG_SEMCACHE=1. Default OFF — the
+    module is only imported when the flag is on, so the default path has zero
+    cost and no behavior change. On hit, we skip Qdrant entirely and return
+    the cached Hit list. Keyed by pipeline_version + KB selection + quantized
+    query vector (so near-identical queries share a cache entry).
     """
     [qvec] = await embedder.embed([query])
     hybrid = _hybrid_enabled()
+
+    # P2.6: semantic retrieval cache — lookup BEFORE any Qdrant call.
+    # Lazy import keeps default-off path zero-cost (module never loads).
+    if os.environ.get("RAG_SEMCACHE", "0") == "1":
+        from ext.services.retrieval_cache import (
+            get as _cache_get,
+            is_enabled as _semcache_on,
+        )
+        if _semcache_on():
+            cached = _cache_get(qvec, list(selected_kbs), chat_id)
+            if cached is not None:
+                return [
+                    Hit(id=c["id"], score=c["score"], payload=c["payload"])
+                    for c in cached
+                ][:total_limit]
 
     async def _search_one(collection: str, subtag_ids: Optional[list[int]] = None) -> List[Hit]:
         use_hybrid = False
@@ -88,4 +109,16 @@ async def retrieve(
     for lst in results:
         flat.extend(lst)
     flat.sort(key=lambda h: h.score, reverse=True)
-    return flat[:total_limit]
+    trimmed = flat[:total_limit]
+
+    # P2.6: write cache entry after successful Qdrant fan-out.
+    # Same env-gate as above so the module stays unloaded in the default path.
+    if os.environ.get("RAG_SEMCACHE", "0") == "1":
+        from ext.services.retrieval_cache import (
+            put as _cache_put,
+            is_enabled as _semcache_on,
+        )
+        if _semcache_on():
+            _cache_put(qvec, list(selected_kbs), chat_id, trimmed)
+
+    return trimmed
