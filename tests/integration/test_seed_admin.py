@@ -8,6 +8,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 from testcontainers.postgres import PostgresContainer
 
+pytestmark = pytest.mark.integration
+
 ROOT = Path(__file__).resolve().parents[2]
 SEED = ROOT / "scripts" / "seed_admin.py"
 MIGRATION = ROOT / "ext/db/migrations/001_create_kb_schema.sql"

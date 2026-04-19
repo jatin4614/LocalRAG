@@ -10,6 +10,8 @@ from ext.routers.rag import router as rag_router, configure as configure_rag
 from ext.services.vector_store import VectorStore
 from ext.services.embedder import StubEmbedder
 
+pytestmark = pytest.mark.integration
+
 
 @pytest_asyncio.fixture(autouse=True)
 async def seed(engine):

@@ -2,6 +2,8 @@ import pytest
 from sqlalchemy import text
 from ext.services.rbac import get_allowed_kb_ids
 
+pytestmark = pytest.mark.integration
+
 
 @pytest.mark.asyncio
 async def test_rbac_direct_and_group_grants(session):

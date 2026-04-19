@@ -2,6 +2,8 @@ import httpx
 import pytest
 from ext.services.embedder import StubEmbedder, TEIEmbedder
 
+pytestmark = pytest.mark.integration
+
 
 @pytest.mark.asyncio
 async def test_stub_embedder_deterministic():

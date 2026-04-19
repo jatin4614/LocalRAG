@@ -4,6 +4,8 @@ from ext.services.ingest import ingest_bytes
 from ext.services.vector_store import VectorStore
 from ext.services.embedder import StubEmbedder
 
+pytestmark = pytest.mark.integration
+
 
 @pytest.mark.asyncio
 async def test_retrieve_from_multiple_kbs(clean_qdrant):

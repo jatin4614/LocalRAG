@@ -1,6 +1,8 @@
 import pytest
 from httpx import AsyncClient, ASGITransport
 
+pytestmark = pytest.mark.integration
+
 
 @pytest.mark.asyncio
 async def test_healthz(engine, monkeypatch):

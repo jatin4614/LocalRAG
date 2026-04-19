@@ -4,6 +4,8 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from testcontainers.postgres import PostgresContainer
 from pathlib import Path
 
+pytestmark = pytest.mark.integration
+
 MIGRATION = Path(__file__).resolve().parents[2] / "ext/db/migrations/001_create_kb_schema.sql"
 
 

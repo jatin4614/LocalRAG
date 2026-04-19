@@ -3,6 +3,8 @@ from ext.services.ingest import ingest_bytes
 from ext.services.embedder import StubEmbedder
 from ext.services.vector_store import VectorStore
 
+pytestmark = pytest.mark.integration
+
 
 @pytest.mark.asyncio
 async def test_ingest_txt_into_kb(clean_qdrant):

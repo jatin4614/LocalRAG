@@ -10,6 +10,8 @@ from ext.routers.upload import router as upload_router, configure as configure_u
 from ext.services.vector_store import VectorStore
 from ext.services.embedder import StubEmbedder
 
+pytestmark = pytest.mark.integration
+
 
 ADMIN = {"X-User-Id": "9", "X-User-Role": "admin"}
 

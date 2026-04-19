@@ -5,6 +5,8 @@ import httpx
 from fastapi import FastAPI
 from httpx import AsyncClient, ASGITransport
 
+pytestmark = pytest.mark.integration
+
 
 def _stub_backend(state: dict) -> FastAPI:
     app = FastAPI()

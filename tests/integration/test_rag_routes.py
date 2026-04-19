@@ -10,6 +10,8 @@ from ext.services.vector_store import VectorStore
 from ext.services.embedder import StubEmbedder
 from ext.services.ingest import ingest_bytes
 
+pytestmark = pytest.mark.integration
+
 
 ALICE = {"X-User-Id": "1", "X-User-Role": "user"}
 

@@ -38,12 +38,13 @@ dev = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["tests"]
+testpaths = ["tests/unit"]
 python_files = ["test_*.py"]
 markers = [
   "security: upload safety / XSS / CSRF / MIME checks",
   "concurrency: multi-user parallel operations",
   "perf: performance benchmarks (non-gating)",
+  "integration: requires docker compose stack (opt-in via --integration or pytest tests/integration/)",
 ]
 
 [tool.ruff]

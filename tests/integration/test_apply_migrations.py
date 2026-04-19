@@ -9,6 +9,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 from testcontainers.postgres import PostgresContainer
 
+pytestmark = pytest.mark.integration
+
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "apply_migrations.py"

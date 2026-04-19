@@ -1,6 +1,8 @@
 import pytest
 from sqlalchemy import text
 
+pytestmark = pytest.mark.integration
+
 
 @pytest.mark.asyncio
 async def test_kb_documents_has_chunk_count(session):

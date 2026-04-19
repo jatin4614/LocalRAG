@@ -6,6 +6,8 @@ from pathlib import Path
 import httpx
 import pytest
 
+pytestmark = pytest.mark.integration
+
 ROOT = Path(__file__).resolve().parents[2]
 COMPOSE = ["docker", "compose", "-f", str(ROOT / "compose/docker-compose.yml"),
            "--env-file", str(ROOT / "compose/.env")]
