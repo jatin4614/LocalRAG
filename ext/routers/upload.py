@@ -23,6 +23,12 @@ router = APIRouter(tags=["upload"])
 
 MAX_UPLOAD_BYTES = int(os.environ.get("RAG_MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
 
+# Feature flag — default ("1") = legacy synchronous ingest in the request thread.
+# Set RAG_SYNC_INGEST=0 to route uploads through the Celery-backed queue
+# (blob store + ingest_worker). Flipped at module import; change env + restart
+# the FastAPI process to toggle.
+RAG_SYNC_INGEST = os.environ.get("RAG_SYNC_INGEST", "1") == "1"
+
 
 def _safe_truncate(msg: str, max_len: int = 1000) -> str:
     """Truncate a string at max_len without splitting multi-byte chars."""
@@ -60,6 +66,8 @@ class UploadResult(BaseModel):
     status: str
     chunks: int
     doc_id: Optional[int] = None
+    task_id: Optional[str] = None
+    sha: Optional[str] = None
 
 
 async def _read_bounded(file: UploadFile) -> bytes:
@@ -129,27 +137,46 @@ async def upload_kb_doc(
     session.add(doc)
     await session.flush()
 
-    try:
-        await _VS.ensure_collection(f"kb_{kb_id}")
-        n = await ingest_bytes(
-            data=data,
-            mime_type=file.content_type or "application/octet-stream",
-            filename=safe_name,
-            collection=f"kb_{kb_id}",
-            payload_base={"kb_id": kb_id, "subtag_id": subtag_id, "doc_id": doc.id},
-            vector_store=_VS,
-            embedder=_EMB,
-        )
-    except Exception as e:
-        doc.ingest_status = "failed"
-        doc.error_message = _safe_truncate(str(e))
-        await session.commit()
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
+    if RAG_SYNC_INGEST:
+        try:
+            await _VS.ensure_collection(f"kb_{kb_id}")
+            n = await ingest_bytes(
+                data=data,
+                mime_type=file.content_type or "application/octet-stream",
+                filename=safe_name,
+                collection=f"kb_{kb_id}",
+                payload_base={"kb_id": kb_id, "subtag_id": subtag_id, "doc_id": doc.id},
+                vector_store=_VS,
+                embedder=_EMB,
+            )
+        except Exception as e:
+            doc.ingest_status = "failed"
+            doc.error_message = _safe_truncate(str(e))
+            await session.commit()
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
 
-    doc.ingest_status = "done"
-    doc.chunk_count = n
+        doc.ingest_status = "done"
+        doc.chunk_count = n
+        await session.commit()
+        return UploadResult(status="done", chunks=n, doc_id=doc.id)
+
+    # Async path: write blob to shared store, enqueue Celery task, return task_id.
+    from ..services.blob_store import BlobStore
+    from ..workers.ingest_worker import ingest_blob
+
+    store = BlobStore(os.environ.get("INGEST_BLOB_ROOT", "/var/ingest"))
+    sha = store.write(data)
+    await _VS.ensure_collection(f"kb_{kb_id}")
+    task = ingest_blob.delay(
+        sha,
+        file.content_type or "application/octet-stream",
+        safe_name,
+        f"kb_{kb_id}",
+        {"kb_id": kb_id, "subtag_id": subtag_id, "doc_id": doc.id},
+    )
+    doc.ingest_status = "queued"
     await session.commit()
-    return UploadResult(status="done", chunks=n, doc_id=doc.id)
+    return UploadResult(status="queued", chunks=0, doc_id=doc.id, task_id=task.id, sha=sha)
 
 
 @router.post(
@@ -174,13 +201,30 @@ async def upload_private_doc(
 
     data = await _read_bounded(file)
     await _VS.ensure_collection(f"chat_{chat_id}")
-    n = await ingest_bytes(
-        data=data,
-        mime_type=file.content_type or "application/octet-stream",
-        filename=_safe_filename(file.filename),
-        collection=f"chat_{chat_id}",
-        payload_base={"chat_id": chat_id, "owner_user_id": user.id},
-        vector_store=_VS,
-        embedder=_EMB,
+
+    if RAG_SYNC_INGEST:
+        n = await ingest_bytes(
+            data=data,
+            mime_type=file.content_type or "application/octet-stream",
+            filename=_safe_filename(file.filename),
+            collection=f"chat_{chat_id}",
+            payload_base={"chat_id": chat_id, "owner_user_id": user.id},
+            vector_store=_VS,
+            embedder=_EMB,
+        )
+        return UploadResult(status="done", chunks=n)
+
+    # Async path.
+    from ..services.blob_store import BlobStore
+    from ..workers.ingest_worker import ingest_blob
+
+    store = BlobStore(os.environ.get("INGEST_BLOB_ROOT", "/var/ingest"))
+    sha = store.write(data)
+    task = ingest_blob.delay(
+        sha,
+        file.content_type or "application/octet-stream",
+        _safe_filename(file.filename),
+        f"chat_{chat_id}",
+        {"chat_id": chat_id, "owner_user_id": user.id},
     )
-    return UploadResult(status="done", chunks=n)
+    return UploadResult(status="queued", chunks=0, task_id=task.id, sha=sha)
