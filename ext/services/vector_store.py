@@ -15,6 +15,12 @@ _PAYLOAD_FIELDS = [
     "page", "heading_path", "sheet", "model_version",
 ]
 
+# Name of the named dense vector when a collection is created with sparse vectors
+# alongside. Legacy collections (no sparse) use the unnamed single-vector form,
+# so ``_DENSE_NAME`` is *only* used on hybrid-enabled collections.
+_DENSE_NAME = "dense"
+_SPARSE_NAME = "bm25"
+
 
 @dataclass
 class Hit:
@@ -29,6 +35,9 @@ class VectorStore:
         self._vector_size = vector_size
         self._distance = distance
         self._known: set[str] = set()
+        # Cache of collection name → bool (does this collection have a sparse
+        # named vector?). Populated lazily; cleared when collection is deleted.
+        self._sparse_cache: dict[str, bool] = {}
 
     async def close(self) -> None:
         await self._client.close()
@@ -37,17 +46,46 @@ class VectorStore:
         cols = (await self._client.get_collections()).collections
         return [c.name for c in cols]
 
-    async def ensure_collection(self, name: str) -> None:
+    async def ensure_collection(self, name: str, *, with_sparse: bool = False) -> None:
+        """Idempotently create a collection.
+
+        By default creates a legacy-shaped collection with a single unnamed
+        dense vector (backward-compatible with every collection created before
+        this change). When ``with_sparse=True``, creates a collection with both
+        a named ``dense`` vector AND a named ``bm25`` sparse vector (IDF
+        modifier) — required for server-side hybrid retrieval via RRF.
+
+        This method never upgrades an existing collection; if ``name`` already
+        exists with the wrong shape, callers must recreate it externally.
+        """
         if name in self._known:
             return
         try:
-            await self._client.create_collection(
-                collection_name=name,
-                vectors_config=qm.VectorParams(
-                    size=self._vector_size,
-                    distance=qm.Distance[self._distance.upper()],
-                ),
-            )
+            if with_sparse:
+                await self._client.create_collection(
+                    collection_name=name,
+                    vectors_config={
+                        _DENSE_NAME: qm.VectorParams(
+                            size=self._vector_size,
+                            distance=qm.Distance[self._distance.upper()],
+                        ),
+                    },
+                    sparse_vectors_config={
+                        _SPARSE_NAME: qm.SparseVectorParams(
+                            modifier=qm.Modifier.IDF,
+                        ),
+                    },
+                )
+                self._sparse_cache[name] = True
+            else:
+                await self._client.create_collection(
+                    collection_name=name,
+                    vectors_config=qm.VectorParams(
+                        size=self._vector_size,
+                        distance=qm.Distance[self._distance.upper()],
+                    ),
+                )
+                self._sparse_cache[name] = False
         except Exception:
             # Already exists — verify it's actually there before caching
             cols = await self.list_collections()
@@ -72,13 +110,95 @@ class VectorStore:
         except Exception:
             pass
         self._known.discard(name)
+        self._sparse_cache.pop(name, None)
+
+    async def _refresh_sparse_cache(self, name: str) -> bool:
+        """Ask Qdrant whether ``name`` has the ``bm25`` sparse named vector.
+
+        Cached; legacy collections always return False. Safe to call on a
+        non-existent collection (returns False).
+        """
+        if name in self._sparse_cache:
+            return self._sparse_cache[name]
+        try:
+            info = await self._client.get_collection(collection_name=name)
+        except Exception:
+            self._sparse_cache[name] = False
+            return False
+        sparse = getattr(info.config.params, "sparse_vectors", None) if info and info.config else None
+        has = bool(sparse) and _SPARSE_NAME in sparse
+        self._sparse_cache[name] = has
+        return has
+
+    def _collection_has_sparse(self, name: str) -> bool:
+        """Return cached sparse-support flag without hitting the network.
+
+        Callers should ensure ``_refresh_sparse_cache(name)`` has been awaited
+        at least once for ``name`` (typically during ``ensure_collection`` or
+        the first retrieval for that collection in this process). Returns
+        False for unknown collections (fail-closed → dense-only fallback).
+        """
+        return self._sparse_cache.get(name, False)
 
     async def upsert(self, name: str, points: Iterable[dict]) -> None:
-        pts = [
-            qm.PointStruct(id=p["id"], vector=p["vector"], payload=p.get("payload", {}))
-            for p in points
-        ]
+        """Upsert points. Each point may carry ``sparse_vector: (indices, values)``.
+
+        When any point has a sparse_vector AND the collection supports sparse
+        (hybrid-enabled), points are written in the named-vector form
+        (``{dense: [...], bm25: SparseVector(...)}``). Otherwise the legacy
+        single-unnamed-vector path is used (byte-identical to before).
+        """
+        points = list(points)
+        # Decide encoding: sparse is only used if (a) any point carries it AND
+        # (b) the collection was created with sparse support.
+        has_sparse_points = any(p.get("sparse_vector") is not None for p in points)
+        use_sparse = False
+        if has_sparse_points:
+            # Make sure the cache is warm — caller usually called
+            # ensure_collection first, but fall back to a Qdrant lookup.
+            await self._refresh_sparse_cache(name)
+            use_sparse = self._collection_has_sparse(name)
+
+        if not use_sparse:
+            # Legacy path — byte-identical to pre-hybrid behavior.
+            pts = [
+                qm.PointStruct(
+                    id=p["id"], vector=p["vector"], payload=p.get("payload", {})
+                )
+                for p in points
+            ]
+            await self._client.upsert(collection_name=name, points=pts, wait=True)
+            return
+
+        # Hybrid path — pack dense under _DENSE_NAME and sparse under _SPARSE_NAME.
+        pts = []
+        for p in points:
+            vec_map: dict = {_DENSE_NAME: p["vector"]}
+            sv = p.get("sparse_vector")
+            if sv is not None:
+                indices, values = sv
+                vec_map[_SPARSE_NAME] = qm.SparseVector(indices=list(indices), values=list(values))
+            pts.append(
+                qm.PointStruct(id=p["id"], vector=vec_map, payload=p.get("payload", {}))
+            )
         await self._client.upsert(collection_name=name, points=pts, wait=True)
+
+    @staticmethod
+    def _build_filter(
+        *, subtag_ids: Optional[list[int]] = None
+    ) -> qm.Filter:
+        must_conditions = []
+        if subtag_ids:
+            must_conditions.append(
+                qm.FieldCondition(key="subtag_id", match=qm.MatchAny(any=subtag_ids))
+            )
+        must_not_conditions = [
+            qm.FieldCondition(key="deleted", match=qm.MatchValue(value=True))
+        ]
+        return qm.Filter(
+            must=must_conditions or None,
+            must_not=must_not_conditions,
+        )
 
     async def search(
         self,
@@ -88,22 +208,55 @@ class VectorStore:
         limit: int = 10,
         subtag_ids: Optional[list[int]] = None,
     ) -> List[Hit]:
-        must_conditions = []
-        if subtag_ids:
-            must_conditions.append(
-                qm.FieldCondition(key="subtag_id", match=qm.MatchAny(any=subtag_ids))
-            )
-        # Exclude soft-deleted points regardless of whether a subtag filter is active.
-        must_not_conditions = [
-            qm.FieldCondition(key="deleted", match=qm.MatchValue(value=True))
-        ]
-        flt = qm.Filter(
-            must=must_conditions or None,
-            must_not=must_not_conditions,
-        )
+        """Dense-only search — preserved byte-identically for legacy / flag-off paths."""
+        flt = self._build_filter(subtag_ids=subtag_ids)
         response = await self._client.query_points(
             collection_name=name,
             query=query_vector,
+            limit=limit,
+            query_filter=flt,
+            with_payload=_PAYLOAD_FIELDS,
+        )
+        return [Hit(id=r.id, score=r.score, payload=r.payload or {}) for r in response.points]
+
+    async def hybrid_search(
+        self,
+        name: str,
+        query_vector: list[float],
+        query_text: str,
+        *,
+        limit: int = 10,
+        subtag_ids: Optional[list[int]] = None,
+    ) -> List[Hit]:
+        """Server-side RRF fusion of dense + BM25 sparse results.
+
+        Only valid for collections created with ``ensure_collection(..., with_sparse=True)``.
+        Uses Qdrant's ``query_points`` with two ``Prefetch`` arms (dense + sparse)
+        fused via ``FusionQuery(Fusion.RRF)``. Each prefetch pulls ``limit*2``
+        candidates to give RRF enough material to rerank. Requires Qdrant ≥ 1.11.
+        """
+        from .sparse_embedder import embed_sparse_query
+
+        flt = self._build_filter(subtag_ids=subtag_ids)
+        indices, values = embed_sparse_query(query_text)
+        prefetch = [
+            qm.Prefetch(
+                query=query_vector,
+                using=_DENSE_NAME,
+                filter=flt,
+                limit=limit * 2,
+            ),
+            qm.Prefetch(
+                query=qm.SparseVector(indices=indices, values=values),
+                using=_SPARSE_NAME,
+                filter=flt,
+                limit=limit * 2,
+            ),
+        ]
+        response = await self._client.query_points(
+            collection_name=name,
+            prefetch=prefetch,
+            query=qm.FusionQuery(fusion=qm.Fusion.RRF),
             limit=limit,
             query_filter=flt,
             with_payload=_PAYLOAD_FIELDS,

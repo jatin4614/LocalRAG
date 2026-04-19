@@ -2,10 +2,16 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import List, Optional, Sequence
 
 from .embedder import Embedder
 from .vector_store import Hit, VectorStore
+
+
+def _hybrid_enabled() -> bool:
+    """Read RAG_HYBRID at call time (not import time) so tests can toggle it."""
+    return os.environ.get("RAG_HYBRID", "0") == "1"
 
 
 async def retrieve(
@@ -23,26 +29,50 @@ async def retrieve(
     selected_kbs shape: [{"kb_id": int, "subtag_ids": [int, ...]}, ...]
         empty subtag_ids → search all subtags in that KB.
     Returns a flat list of Hit objects sorted by raw score descending, trimmed to total_limit.
+
+    When RAG_HYBRID=1 is set in the environment AND a given collection was
+    created with sparse-vector support, retrieval uses hybrid RRF fusion. Any
+    collection that lacks sparse support silently falls back to dense-only
+    search (preserves backward compatibility with legacy collections).
     """
     [qvec] = await embedder.embed([query])
+    hybrid = _hybrid_enabled()
 
-    async def _search_kb(cfg: dict) -> List[Hit]:
-        kb_id = cfg["kb_id"]
-        subtag_ids = cfg.get("subtag_ids") or None
+    async def _search_one(collection: str, subtag_ids: Optional[list[int]] = None) -> List[Hit]:
+        use_hybrid = False
+        if hybrid:
+            # Warm the sparse-support cache for this collection; on failure
+            # (e.g., collection doesn't exist) _refresh_sparse_cache returns
+            # False and we fall back to dense-only → exception surfaces from
+            # vs.search below. getattr guards against minimal vector-store
+            # substitutes in tests that don't implement the helper.
+            refresh = getattr(vector_store, "_refresh_sparse_cache", None)
+            if refresh is not None:
+                try:
+                    use_hybrid = await refresh(collection)
+                except Exception:
+                    use_hybrid = False
         try:
+            if use_hybrid:
+                return await vector_store.hybrid_search(
+                    collection, qvec, query,
+                    limit=per_kb_limit, subtag_ids=subtag_ids,
+                )
             return await vector_store.search(
-                f"kb_{kb_id}", qvec, limit=per_kb_limit, subtag_ids=subtag_ids,
+                collection, qvec, limit=per_kb_limit, subtag_ids=subtag_ids,
             )
         except Exception:
             return []
 
+    async def _search_kb(cfg: dict) -> List[Hit]:
+        kb_id = cfg["kb_id"]
+        subtag_ids = cfg.get("subtag_ids") or None
+        return await _search_one(f"kb_{kb_id}", subtag_ids=subtag_ids)
+
     async def _search_chat() -> List[Hit]:
         if chat_id is None:
             return []
-        try:
-            return await vector_store.search(f"chat_{chat_id}", qvec, limit=per_kb_limit)
-        except Exception:
-            return []
+        return await _search_one(f"chat_{chat_id}")
 
     tasks = [_search_kb(cfg) for cfg in selected_kbs]
     tasks.append(_search_chat())

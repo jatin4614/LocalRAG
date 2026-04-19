@@ -7,6 +7,7 @@ metadata onto every resulting chunk so Qdrant payloads can surface hints like
 """
 from __future__ import annotations
 
+import os
 import time
 import uuid
 from typing import Mapping
@@ -16,6 +17,11 @@ from .embedder import Embedder
 from .extractor import extract
 from .pipeline_version import current_version
 from .vector_store import VectorStore
+
+
+def _hybrid_enabled() -> bool:
+    """Read RAG_HYBRID at call time so tests can toggle it without reimport."""
+    return os.environ.get("RAG_HYBRID", "0") == "1"
 
 # Stable namespace for deterministic point IDs (UUID5 based on doc_id + chunk_index).
 # Using the well-known URL namespace UUID so the value is fixed across deploys.
@@ -52,6 +58,29 @@ async def ingest_bytes(
 
     texts = [c.text for c, _ in paired]
     vectors = await embedder.embed(texts)
+
+    # Sparse vectors are only computed when hybrid is on AND the target
+    # collection was created with sparse support. When either condition fails
+    # we produce no sparse vectors and the upsert path takes the legacy
+    # dense-only shape (byte-identical to the pre-hybrid behaviour). We use
+    # getattr with defaults so test doubles / minimal VectorStore substitutes
+    # that don't implement the sparse detection helpers still work.
+    sparse_vectors: list[tuple[list[int], list[float]] | None] = [None] * len(paired)
+    if _hybrid_enabled():
+        refresh = getattr(vector_store, "_refresh_sparse_cache", None)
+        has_sparse = getattr(vector_store, "_collection_has_sparse", None)
+        if refresh is not None and has_sparse is not None:
+            try:
+                await refresh(collection)
+            except Exception:
+                pass  # fall through — has_sparse below will be False
+            if has_sparse(collection):
+                try:
+                    from .sparse_embedder import embed_sparse
+                    sparse_vectors = list(embed_sparse(texts))  # type: ignore[assignment]
+                except Exception:
+                    # fastembed missing or failed — silently skip sparse arm.
+                    sparse_vectors = [None] * len(paired)
 
     now = time.time_ns()
     pv = current_version()
@@ -92,10 +121,14 @@ async def ingest_bytes(
             id_seed = f"chat:{chat_id}:chunk:{gidx}"
         point_id = str(uuid.uuid5(_POINT_NS, id_seed))
 
-        points.append({
+        point: dict = {
             "id": point_id,
             "vector": vec,
             "payload": payload,
-        })
+        }
+        sv = sparse_vectors[gidx]
+        if sv is not None:
+            point["sparse_vector"] = sv
+        points.append(point)
     await vector_store.upsert(collection, points)
     return len(points)

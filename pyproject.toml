@@ -35,6 +35,13 @@ dev = [
   "openpyxl>=3.1",
   "celery[redis]>=5.3",
 ]
+# Hybrid-retrieval extra. Install only if you plan to run with RAG_HYBRID=1
+# (sparse BM25 + dense fusion via Qdrant's server-side RRF). The fastembed
+# dependency pulls in onnxruntime + pillow (~150 MB total on first install).
+# The Qdrant/bm25 model itself is ~10 MB (stopwords + stemmer).
+hybrid = [
+  "fastembed>=0.4",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
