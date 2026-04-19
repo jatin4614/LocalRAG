@@ -113,18 +113,25 @@ class VectorStore:
     async def delete_by_doc(self, collection: str, doc_id: int | str) -> int:
         """Delete all points in ``collection`` whose payload ``doc_id`` matches.
 
-        doc_id is stored as a string in Qdrant payloads (normalised in ingest.py).
-        Returns 1 on success, 0 on any error (best-effort — caller should log).
+        Tries int match first (new canonical form, enforced in ingest.py and
+        by scripts/normalize_doc_ids.py), falls back to string match for any
+        legacy rows that haven't been normalised yet. Returns 1 on success,
+        0 on any error (best-effort — caller should log).
         """
+        candidates: list[int | str] = []
+        try:
+            candidates.append(int(doc_id))
+        except (ValueError, TypeError):
+            pass
+        candidates.append(str(doc_id))
+
         try:
             await self._client.delete(
                 collection_name=collection,
                 points_selector=qm.FilterSelector(
-                    filter=qm.Filter(must=[
-                        qm.FieldCondition(
-                            key="doc_id",
-                            match=qm.MatchValue(value=str(doc_id)),
-                        )
+                    filter=qm.Filter(should=[
+                        qm.FieldCondition(key="doc_id", match=qm.MatchValue(value=v))
+                        for v in candidates
                     ])
                 ),
                 wait=True,
