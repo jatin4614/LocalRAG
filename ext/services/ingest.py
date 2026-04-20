@@ -12,6 +12,7 @@ import time
 import uuid
 from typing import Mapping
 
+from . import flags
 from .chunker import chunk_text
 from .embedder import Embedder
 from .extractor import extract
@@ -39,6 +40,17 @@ def _contextualize_enabled() -> bool:
     behaviour (no chat-model calls, no httpx churn, no extra imports).
     """
     return os.environ.get("RAG_CONTEXTUALIZE_KBS", "0") == "1"
+
+
+def _raptor_enabled() -> bool:
+    """Read RAG_RAPTOR at call time via the flags overlay.
+
+    Default OFF. When OFF, the raptor module is not imported here, so the
+    default ingest path stays byte-identical to the pre-P3.4 behaviour
+    (no tree building, no extra chat-model calls, no sklearn import).
+    Per-KB overrides from ``rag_config`` flow through ``flags.get``.
+    """
+    return flags.get("RAG_RAPTOR", "0") == "1"
 
 
 async def _maybe_contextualize_chunks(
@@ -182,37 +194,118 @@ async def ingest_bytes(
     doc_id = payload_base.get("doc_id")
     chat_id = payload_base.get("chat_id")
 
+    # P3.4: optional RAPTOR tree expansion. OFF by default — the default
+    # path does not import the raptor module at all. When on, we replace
+    # the flat list of chunk points with every tree node (leaves at
+    # level 0 plus intermediate LLM summaries at level 1+). Each node
+    # becomes one Qdrant point with a ``chunk_level`` payload field so
+    # retrieval / admin tooling can distinguish tiers. Fail-open at the
+    # batch level — a runaway chat endpoint or a missing dep (sklearn)
+    # drops us back to flat ingest.
+    tree_nodes = None  # type: ignore[var-annotated]
+    if _raptor_enabled():
+        try:
+            from .raptor import build_tree  # local import — off-path has no cost
+            chat_url = os.environ.get("OPENAI_API_BASE_URL")
+            chat_model = os.environ.get("CHAT_MODEL", "orgchat-chat")
+            api_key = os.environ.get("OPENAI_API_KEY")
+            max_levels = int(flags.get("RAG_RAPTOR_MAX_LEVELS", "3") or 3)
+            cluster_min = int(flags.get("RAG_RAPTOR_CLUSTER_MIN", "5") or 5)
+            concurrency = int(flags.get("RAG_RAPTOR_CONCURRENCY", "4") or 4)
+            if chat_url:
+                leaves = [
+                    {"text": c.text, "index": i, "embedding": vectors[i]}
+                    for i, (c, _b) in enumerate(paired)
+                ]
+                tree_nodes = await build_tree(
+                    leaves,
+                    chat_url=chat_url,
+                    chat_model=chat_model,
+                    api_key=api_key,
+                    embedder=embedder,
+                    max_levels=max_levels,
+                    cluster_min=cluster_min,
+                    concurrency=concurrency,
+                )
+        except Exception:  # noqa: BLE001 — fail-open
+            tree_nodes = None
+
     points = []
-    for gidx, ((chunk, block), vec) in enumerate(zip(paired, vectors)):
-        payload = dict(payload_base)
-        payload["chunk_index"] = gidx
-        payload["text"] = chunk.text
-        payload["uploaded_at"] = now
-        payload["deleted"] = False
-        # Structural metadata from the source block (may be None / []).
-        payload["page"] = block.page
-        payload["heading_path"] = list(block.heading_path)
-        payload["sheet"] = block.sheet
-        payload["model_version"] = pv
+    if tree_nodes:
+        # Tree-node path: one point per RAPTOR node (leaves + summaries).
+        # Leaves index aligns with ``paired[i]`` so structural metadata
+        # (page / heading_path / sheet) + sparse vectors still attach.
+        # Summary nodes get None for those fields (they don't live in any
+        # one source block) and no sparse arm (BM25 over a LLM summary is
+        # not meaningful and we don't have it anyway).
+        for nidx, node in enumerate(tree_nodes):
+            if node.embedding is None:
+                continue  # build_tree couldn't embed this summary — skip
+            payload = dict(payload_base)
+            payload["chunk_index"] = nidx
+            payload["text"] = node.text
+            payload["uploaded_at"] = now
+            payload["deleted"] = False
+            payload["model_version"] = pv
+            payload["chunk_level"] = int(node.level)
+            payload["source_chunk_ids"] = list(node.source_chunk_ids)
+            if node.level == 0 and nidx < len(paired):
+                # Leaf: inherit the source block's structural metadata.
+                _chunk, block = paired[nidx]
+                payload["page"] = block.page
+                payload["heading_path"] = list(block.heading_path)
+                payload["sheet"] = block.sheet
+            else:
+                payload["page"] = None
+                payload["heading_path"] = []
+                payload["sheet"] = None
 
-        # Deterministic point ID: same doc + global chunk index always maps
-        # to the same Qdrant point. This lets delete_by_doc reconstruct point
-        # IDs or use payload filtering to remove vectors when a document is
-        # soft-deleted.
-        if doc_id is not None:
-            id_seed = f"doc:{doc_id}:chunk:{gidx}"
-        else:
-            id_seed = f"chat:{chat_id}:chunk:{gidx}"
-        point_id = str(uuid.uuid5(_POINT_NS, id_seed))
+            if doc_id is not None:
+                id_seed = f"doc:{doc_id}:chunk:{nidx}"
+            else:
+                id_seed = f"chat:{chat_id}:chunk:{nidx}"
+            point_id = str(uuid.uuid5(_POINT_NS, id_seed))
+            point: dict = {
+                "id": point_id,
+                "vector": node.embedding,
+                "payload": payload,
+            }
+            if node.level == 0 and nidx < len(sparse_vectors):
+                sv = sparse_vectors[nidx]
+                if sv is not None:
+                    point["sparse_vector"] = sv
+            points.append(point)
+    else:
+        for gidx, ((chunk, block), vec) in enumerate(zip(paired, vectors)):
+            payload = dict(payload_base)
+            payload["chunk_index"] = gidx
+            payload["text"] = chunk.text
+            payload["uploaded_at"] = now
+            payload["deleted"] = False
+            # Structural metadata from the source block (may be None / []).
+            payload["page"] = block.page
+            payload["heading_path"] = list(block.heading_path)
+            payload["sheet"] = block.sheet
+            payload["model_version"] = pv
 
-        point: dict = {
-            "id": point_id,
-            "vector": vec,
-            "payload": payload,
-        }
-        sv = sparse_vectors[gidx]
-        if sv is not None:
-            point["sparse_vector"] = sv
-        points.append(point)
+            # Deterministic point ID: same doc + global chunk index always maps
+            # to the same Qdrant point. This lets delete_by_doc reconstruct point
+            # IDs or use payload filtering to remove vectors when a document is
+            # soft-deleted.
+            if doc_id is not None:
+                id_seed = f"doc:{doc_id}:chunk:{gidx}"
+            else:
+                id_seed = f"chat:{chat_id}:chunk:{gidx}"
+            point_id = str(uuid.uuid5(_POINT_NS, id_seed))
+
+            point: dict = {
+                "id": point_id,
+                "vector": vec,
+                "payload": payload,
+            }
+            sv = sparse_vectors[gidx]
+            if sv is not None:
+                point["sparse_vector"] = sv
+            points.append(point)
     await vector_store.upsert(collection, points)
     return len(points)
