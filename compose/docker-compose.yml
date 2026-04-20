@@ -76,6 +76,19 @@ services:
     depends_on:
       - open-webui
 
+  # To swap chat model: set CHAT_MODEL in compose/.env to any HF repo id.
+  # vllm will download on first boot (requires HF_HUB_OFFLINE=0 for the first
+  # run — see docs/rag-model-swap.md). After the cache is populated,
+  # HF_HUB_OFFLINE=1 is safe.
+  #
+  # Suggested swap targets (as of 2026-04):
+  #   Qwen/Qwen2.5-14B-Instruct-AWQ         ~8 GB VRAM (current default)
+  #   google/gemma-3-27b-it                 ~54 GB VRAM — won't fit on 32 GB
+  #   google/gemma-3-12b-it                 ~24 GB VRAM — tight fit
+  #   solidrust/gemma-3-27b-it-AWQ          ~14 GB VRAM (4-bit quant)
+  #   meta-llama/Llama-3.3-70B-Instruct-AWQ ~18 GB VRAM (4-bit quant)
+  #
+  # Don't forget to set RAG_BUDGET_TOKENIZER to match (gemma-3 / qwen / llama).
   vllm-chat:
     image: vllm/vllm-openai:latest
     container_name: orgchat-vllm-chat
