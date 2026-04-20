@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import List, Optional, Sequence
 
 from . import flags
@@ -66,7 +67,34 @@ async def retrieve(
     the cached Hit list. Keyed by pipeline_version + KB selection + quantized
     query vector (so near-identical queries share a cache entry).
     """
-    [qvec] = await embedder.embed([query])
+    # P3.3: optional HyDE (Hypothetical Document Embeddings).
+    # When RAG_HYDE=1 we generate N synthetic "excerpt" answers via the
+    # chat model, embed them, and average. The resulting vector matches
+    # real document chunks (written as declarative statements) better
+    # than the raw question's embedding does — a big win on abstract
+    # queries over long KBs. Fail-open: on any chat error hyde_embed
+    # returns None, and we fall through to the raw-query embed.
+    #
+    # Default path (flag unset) is byte-identical to pre-P3.3: the
+    # ``ext.services.hyde`` module is not imported at all, so there is
+    # zero cost on the default path.
+    if flags.get("RAG_HYDE", "0") == "1":
+        from ext.services.hyde import hyde_embed
+        n = int(flags.get("RAG_HYDE_N", "1") or "1")
+        hyde_vec = await hyde_embed(
+            query,
+            embedder,
+            n=n,
+            chat_url=os.environ.get("OPENAI_API_BASE_URL", "http://vllm-chat:8000/v1"),
+            chat_model=os.environ.get("HYDE_MODEL", os.environ.get("CHAT_MODEL", "orgchat-chat")),
+            api_key=os.environ.get("OPENAI_API_KEY"),
+        )
+        if hyde_vec is not None:
+            qvec = hyde_vec
+        else:
+            [qvec] = await embedder.embed([query])
+    else:
+        [qvec] = await embedder.embed([query])
     hybrid = _hybrid_enabled()
 
     # P2.6: semantic retrieval cache — lookup BEFORE any Qdrant call.

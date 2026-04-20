@@ -100,6 +100,9 @@ def test_merge_all_valid_keys():
         "spotlight": True,
         "semcache": True,
         "contextualize_on_ingest": True,
+        # P3.3
+        "hyde": True,
+        "hyde_n": 3,
     }
     out = merge_configs([cfg])
     for key in VALID_KEYS:

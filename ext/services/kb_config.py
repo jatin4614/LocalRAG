@@ -42,6 +42,10 @@ to set unknown keys, but we belt-and-brace at the service layer too)::
                                      flag overlay — the overlay is
                                      request-scoped and ingest is a
                                      separate process path)
+    hyde                  bool    → RAG_HYDE   (P3.3 — enable Hypothetical
+                                     Document Embeddings per KB)
+    hyde_n                int     → RAG_HYDE_N (number of hypothetical
+                                     excerpts to average; default 1)
 
 An empty config ``{}`` means "inherit process defaults" (no overlay
 entry emitted — ``flags.get`` falls through to ``os.environ``).
@@ -60,10 +64,18 @@ VALID_BOOL_KEYS = frozenset({
     "spotlight",
     "semcache",
     "contextualize_on_ingest",
+    # P3.3: HyDE (Hypothetical Document Embeddings) — per-KB override so a
+    # year-long, abstract-query-heavy KB can opt in without flipping the
+    # global RAG_HYDE process flag.
+    "hyde",
 })
 VALID_INT_KEYS = frozenset({
     "rerank_top_k",
     "context_expand_window",
+    # P3.3: number of hypothetical-doc generations to average. Higher N
+    # improves retrieval quality on abstract queries at the cost of N
+    # extra chat calls (parallel, so wall-time cost is roughly constant).
+    "hyde_n",
 })
 VALID_FLOAT_KEYS = frozenset({
     "mmr_lambda",
@@ -88,6 +100,8 @@ _KEY_TO_ENV: dict[str, str] = {
     "spotlight": "RAG_SPOTLIGHT",
     "semcache": "RAG_SEMCACHE",
     "contextualize_on_ingest": "RAG_CONTEXTUALIZE_KBS",
+    "hyde": "RAG_HYDE",
+    "hyde_n": "RAG_HYDE_N",
 }
 
 
