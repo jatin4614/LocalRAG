@@ -512,6 +512,62 @@ async def _run_pipeline(
 
     sources_out = list(sources_by_doc.values())
 
+    # --- KB catalog preamble ---------------------------------------------
+    # Metadata queries ("which reports do I have?", "list documents",
+    # "what dates are covered?") can't be answered from content alone —
+    # retrieval returns chunks whose *text* mentions dates, not the set
+    # of files themselves. We always prepend a compact catalog of the
+    # selected KBs so the LLM knows the real scope of available docs.
+    # Sourced from Postgres kb_documents (not Qdrant scroll) because it's
+    # O(1) indexed lookup and reflects soft-deletes.
+    try:
+        kb_ids = sorted({int(c["kb_id"]) for c in selected_kbs if c.get("kb_id") is not None})
+        if kb_ids and _sessionmaker is not None:
+            from sqlalchemy import text as _sql_text
+            async with _sessionmaker() as _s:
+                res = await _s.execute(
+                    _sql_text(
+                        "SELECT kb_id, filename FROM kb_documents "
+                        "WHERE kb_id = ANY(:ids) AND deleted_at IS NULL "
+                        "ORDER BY kb_id, uploaded_at DESC, filename"
+                    ),
+                    {"ids": kb_ids},
+                )
+                rows = res.all()
+            if rows:
+                from collections import defaultdict as _dd
+                _by_kb: dict[int, list[str]] = _dd(list)
+                for kb_id_row, fn in rows:
+                    _by_kb[kb_id_row].append(fn)
+                _catalog_lines = []
+                for kb_id_row, fns in _by_kb.items():
+                    _catalog_lines.append(f"KB {kb_id_row}: {len(fns)} document(s) available")
+                    # Cap at 60 filenames per KB to stay cheap on tokens
+                    for fn in fns[:60]:
+                        _catalog_lines.append(f"  - {fn}")
+                    if len(fns) > 60:
+                        _catalog_lines.append(f"  ... and {len(fns) - 60} more")
+                _catalog_text = (
+                    "KNOWLEDGE-BASE CATALOG (authoritative list of documents "
+                    "available to you; use this for any 'which files / what "
+                    "reports / list dates' question):\n" + "\n".join(_catalog_lines)
+                )
+                sources_out.insert(0, {
+                    "source": {"id": "kb-catalog", "name": "kb-catalog", "url": "kb-catalog"},
+                    "document": [_catalog_text],
+                    "metadata": [{
+                        "source": "kb-catalog",
+                        "name": "kb-catalog",
+                        "kb_id": None,
+                        "doc_id": None,
+                        "chat_id": None,
+                        "subtag_id": None,
+                    }],
+                })
+    except Exception as _e:
+        # Fail-open: catalog is nice-to-have, not a correctness requirement.
+        logger.debug("kb catalog preamble skipped: %s", _e)
+
     # Emit a "hits" event before "done" so the UI can render citation
     # previews as soon as the backend has them, without waiting for the
     # LLM response stream.
