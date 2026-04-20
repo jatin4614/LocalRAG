@@ -9,7 +9,7 @@ from fastapi.responses import HTMLResponse
 
 from .config import clear_settings_cache, get_settings
 from .db.session import make_engine, make_sessionmaker
-from .routers import kb_admin, kb_retrieval, rag, upload
+from .routers import kb_admin, kb_retrieval, rag, rag_stream, upload
 from .services.embedder import TEIEmbedder
 from .services.vector_store import VectorStore
 
@@ -62,6 +62,8 @@ def build_app() -> FastAPI:
     app.include_router(kb_admin.router)
     app.include_router(upload.router)
     app.include_router(rag.router)
+    # P3.0 — SSE progress stream for the RAG pipeline.
+    app.include_router(rag_stream.router)
 
     # P2.5 — Prometheus metrics. Fail-open if prometheus_client missing.
     _mount_metrics(app)
@@ -76,7 +78,7 @@ def build_ext_routers():
     """
     from .config import clear_settings_cache, get_settings
     from .db.session import make_engine, make_sessionmaker
-    from .routers import kb_admin, kb_retrieval, rag, upload
+    from .routers import kb_admin, kb_retrieval, rag, rag_stream, upload
     from .services import auth as auth_svc
     from .services.embedder import TEIEmbedder
     from .services.vector_store import VectorStore
@@ -110,4 +112,11 @@ def build_ext_routers():
         return HR(html.read_text())
 
     # Retrieval first — avoids /available shadowing by admin's /{kb_id}.
-    return [ui_router, kb_retrieval.router, kb_admin.router, upload.router, rag.router]
+    return [
+        ui_router,
+        kb_retrieval.router,
+        kb_admin.router,
+        upload.router,
+        rag.router,
+        rag_stream.router,  # P3.0 — SSE progress stream
+    ]

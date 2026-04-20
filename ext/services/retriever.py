@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from typing import List, Optional, Sequence
 
+from . import flags
 from .embedder import Embedder
 from .vector_store import CHAT_PRIVATE_COLLECTION, Hit, VectorStore
 
@@ -15,8 +15,11 @@ def _hybrid_enabled() -> bool:
     Default on as of 2026-04-19 — eval showed +12pp chunk_recall at +3ms.
     Set RAG_HYBRID=0 to force dense-only. Any non-"0" value (including empty,
     "yes", "true") means "on" — more forgiving and matches user intent.
+
+    Reads through ``flags.get`` so per-request KB-config overrides take
+    precedence over the process-level env var (P3.0).
     """
-    return os.environ.get("RAG_HYBRID", "1") != "0"
+    return flags.get("RAG_HYBRID", "1") != "0"
 
 
 async def retrieve(
@@ -68,7 +71,8 @@ async def retrieve(
 
     # P2.6: semantic retrieval cache — lookup BEFORE any Qdrant call.
     # Lazy import keeps default-off path zero-cost (module never loads).
-    if os.environ.get("RAG_SEMCACHE", "0") == "1":
+    # flags.get honors request-scoped KB-config overrides (P3.0).
+    if flags.get("RAG_SEMCACHE", "0") == "1":
         from ext.services.retrieval_cache import (
             get as _cache_get,
             is_enabled as _semcache_on,
@@ -178,7 +182,7 @@ async def retrieve(
 
     # P2.6: write cache entry after successful Qdrant fan-out.
     # Same env-gate as above so the module stays unloaded in the default path.
-    if os.environ.get("RAG_SEMCACHE", "0") == "1":
+    if flags.get("RAG_SEMCACHE", "0") == "1":
         from ext.services.retrieval_cache import (
             put as _cache_put,
             is_enabled as _semcache_on,

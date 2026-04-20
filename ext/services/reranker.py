@@ -6,10 +6,10 @@ Strategy:
 """
 from __future__ import annotations
 
-import os
 from collections import defaultdict
 from typing import Any, Callable, List, Sequence
 
+from . import flags
 from .vector_store import Hit
 
 
@@ -48,8 +48,12 @@ def rerank(hits: List[Hit], *, top_k: int = 10) -> List[Hit]:
 
 
 def _read_rerank_flag() -> bool:
-    """Read RAG_RERANK at call time so tests can monkeypatch env without reload."""
-    return os.environ.get("RAG_RERANK", "0") == "1"
+    """Read RAG_RERANK at call time so tests can monkeypatch env without reload.
+
+    Uses ``flags.get`` so per-KB config overrides (P3.0) take effect for
+    the current request without mutating the shared process env.
+    """
+    return flags.get("RAG_RERANK", "0") == "1"
 
 
 def rerank_with_flag(

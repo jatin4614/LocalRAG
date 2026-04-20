@@ -19,6 +19,8 @@ import os
 import threading
 from typing import Any, Optional, Sequence
 
+from . import flags
+
 _LOCK = threading.Lock()
 # Sentinel states:
 #   None  — not yet tried to connect
@@ -64,8 +66,10 @@ def is_enabled() -> bool:
     """Return True if the cache can be used right now.
 
     Gated behind ``RAG_SEMCACHE=1``; default off for zero behavior change.
+    Reads through ``flags.get`` so per-request KB-config overrides (P3.0)
+    can enable the cache for specific KBs without global env mutation.
     """
-    if os.environ.get("RAG_SEMCACHE", "0") != "1":
+    if flags.get("RAG_SEMCACHE", "0") != "1":
         return False
     c = _get_client()
     return bool(c) and c is not False
