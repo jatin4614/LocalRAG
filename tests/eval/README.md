@@ -93,3 +93,68 @@ It will **not** catch:
 Human-labelled golden queries are still required before the CI regression
 gate is treated as meaningful. See the plan's P0.1 Step 1 for the handwritten
 schema (`expected_doc_ids` + `expected_chunk_indices` per user question).
+
+## Faithfulness (P3.5)
+
+The retrieval harness above grades **did we pull the right chunk?** It does
+**not** grade **did the model's answer stay grounded in that chunk?**
+Features like `RAG_CONTEXT_EXPAND` and `RAG_CONTEXTUALIZE_KBS` primarily
+improve answer quality on the same retrieval set, so they are invisible to
+the retrieval metrics.
+
+RAGAS-style **faithfulness** plugs that gap: fraction of an answer's factual
+claims that are supported by the retrieved context. Two-pass LLM judge:
+
+1. **Extract claims** — ask the chat model to break the generated answer into
+   a flat list of standalone claims.
+2. **Grade each claim** — for each claim, ask the judge *"is this claim
+   supported by the context? YES / NO"*.
+3. **Score** = supported / total claims, range `[0.0, 1.0]`.
+
+### Run it
+
+```
+python tests/eval/run_faithfulness_eval.py \
+    --golden tests/eval/golden.jsonl \
+    --qdrant-url http://localhost:6333 \
+    --tei-url http://172.19.0.6:80 \
+    --chat-url http://172.19.0.7:8000/v1 \
+    --chat-model orgchat-chat \
+    --label faithfulness_baseline \
+    --out tests/eval/results/faithfulness_baseline.json
+```
+
+The same `RAG_HYBRID`/`RAG_RERANK`/`RAG_MMR`/`RAG_CONTEXT_EXPAND` env flags
+control the retrieval stage, so flip a flag and re-run to compare faithfulness
+before and after the change.
+
+### Cost per run
+
+Per query: 1 retrieve + 1 answer-gen + 1 claim-extract + up to 10 grade calls.
+On Qwen2.5-14B-AWQ that is roughly **2-3 seconds per query, ~2-3 minutes for
+a 50-row golden** at the default `--concurrency 4`.
+
+### Interpretation
+
+| Score     | Read-out                                                              |
+|-----------|-----------------------------------------------------------------------|
+| `>= 0.90` | Very grounded. Answers are mostly supported by the retrieved chunks.  |
+| `0.70-0.90` | Reasonable. Expect occasional unsupported sentences.                |
+| `< 0.70`  | Frequent hallucination. Retrieval may be under-covering the question, |
+|           | or the model is rambling past what the context supports.              |
+
+A flag flip should **lift mean faithfulness by at least +3 pp** with no
+regression in retrieval metrics to justify a default flip.
+
+### Bias note
+
+We use the **same** local Qwen2.5-14B-AWQ as both the answer generator
+**and** the judge. That is self-grading and systematically optimistic: the
+model tends to grade its own claims generously. Ideal setup uses a distinct
+stronger judge (GPT-4, Claude) but our deployment is air-gapped. Treat
+absolute scores as directional; **relative** deltas between two runs against
+the same judge are what matter for gating decisions.
+
+Sample-size caveat: the auto-generated 50-row golden is tight. Treat a
+`+3 pp` lift with fewer than 3 runs (std-dev unknown) as suggestive, not
+conclusive.
