@@ -59,8 +59,8 @@ async def test_default_no_owner_passes_none_to_every_search(monkeypatch) -> None
         vector_store=vs,
         embedder=_FakeEmbedder(),
     )
-    # Two vs.search calls: one per KB, one for chat.
-    assert vs.search.await_count == 2
+    # 1 KB + 2 chat dual-read (chat_private + legacy chat_42) = 3 calls.
+    assert vs.search.await_count == 3
     for call in vs.search.await_args_list:
         # owner_user_id must be None (not missing) so vs.search's own default
         # kicks in (== None == no filter).
@@ -79,7 +79,8 @@ async def test_default_no_owner_on_hybrid_path(monkeypatch) -> None:
         vector_store=vs,
         embedder=_FakeEmbedder(),
     )
-    assert vs.hybrid_search.await_count == 2
+    # 1 KB + 2 chat dual-read = 3 hybrid calls.
+    assert vs.hybrid_search.await_count == 3
     for call in vs.hybrid_search.await_args_list:
         assert call.kwargs.get("owner_user_id") is None
 
@@ -103,14 +104,16 @@ async def test_owner_filter_never_forwarded_to_kb_search(monkeypatch) -> None:
         embedder=_FakeEmbedder(),
         owner_user_id=7,
     )
-    # 2 KB + 1 chat = 3 calls.
-    assert vs.search.await_count == 3
+    # 2 KB + 2 chat dual-read (chat_private + legacy chat_99) = 4 calls.
+    assert vs.search.await_count == 4
     calls_by_collection = {
         call.args[0]: call.kwargs.get("owner_user_id")
         for call in vs.search.await_args_list
     }
     assert calls_by_collection["kb_1"] is None
     assert calls_by_collection["kb_2"] is None
+    # Both chat arms get the owner filter.
+    assert calls_by_collection["chat_private"] == 7
     assert calls_by_collection["chat_99"] == 7
 
 
@@ -132,6 +135,8 @@ async def test_owner_filter_never_forwarded_to_kb_hybrid(monkeypatch) -> None:
         for call in vs.hybrid_search.await_args_list
     }
     assert calls_by_collection["kb_1"] is None
+    # Both chat arms (chat_private primary + legacy chat_99) get the filter.
+    assert calls_by_collection["chat_private"] == 7
     assert calls_by_collection["chat_99"] == 7
 
 
@@ -151,11 +156,13 @@ async def test_owner_filter_forwarded_to_chat_search(monkeypatch) -> None:
         embedder=_FakeEmbedder(),
         owner_user_id=7,
     )
-    # Only the chat arm runs (no KBs selected).
-    assert vs.search.await_count == 1
-    call = vs.search.await_args_list[0]
-    assert call.args[0] == "chat_99"
-    assert call.kwargs["owner_user_id"] == 7
+    # Only chat arm runs (no KBs selected) but dual-read = 2 calls.
+    assert vs.search.await_count == 2
+    cols = [c.args[0] for c in vs.search.await_args_list]
+    assert "chat_private" in cols
+    assert "chat_99" in cols
+    for call in vs.search.await_args_list:
+        assert call.kwargs["owner_user_id"] == 7
 
 
 @pytest.mark.asyncio

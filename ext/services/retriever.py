@@ -6,7 +6,7 @@ import os
 from typing import List, Optional, Sequence
 
 from .embedder import Embedder
-from .vector_store import Hit, VectorStore
+from .vector_store import CHAT_PRIVATE_COLLECTION, Hit, VectorStore
 
 
 def _hybrid_enabled() -> bool:
@@ -43,11 +43,19 @@ async def retrieve(
     with legacy collections). Set RAG_HYBRID=0 to force dense-only globally.
 
     P2.2: ``owner_user_id`` is forwarded ONLY to chat-scoped namespace searches
-    (``chat_{chat_id}``) — KB collections stay shared across all users with
-    access. When None (default) no owner filter is applied anywhere, making
-    the default path byte-identical to pre-P2.2. This is the per-user isolation
-    invariant for private chat docs: even within a consolidated chat collection
-    (P2.3), two users' docs cannot cross-pollinate.
+    (``chat_private`` + legacy ``chat_{chat_id}``) — KB collections stay shared
+    across all users with access. When None (default) no owner filter is
+    applied anywhere, making the default path byte-identical to pre-P2.2.
+    This is the per-user isolation invariant for private chat docs: within
+    the consolidated ``chat_private`` collection, the filter prevents any
+    cross-user bleed.
+
+    P2.3: chat-private reads dual-target BOTH ``chat_private`` (new primary,
+    tenant-filtered by ``chat_id`` + ``owner_user_id``) AND the legacy
+    ``chat_{chat_id}`` collection (fallback for un-migrated data). Results
+    are merged and deduplicated by point id so callers see a flat stream.
+    Dual-read is idempotent — once a chat is migrated, the legacy
+    collection is empty and contributes nothing.
 
     Semantic cache (P2.6) is gated behind RAG_SEMCACHE=1. Default OFF — the
     module is only imported when the flag is on, so the default path has zero
@@ -78,6 +86,7 @@ async def retrieve(
         subtag_ids: Optional[list[int]] = None,
         *,
         owner_filter: Optional[int | str] = None,
+        chat_filter: Optional[int | str] = None,
     ) -> List[Hit]:
         use_hybrid = False
         if hybrid:
@@ -98,10 +107,12 @@ async def retrieve(
                     collection, qvec, query,
                     limit=per_kb_limit, subtag_ids=subtag_ids,
                     owner_user_id=owner_filter,
+                    chat_id=chat_filter,
                 )
             return await vector_store.search(
                 collection, qvec, limit=per_kb_limit, subtag_ids=subtag_ids,
                 owner_user_id=owner_filter,
+                chat_id=chat_filter,
             )
         except Exception:
             return []
@@ -113,16 +124,47 @@ async def retrieve(
         return await _search_one(f"kb_{kb_id}", subtag_ids=subtag_ids)
 
     async def _search_chat() -> List[Hit]:
+        """Read private chat docs from both chat_private (primary) AND the
+        legacy ``chat_{chat_id}`` collection (fallback).
+
+        Migration story (P2.3):
+          * New uploads land in ``chat_private``, tenant-filtered by
+            ``chat_id`` + ``owner_user_id``.
+          * Pre-existing chats still have their data in ``chat_{chat_id}``
+            collections — we keep reading from those until an operator
+            runs ``scripts/migrate_chat_collections.py --apply``.
+          * Dual-read is idempotent: once a chat is migrated, the legacy
+            collection is empty (or deleted) and ``_search_one`` returns
+            an empty list. Merged+deduped result set is unchanged.
+        """
         if chat_id is None:
             return []
-        # Chat-scoped namespace — enforce per-user isolation when an owner
-        # is provided. With a dedicated ``chat_{chat_id}`` collection and a
-        # single owner, this is redundant today but becomes load-bearing once
-        # P2.3 merges all private chat docs into a single ``chat_private``
-        # collection sharded only by ``owner_user_id`` + ``chat_id``.
-        return await _search_one(
-            f"chat_{chat_id}", owner_filter=owner_user_id,
+        # Primary — consolidated collection, filtered by both chat_id and owner.
+        # Both filters are load-bearing: chat_id scopes the tenant, owner enforces
+        # per-user isolation (two users in the same chat would be a concurrency
+        # bug, but defense-in-depth is cheap with tenant indexes).
+        primary = await _search_one(
+            CHAT_PRIVATE_COLLECTION,
+            owner_filter=owner_user_id,
+            chat_filter=chat_id,
         )
+        # Legacy fallback — per-chat collection (pre-P2.3 shape). Missing
+        # collection surfaces as an exception inside vs.search; _search_one
+        # catches and returns []. Owner filter still applies even though the
+        # collection is already chat-scoped (defense-in-depth; cheap).
+        legacy = await _search_one(
+            f"chat_{chat_id}",
+            owner_filter=owner_user_id,
+        )
+        # Merge + dedupe by point id. Keep the higher-scoring copy when the
+        # same id appears in both (shouldn't happen if migration ran cleanly,
+        # but is the right tie-break if it hasn't).
+        merged: dict = {}
+        for hit in list(primary) + list(legacy):
+            prev = merged.get(hit.id)
+            if prev is None or hit.score > prev.score:
+                merged[hit.id] = hit
+        return list(merged.values())
 
     tasks = [_search_kb(cfg) for cfg in selected_kbs]
     tasks.append(_search_chat())

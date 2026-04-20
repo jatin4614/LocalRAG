@@ -16,7 +16,7 @@ from ..services.auth import CurrentUser, get_current_user, require_admin
 from ..services.embedder import Embedder
 from ..services.ingest import ingest_bytes
 from ..services.pipeline_version import current_version
-from ..services.vector_store import VectorStore
+from ..services.vector_store import CHAT_PRIVATE_COLLECTION, VectorStore
 
 
 router = APIRouter(tags=["upload"])
@@ -216,15 +216,26 @@ async def upload_private_doc(
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="chat not found")
 
     data = await _read_bounded(file)
-    await _VS.ensure_collection(f"chat_{chat_id}")
+    # P2.3: all new private chat uploads land in the consolidated
+    # ``chat_private`` collection. We ensure the collection exists with
+    # sparse support so hybrid retrieval (P1.1) can use it from day one.
+    # ensure_collection is idempotent — safe on every request.
+    await _VS.ensure_collection(CHAT_PRIVATE_COLLECTION, with_sparse=True)
+
+    # payload_base stamps both chat_id AND owner_user_id. These double as:
+    #   - tenant filter keys for Qdrant's is_tenant=True indexes (P2.1),
+    #   - read-path filters in retrieve() so neither cross-chat nor
+    #     cross-user leaks are possible even though many chats share the
+    #     same collection.
+    chat_payload_base = {"chat_id": chat_id, "owner_user_id": user.id}
 
     if RAG_SYNC_INGEST:
         n = await ingest_bytes(
             data=data,
             mime_type=file.content_type or "application/octet-stream",
             filename=_safe_filename(file.filename),
-            collection=f"chat_{chat_id}",
-            payload_base={"chat_id": chat_id, "owner_user_id": user.id},
+            collection=CHAT_PRIVATE_COLLECTION,
+            payload_base=chat_payload_base,
             vector_store=_VS,
             embedder=_EMB,
         )
@@ -240,7 +251,7 @@ async def upload_private_doc(
         sha,
         file.content_type or "application/octet-stream",
         _safe_filename(file.filename),
-        f"chat_{chat_id}",
-        {"chat_id": chat_id, "owner_user_id": user.id},
+        CHAT_PRIVATE_COLLECTION,
+        chat_payload_base,
     )
     return UploadResult(status="queued", chunks=0, task_id=task.id, sha=sha)

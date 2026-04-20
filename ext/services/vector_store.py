@@ -61,6 +61,16 @@ _DENSE_NAME = "dense"
 _SPARSE_NAME = "bm25"
 
 
+# P2.3: Single consolidated collection for all private chat documents.
+# Replaces the unbounded-growth pattern of ``chat_{chat_id}`` — one collection
+# per chat — with a single hybrid-shaped collection tenant-partitioned on
+# ``chat_id`` + ``owner_user_id``. Qdrant's ``is_tenant=True`` indexes
+# (registered in ``ensure_collection`` above) make those filters
+# O(tenant-size) not O(total-points), so one big collection scales where
+# N per-chat collections did not.
+CHAT_PRIVATE_COLLECTION = "chat_private"
+
+
 @dataclass
 class Hit:
     id: int | str | uuid.UUID
@@ -265,6 +275,7 @@ class VectorStore:
         *,
         subtag_ids: Optional[list[int]] = None,
         owner_user_id: Optional[int | str] = None,
+        chat_id: Optional[int | str] = None,
     ) -> qm.Filter:
         """Build the standard Qdrant filter for every read path.
 
@@ -277,6 +288,14 @@ class VectorStore:
         Default ``owner_user_id=None`` means no owner filter — byte-identical
         to the pre-P2.2 behaviour. This preserves KB retrieval semantics where
         every user with KB access sees every chunk regardless of uploader.
+
+        P2.3: ``chat_id`` adds a second ``must`` condition pinning matches to
+        a single chat. Required for reads against the consolidated
+        ``chat_private`` collection (many chats share the same collection,
+        tenant-partitioned by ``chat_id`` + ``owner_user_id``). Default
+        ``chat_id=None`` = no chat filter = byte-identical to pre-P2.3.
+        Chat ids are typically UUID strings from upstream Open WebUI; they
+        pass through unchanged.
         """
         must_conditions = []
         if subtag_ids:
@@ -296,6 +315,13 @@ class VectorStore:
                     match=qm.MatchValue(value=match_val),
                 )
             )
+        if chat_id is not None:
+            must_conditions.append(
+                qm.FieldCondition(
+                    key="chat_id",
+                    match=qm.MatchValue(value=chat_id),
+                )
+            )
         must_not_conditions = [
             qm.FieldCondition(key="deleted", match=qm.MatchValue(value=True))
         ]
@@ -312,6 +338,7 @@ class VectorStore:
         limit: int = 10,
         subtag_ids: Optional[list[int]] = None,
         owner_user_id: Optional[int | str] = None,
+        chat_id: Optional[int | str] = None,
     ) -> List[Hit]:
         """Dense-only search.
 
@@ -323,8 +350,16 @@ class VectorStore:
 
         P2.2: ``owner_user_id`` adds a ``must`` condition on the owner field.
         Default None = no owner filter = byte-identical to pre-P2.2.
+
+        P2.3: ``chat_id`` adds a ``must`` condition on the chat scope —
+        required when reading from the consolidated ``chat_private``
+        collection. Default None = no chat filter = byte-identical to pre-P2.3.
         """
-        flt = self._build_filter(subtag_ids=subtag_ids, owner_user_id=owner_user_id)
+        flt = self._build_filter(
+            subtag_ids=subtag_ids,
+            owner_user_id=owner_user_id,
+            chat_id=chat_id,
+        )
         # Warm the sparse cache lazily (cheap, cached on first call) so legacy
         # callers that only use dense still route correctly against hybrid collections.
         if name not in self._sparse_cache:
@@ -355,6 +390,7 @@ class VectorStore:
         limit: int = 10,
         subtag_ids: Optional[list[int]] = None,
         owner_user_id: Optional[int | str] = None,
+        chat_id: Optional[int | str] = None,
     ) -> List[Hit]:
         """Server-side RRF fusion of dense + BM25 sparse results.
 
@@ -366,10 +402,17 @@ class VectorStore:
         P2.2: ``owner_user_id`` propagates to both prefetch arms and the outer
         filter so RRF can only surface chunks owned by the given user. Default
         None = byte-identical to pre-P2.2.
+
+        P2.3: ``chat_id`` propagates identically — required to scope the
+        consolidated ``chat_private`` collection to a single chat.
         """
         from .sparse_embedder import embed_sparse_query
 
-        flt = self._build_filter(subtag_ids=subtag_ids, owner_user_id=owner_user_id)
+        flt = self._build_filter(
+            subtag_ids=subtag_ids,
+            owner_user_id=owner_user_id,
+            chat_id=chat_id,
+        )
         indices, values = embed_sparse_query(query_text)
         # P2.4: apply hnsw_ef to the dense prefetch arm. Sparse uses BM25
         # (no HNSW), so SearchParams on that arm is a no-op — we still attach
