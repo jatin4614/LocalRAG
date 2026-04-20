@@ -6,6 +6,77 @@ the Org Chat Assistant on a single 32 GB RTX 6000 Ada GPU machine. It is written
 
 ---
 
+## First-boot: populate model cache
+
+The stack runs with `HF_HUB_OFFLINE=1` on all model services (`vllm-chat`,
+`vllm-vision`, `tei`, `whisper`), so model weights **must** be present in
+`./volumes/models/` BEFORE `docker compose up`. If the cache is empty on
+first boot, every model container will crash-loop.
+
+Run once from a machine with internet access:
+
+```bash
+python scripts/preflight_models.py       # ~40 GB download: chat + vision + embedder + whisper
+```
+
+Or use the bootstrap wrapper, which runs `--verify-only` first and only
+downloads what is actually missing:
+
+```bash
+bash scripts/bootstrap.sh
+```
+
+**Air-gapped hosts.** If the target machine has no internet access, run
+`preflight_models.py` on a connected machine and copy the cache over
+BEFORE running compose:
+
+```bash
+rsync -av ./volumes/models/  user@air-gapped-host:/opt/orgchat/volumes/models/
+```
+
+The three vLLM/TEI services mount `./volumes/models` → `/root/.cache/huggingface/hub`
+(HF Hub layout: `models--<org>--<name>/`). The whisper service mounts the same
+directory at `/models`. `faster-whisper` uses the same `models--Systran--faster-whisper-<size>/`
+layout so a single populated `volumes/models/` satisfies all four services.
+
+**Re-download a specific model** (after bumping a version, for instance):
+
+```bash
+rm -rf ./volumes/models/models--<org>--<model>
+python scripts/preflight_models.py
+```
+
+**Preflight exit codes** (useful when scripting):
+
+| Code | Meaning |
+|------|---------|
+| `0`  | All models present, or downloads completed successfully |
+| `2`  | One or more models missing (`--verify-only`) or insufficient disk |
+| `3`  | Network unreachable — HuggingFace Hub could not be contacted |
+| `4`  | Invalid command-line arguments |
+
+**Escape hatch: populate the cache from inside a container.** If for some
+reason you cannot run the preflight script on the host (unusual Python
+environment, missing dependencies, etc.) you can populate the cache by
+temporarily disabling offline mode on a single service. For example, to
+warm the chat model cache from inside `vllm-chat`:
+
+```bash
+# 1. Comment out HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE in vllm-chat's
+#    environment: block in compose/docker-compose.yml (or override via
+#    `-e HF_HUB_OFFLINE=0 -e TRANSFORMERS_OFFLINE=0`).
+# 2. docker compose up vllm-chat   — it will download weights into the
+#    mounted ./volumes/models on first run.
+# 3. Once the container reports healthy, docker compose down.
+# 4. Restore HF_HUB_OFFLINE=1 / TRANSFORMERS_OFFLINE=1.
+# 5. docker compose up -d            — subsequent runs are fully offline.
+```
+
+Repeat per service, or just run the preflight script once — it is much
+simpler and produces the same cache layout.
+
+---
+
 ## 1. Prerequisites
 
 ### 1.1 Hardware

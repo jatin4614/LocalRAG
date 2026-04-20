@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from typing import AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel
@@ -11,8 +11,9 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
 from sqlalchemy import select
 
 from ..services import kb_service
-from ..db.models import KBDocument
+from ..db.models import KBDocument, KnowledgeBase
 from ..services.auth import CurrentUser, require_admin
+from ..services.kb_config import VALID_KEYS, validate_config
 from ..services.vector_store import VectorStore
 
 log = logging.getLogger("orgchat.kb_admin")
@@ -113,6 +114,88 @@ async def update_kb(
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="kb not found")
     await session.commit()
     return _to_out(kb)
+
+
+class RAGConfigOut(BaseModel):
+    kb_id: int
+    rag_config: dict[str, Any]
+
+
+@router.get("/{kb_id}/config", response_model=RAGConfigOut)
+async def get_rag_config(
+    kb_id: int,
+    user: CurrentUser = Depends(require_admin),
+    session: AsyncSession = Depends(_get_session),
+):
+    """P3.0 — fetch per-KB retrieval quality overrides.
+
+    Returns ``{}`` when the KB inherits process-level defaults (never null
+    so admin UIs can round-trip without a null-check).
+    """
+    kb = await kb_service.get_kb(session, kb_id=kb_id)
+    if kb is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="kb not found")
+    return RAGConfigOut(kb_id=kb.id, rag_config=dict(kb.rag_config or {}))
+
+
+@router.patch("/{kb_id}/config", response_model=RAGConfigOut)
+async def patch_rag_config(
+    kb_id: int,
+    body: dict[str, Any],
+    user: CurrentUser = Depends(require_admin),
+    session: AsyncSession = Depends(_get_session),
+):
+    """P3.0 — merge ``body`` into the KB's ``rag_config``.
+
+    Partial update: only keys present in ``body`` are touched; everything
+    else stays at its prior value. Unknown keys are rejected with 400 so
+    admin UIs fail loudly when the frontend and backend drift out of sync.
+    Values are coerced to their whitelisted types (bool / int / float)
+    before persistence — the JSONB column is append-only-safe.
+
+    Example::
+
+        PATCH /api/kb/42/config
+        {"rerank": true, "context_expand_window": 3}
+
+    Response::
+
+        {"kb_id": 42, "rag_config": {"rerank": true, "context_expand_window": 3}}
+    """
+    # Reject unknown keys up-front so the admin UI gets actionable errors.
+    unknown = set(body.keys()) - set(VALID_KEYS)
+    if unknown:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail=f"unknown config keys: {sorted(unknown)}",
+        )
+
+    # Coerce to the expected Python types; any key whose value fails
+    # coercion is silently dropped by validate_config, so we compare back
+    # to detect bad types and raise 400.
+    cleaned = validate_config(body)
+    bad_types = [k for k in body if k in VALID_KEYS and k not in cleaned]
+    if bad_types:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail=f"bad value type for: {sorted(bad_types)}",
+        )
+
+    kb = await kb_service.get_kb(session, kb_id=kb_id)
+    if kb is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="kb not found")
+
+    # Partial merge: existing values win only for keys NOT in cleaned.
+    merged: dict[str, Any] = dict(kb.rag_config or {})
+    merged.update(cleaned)
+    kb.rag_config = merged
+    # Force SQLAlchemy to detect the JSON mutation on SQLite (where the
+    # mutable dict tracker isn't wired up).
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(kb, "rag_config")
+    await session.flush()
+    await session.commit()
+    return RAGConfigOut(kb_id=kb.id, rag_config=merged)
 
 
 @router.delete("/{kb_id}", status_code=status.HTTP_204_NO_CONTENT)

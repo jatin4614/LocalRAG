@@ -11,6 +11,8 @@ from ext.services.embedder import StubEmbedder
 from ext.services.retriever import retrieve
 from ext.services.reranker import rerank
 
+pytestmark = pytest.mark.integration
+
 
 @pytest.mark.asyncio
 async def test_query_hits_matching_doc_not_noise(clean_qdrant):

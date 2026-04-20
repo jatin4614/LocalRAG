@@ -3,7 +3,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 
 def test_git_repo_initialized():
-    assert (ROOT / ".git").is_dir(), ".git directory missing — run `git init`"
+    # .git is a directory in a normal clone, but a file (gitdir: ...) in a git worktree.
+    assert (ROOT / ".git").exists(), ".git missing — run `git init`"
 
 def test_gitignore_ignores_volumes_and_venv():
     content = (ROOT / ".gitignore").read_text()

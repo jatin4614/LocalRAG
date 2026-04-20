@@ -1,0 +1,23 @@
+{
+  "label": "hybrid",
+  "k": 10,
+  "metrics": {
+    "n_queries": 50,
+    "n_errors": 0,
+    "chunk_recall_at_k": 0.96,
+    "doc_recall_at_k": 0.98,
+    "mrr_at_k": 0.924,
+    "unique_docs_at_k": 5.56,
+    "p50_latency_ms": 10.386261492385529,
+    "p95_latency_ms": 12.891937978565693
+  },
+  "flags": {
+    "RAG_HYBRID": "1",
+    "RAG_RERANK": "",
+    "RAG_MMR": "",
+    "RAG_CONTEXT_EXPAND": "",
+    "RAG_BUDGET_TOKENIZER": "",
+    "RAG_MMR_LAMBDA": "",
+    "RAG_CONTEXT_EXPAND_WINDOW": ""
+  }
+}

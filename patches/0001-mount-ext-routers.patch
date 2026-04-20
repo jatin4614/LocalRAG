@@ -66,7 +66,7 @@ diff --git a/backend/open_webui/utils/middleware.py b/backend/open_webui/utils/m
 index b64febd67..2d158de99 100644
 --- a/backend/open_webui/utils/middleware.py
 +++ b/backend/open_webui/utils/middleware.py
-@@ -2701,6 +2701,36 @@ async def process_chat_payload(request, form_data, user, metadata, model):
+@@ -2701,6 +2701,55 @@ async def process_chat_payload(request, form_data, user, metadata, model):
          except Exception as e:
              log.exception(e)
  
@@ -85,15 +85,34 @@ index b64febd67..2d158de99 100644
 +        if (_kb_config or _chat_id) and prompt and _user_id:
 +            log.info("orgchat: retrieving KB sources (kbs=%d chat=%s)",
 +                     len(_kb_config or []), bool(_chat_id))
++            # P0.5 — prior turns for history-aware rewrite (gated by
++            # RAG_DISABLE_REWRITE inside the bridge; default off).
++            _history = [m for m in (form_data.get('messages') or [])[:-1]
++                        if isinstance(m, dict) and m.get('content')]
 +            _kb_sources = await retrieve_kb_sources(
 +                _kb_config or [],
 +                prompt,
 +                str(_user_id),
 +                chat_id=str(_chat_id) if _chat_id else None,
++                history=_history,
 +            )
 +            if _kb_sources:
 +                sources.extend(_kb_sources)
 +                log.info("orgchat: injected %d KB source(s)", len(_kb_sources))
++                # P0.6 — spotlighting: when RAG_SPOTLIGHT=1, prepend the
++                # untrusted-content policy to the system prompt so the LLM
++                # treats tagged chunks as data, not instructions. Default
++                # off → no change to prompt.
++                try:
++                    import os as _os_sp
++                    if _os_sp.environ.get('RAG_SPOTLIGHT', '0') == '1':
++                        from ext.services.spotlight import SPOTLIGHT_POLICY as _SP_POLICY
++                        form_data['messages'] = add_or_update_system_message(
++                            _SP_POLICY, form_data.get('messages') or [], append=False,
++                        )
++                        log.info("orgchat: spotlight policy injected into system prompt")
++                except Exception as _e_sp:
++                    log.warning("orgchat spotlight policy injection failed (non-fatal): %s", _e_sp)
 +            else:
 +                log.info("orgchat: no KB sources found for query")
 +    except Exception as _e_kb:

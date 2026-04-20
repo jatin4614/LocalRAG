@@ -2,6 +2,8 @@ import pytest
 from sqlalchemy import text
 from ext.services import kb_service
 
+pytestmark = pytest.mark.integration
+
 
 @pytest.mark.asyncio
 async def test_create_and_get_kb(session):

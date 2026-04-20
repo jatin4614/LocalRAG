@@ -12,6 +12,9 @@ volumes:
   postgres_data: { driver: local }
   redis_data:    { driver: local }
   qdrant_data:   { driver: local }
+  # Shared between open-webui (producer) and celery-worker (consumer) when
+  # RAG_SYNC_INGEST=0. In the default sync path, nothing writes to it.
+  ingest_blobs:  { driver: local }
 
 services:
   postgres:
@@ -73,6 +76,19 @@ services:
     depends_on:
       - open-webui
 
+  # To swap chat model: set CHAT_MODEL in compose/.env to any HF repo id.
+  # vllm will download on first boot (requires HF_HUB_OFFLINE=0 for the first
+  # run — see docs/rag-model-swap.md). After the cache is populated,
+  # HF_HUB_OFFLINE=1 is safe.
+  #
+  # Suggested swap targets (as of 2026-04):
+  #   Qwen/Qwen2.5-14B-Instruct-AWQ         ~8 GB VRAM (current default)
+  #   google/gemma-3-27b-it                 ~54 GB VRAM — won't fit on 32 GB
+  #   google/gemma-3-12b-it                 ~24 GB VRAM — tight fit
+  #   solidrust/gemma-3-27b-it-AWQ          ~14 GB VRAM (4-bit quant)
+  #   meta-llama/Llama-3.3-70B-Instruct-AWQ ~18 GB VRAM (4-bit quant)
+  #
+  # Don't forget to set RAG_BUDGET_TOKENIZER to match (gemma-3 / qwen / llama).
   vllm-chat:
     image: vllm/vllm-openai:latest
     container_name: orgchat-vllm-chat
@@ -255,6 +271,7 @@ services:
       SESSION_SECRET: ${SESSION_SECRET}
     volumes:
       - ../volumes/uploads:/app/backend/data/uploads
+      - ingest_blobs:/var/ingest
     depends_on:
       postgres:
         condition: service_healthy
@@ -268,3 +285,39 @@ services:
       timeout: 10s
       retries: 5
       start_period: 120s
+
+  # Celery worker for asynchronous ingest. Only used when RAG_SYNC_INGEST=0 on
+  # the open-webui producer; in the default sync path this service can run but
+  # won't receive any tasks. See ext/workers/ingest_worker.py.
+  celery-worker:
+    build:
+      context: ..
+      dockerfile: compose/Dockerfile.celery
+    container_name: orgchat-celery-worker
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/1}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/2}
+      INGEST_BLOB_ROOT: /var/ingest
+      QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
+      TEI_URL: ${TEI_URL:-http://tei:80}
+      RAG_VECTOR_SIZE: ${RAG_VECTOR_SIZE:-1024}
+      RAG_EMBEDDING_OPENAI_API_BASE_URL: ${RAG_EMBEDDING_OPENAI_API_BASE_URL:-http://tei:80/v1}
+    volumes:
+      - ingest_blobs:/var/ingest
+    command:
+      - celery
+      - -A
+      - ext.workers.celery_app
+      - worker
+      - --loglevel=info
+      - --queues=ingest
+      - --concurrency=2
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy

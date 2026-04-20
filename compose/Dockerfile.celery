@@ -1,0 +1,36 @@
+# Minimal Celery worker image for the ingest queue.
+# Only built/run when RAG_SYNC_INGEST=0 (the async path).
+FROM python:3.11-slim-bookworm
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+# System deps needed by the ingest pipeline's extractors (pandoc / docx libs
+# transitively), kept tight.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl \
+      pandoc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Runtime deps. Mirror the subset of project requirements the ingest worker
+# actually imports — no upstream Open WebUI stack, no frontend build.
+RUN pip install \
+      "celery[redis]>=5.3" \
+      "redis>=5.0" \
+      "httpx>=0.27" \
+      "qdrant-client>=1.9" \
+      "pypdf>=4.3" \
+      "python-docx>=1.0" \
+      "openpyxl>=3.1" \
+      "tiktoken>=0.7" \
+      "pydantic>=2.8" \
+      "sqlalchemy[asyncio]>=2.0.30" \
+      "asyncpg>=0.29"
+
+# Project source. Only ext/ is needed for the worker.
+COPY ext/ /app/ext/
+
+# Entrypoint comes from the compose `command:` block (celery ... worker).

@@ -1,6 +1,8 @@
 import pytest
 from ext.services.vector_store import VectorStore
 
+pytestmark = pytest.mark.integration
+
 
 @pytest.mark.asyncio
 async def test_ensure_collection_is_idempotent(clean_qdrant):

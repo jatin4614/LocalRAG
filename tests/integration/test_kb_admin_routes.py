@@ -7,6 +7,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
 
 from ext.routers.kb_admin import router as kb_admin_router, set_sessionmaker
 
+pytestmark = pytest.mark.integration
+
 
 @pytest_asyncio.fixture
 async def client(engine):

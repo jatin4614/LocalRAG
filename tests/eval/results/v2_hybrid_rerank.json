@@ -1,0 +1,23 @@
+{
+  "label": "hybrid_rerank",
+  "k": 10,
+  "metrics": {
+    "n_queries": 50,
+    "n_errors": 0,
+    "chunk_recall_at_k": 0.98,
+    "doc_recall_at_k": 1.0,
+    "mrr_at_k": 0.9766666666666667,
+    "unique_docs_at_k": 5.46,
+    "p50_latency_ms": 976.190500499797,
+    "p95_latency_ms": 988.1793399981689
+  },
+  "flags": {
+    "RAG_HYBRID": "1",
+    "RAG_RERANK": "1",
+    "RAG_MMR": "",
+    "RAG_CONTEXT_EXPAND": "",
+    "RAG_BUDGET_TOKENIZER": "",
+    "RAG_MMR_LAMBDA": "",
+    "RAG_CONTEXT_EXPAND_WINDOW": ""
+  }
+}

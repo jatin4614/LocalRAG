@@ -10,6 +10,8 @@ from ext.routers.rag import router as rag_router, configure as configure_rag
 from ext.services.vector_store import VectorStore
 from ext.services.embedder import StubEmbedder
 
+pytestmark = pytest.mark.integration
+
 
 ADMIN = {"X-User-Id": "9", "X-User-Role": "admin"}
 ALICE = {"X-User-Id": "1", "X-User-Role": "user"}
