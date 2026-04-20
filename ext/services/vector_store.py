@@ -31,6 +31,13 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return val in ("1", "true", "yes", "on")
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (ValueError, TypeError):
+        return default
+
+
 def _hnsw_config_diff() -> qm.HnswConfigDiff:
     """Build the HNSW config applied at collection creation."""
     return qm.HnswConfigDiff(
@@ -40,9 +47,82 @@ def _hnsw_config_diff() -> qm.HnswConfigDiff:
     )
 
 
-def _search_params() -> qm.SearchParams:
-    """Build the per-query SearchParams (hnsw_ef)."""
-    return qm.SearchParams(hnsw_ef=_env_int("RAG_QDRANT_EF", 128))
+# --- P3.2 scalar quantization -----------------------------------------------
+# INT8 scalar quantization @ quantile=0.99 gives ~4× vector-RAM reduction with
+# <2% recall loss. Binary quantization is intentionally skipped — bge-m3 is
+# 1024d, the known borderline where binary starts degrading.
+
+
+def _quantization_config() -> qm.ScalarQuantization:
+    """Build the ScalarQuantization config for new collections.
+
+    ``always_ram=True`` keeps the 4×-smaller quantized index in RAM for fast
+    approximate search; originals spill to disk (``on_disk=True`` on
+    VectorParams) and are only loaded when a query opts into rescoring.
+    """
+    return qm.ScalarQuantization(
+        scalar=qm.ScalarQuantizationConfig(
+            type=qm.ScalarType.INT8,
+            quantile=_env_float("RAG_QDRANT_QUANTILE", 0.99),
+            always_ram=True,
+        )
+    )
+
+
+def _should_quantize() -> bool:
+    """Default-on switch for creating new collections with quantization.
+
+    Off by default so zero-config deployments keep byte-identical behaviour.
+    Operators opt in via ``RAG_QDRANT_QUANTIZE=1``.
+    """
+    return _env_bool("RAG_QDRANT_QUANTIZE", False)
+
+
+def _should_rescore() -> bool:
+    """Per-query rescore switch. On by default when quantization is involved.
+
+    Env knob ``RAG_QDRANT_RESCORE=0`` disables globally. The per-call
+    ``rescore=False`` kwarg on ``search`` / ``hybrid_search`` always wins.
+    """
+    return _env_bool("RAG_QDRANT_RESCORE", True)
+
+
+def _env_oversampling() -> float:
+    """Oversampling ratio used during quantized rescoring.
+
+    With oversampling=2.0, Qdrant pulls 2× the requested limit via the
+    quantized index, then rescores those candidates with the original fp32
+    vectors and returns the final top-N. Higher → better recall, more I/O.
+    """
+    return _env_float("RAG_QDRANT_OVERSAMPLING", 2.0)
+
+
+def _quantization_search_params() -> qm.QuantizationSearchParams:
+    """Build the per-query QuantizationSearchParams (rescore=True, oversampling)."""
+    return qm.QuantizationSearchParams(
+        rescore=True,
+        oversampling=_env_oversampling(),
+    )
+
+
+def _search_params(*, rescore: Optional[bool] = None) -> qm.SearchParams:
+    """Build the per-query SearchParams (hnsw_ef + optional quantization hint).
+
+    ``rescore`` (default None → env-driven):
+      * True  → attach QuantizationSearchParams(rescore=True, oversampling=2)
+      * False → omit quantization params (quantized approx only, no rescore)
+      * None  → follow ``RAG_QDRANT_RESCORE`` env (default True)
+
+    For legacy, unquantized collections the ``quantization=`` arg is a no-op
+    on Qdrant's side, so it's always safe to include.
+    """
+    if rescore is None:
+        rescore = _should_rescore()
+    qp = _quantization_search_params() if rescore else None
+    return qm.SearchParams(
+        hnsw_ef=_env_int("RAG_QDRANT_EF", 128),
+        quantization=qp,
+    )
 
 _PAYLOAD_FIELDS = [
     "text", "kb_id", "subtag_id", "doc_id", "chat_id",
@@ -52,6 +132,9 @@ _PAYLOAD_FIELDS = [
     # P2.2 tenant-owner attribution — indexed as tenant field for RBAC
     # hot-path filters (admin-wide scoped queries skip other owners' subgraphs).
     "owner_user_id",
+    # P3.4 RAPTOR tree provenance: ``chunk_level`` (0 leaf, 1+ summary),
+    # ``source_chunk_ids`` (leaf indices a summary node covers).
+    "chunk_level", "source_chunk_ids",
 ]
 
 # Name of the named dense vector when a collection is created with sparse vectors
@@ -103,7 +186,13 @@ class VectorStore:
         cols = (await self._client.get_collections()).collections
         return [c.name for c in cols]
 
-    async def ensure_collection(self, name: str, *, with_sparse: bool = False) -> None:
+    async def ensure_collection(
+        self,
+        name: str,
+        *,
+        with_sparse: bool = False,
+        with_quantization: Optional[bool] = None,
+    ) -> None:
         """Idempotently create a collection.
 
         By default creates a legacy-shaped collection with a single unnamed
@@ -112,8 +201,18 @@ class VectorStore:
         a named ``dense`` vector AND a named ``bm25`` sparse vector (IDF
         modifier) — required for server-side hybrid retrieval via RRF.
 
+        P3.2: ``with_quantization`` opts the collection into scalar INT8
+        quantization (``ScalarQuantization(INT8, quantile=0.99, always_ram=True)``).
+        When ``None`` (default), the ``RAG_QDRANT_QUANTIZE`` env switch decides.
+        When enabled, the dense VectorParams also gets ``on_disk=True`` so the
+        original fp32 vectors spill to disk (only paged in for rescoring);
+        the 4×-smaller quantized index stays RAM-resident.
+
         This method never upgrades an existing collection; if ``name`` already
-        exists with the wrong shape, callers must recreate it externally.
+        exists with the wrong shape, callers must recreate it externally
+        (or use ``scripts/enable_quantization.py`` to retrofit quantization
+        settings on-the-fly — Qdrant rebuilds the quantized index in the
+        background without rewriting the raw vectors).
         """
         if name in self._known:
             return
@@ -122,6 +221,13 @@ class VectorStore:
         # large KBs spill payloads to disk (keep RAM for HNSW graph).
         hnsw = _hnsw_config_diff()
         on_disk_payload = _env_bool("RAG_QDRANT_ON_DISK_PAYLOAD", False)
+        # P3.2: per-call arg wins; env is the fallback. ``None`` means "ask env".
+        if with_quantization is None:
+            with_quantization = _should_quantize()
+        quant_config = _quantization_config() if with_quantization else None
+        # Originals-on-disk pairs with always-RAM quantized — that's the whole
+        # tier trade: tiny fast index in RAM, big precise index on disk.
+        dense_on_disk = True if with_quantization else None
         try:
             if with_sparse:
                 await self._client.create_collection(
@@ -130,6 +236,7 @@ class VectorStore:
                         _DENSE_NAME: qm.VectorParams(
                             size=self._vector_size,
                             distance=qm.Distance[self._distance.upper()],
+                            on_disk=dense_on_disk,
                         ),
                     },
                     sparse_vectors_config={
@@ -139,6 +246,7 @@ class VectorStore:
                     },
                     hnsw_config=hnsw,
                     on_disk_payload=on_disk_payload,
+                    quantization_config=quant_config,
                 )
                 self._sparse_cache[name] = True
             else:
@@ -147,9 +255,11 @@ class VectorStore:
                     vectors_config=qm.VectorParams(
                         size=self._vector_size,
                         distance=qm.Distance[self._distance.upper()],
+                        on_disk=dense_on_disk,
                     ),
                     hnsw_config=hnsw,
                     on_disk_payload=on_disk_payload,
+                    quantization_config=quant_config,
                 )
                 self._sparse_cache[name] = False
         except Exception:
@@ -339,6 +449,7 @@ class VectorStore:
         subtag_ids: Optional[list[int]] = None,
         owner_user_id: Optional[int | str] = None,
         chat_id: Optional[int | str] = None,
+        rescore: Optional[bool] = None,
     ) -> List[Hit]:
         """Dense-only search.
 
@@ -354,6 +465,15 @@ class VectorStore:
         P2.3: ``chat_id`` adds a ``must`` condition on the chat scope —
         required when reading from the consolidated ``chat_private``
         collection. Default None = no chat filter = byte-identical to pre-P2.3.
+
+        P3.2: ``rescore`` controls quantization rescoring. True (default,
+        env-backed via ``RAG_QDRANT_RESCORE=1``) attaches
+        ``QuantizationSearchParams(rescore=True, oversampling=2.0)`` to the
+        search params so Qdrant uses the INT8 index for approximate search,
+        then rescores the top ``limit*oversampling`` candidates with the full
+        fp32 vectors. On a collection *without* quantization the param is a
+        no-op. Set ``rescore=False`` to skip the rescore pass (fastest, lowest
+        recall — use for latency-critical queries where ±2% recall is fine).
         """
         flt = self._build_filter(
             subtag_ids=subtag_ids,
@@ -374,7 +494,9 @@ class VectorStore:
             "query_filter": flt,
             "with_payload": _PAYLOAD_FIELDS,
             # P2.4: per-query HNSW ``ef`` knob. Higher → better recall, slower.
-            "search_params": _search_params(),
+            # P3.2: SearchParams also carries the QuantizationSearchParams hint
+            # when rescore is on (no-op on unquantized collections).
+            "search_params": _search_params(rescore=rescore),
         }
         if self._sparse_cache.get(name):
             kwargs["using"] = _DENSE_NAME
@@ -391,6 +513,7 @@ class VectorStore:
         subtag_ids: Optional[list[int]] = None,
         owner_user_id: Optional[int | str] = None,
         chat_id: Optional[int | str] = None,
+        rescore: Optional[bool] = None,
     ) -> List[Hit]:
         """Server-side RRF fusion of dense + BM25 sparse results.
 
@@ -405,6 +528,12 @@ class VectorStore:
 
         P2.3: ``chat_id`` propagates identically — required to scope the
         consolidated ``chat_private`` collection to a single chat.
+
+        P3.2: ``rescore`` attaches ``QuantizationSearchParams(rescore=True,
+        oversampling=2.0)`` to the dense prefetch arm so quantized approx
+        search is rescored against the original fp32 vectors. The sparse
+        (BM25) arm has no vectors and ignores the hint. Default follows the
+        ``RAG_QDRANT_RESCORE`` env knob.
         """
         from .sparse_embedder import embed_sparse_query
 
@@ -414,10 +543,10 @@ class VectorStore:
             chat_id=chat_id,
         )
         indices, values = embed_sparse_query(query_text)
-        # P2.4: apply hnsw_ef to the dense prefetch arm. Sparse uses BM25
-        # (no HNSW), so SearchParams on that arm is a no-op — we still attach
-        # it to the dense arm only to keep the call site explicit.
-        sp = _search_params()
+        # P2.4 + P3.2: SearchParams carries hnsw_ef AND (when rescore is on)
+        # QuantizationSearchParams(rescore=True, oversampling=2.0). Attached
+        # only to the dense prefetch arm; BM25 sparse has no HNSW / quantization.
+        sp = _search_params(rescore=rescore)
         prefetch = [
             qm.Prefetch(
                 query=query_vector,
