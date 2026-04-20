@@ -101,6 +101,11 @@ def build_ext_routers():
     from .services import chat_rag_bridge
     chat_rag_bridge.configure(vector_store=vs, embedder=emb, sessionmaker=SessionLocal)
 
+    # Vision preprocessor — converts attached images into text context
+    # before RAG runs. Runs against vllm-vision on the internal network.
+    from .services import vision as vision_svc
+    vision_svc.configure(vector_store=vs, embedder=emb, sessionmaker=SessionLocal)
+
     # Admin UI page (standalone HTML — no Svelte needed)
     from fastapi import APIRouter
     from fastapi.responses import HTMLResponse as HR

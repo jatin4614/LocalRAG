@@ -145,12 +145,14 @@ async def upload_kb_doc(
     # Retrieval does NOT filter KB collections by owner (KBs stay shared across
     # all users with kb_access grants), but the field is recorded for future
     # audit queries, data-export scrubbing, and consistency with the private
-    # chat path.
+    # chat path. ``filename`` is stamped so citations work for legacy payloads
+    # that never got the DB back-fill path.
     kb_payload_base = {
         "kb_id": kb_id,
         "subtag_id": subtag_id,
         "doc_id": doc.id,
         "owner_user_id": user.id,
+        "filename": safe_name,
     }
 
     if RAG_SYNC_INGEST:
@@ -222,18 +224,25 @@ async def upload_private_doc(
     # ensure_collection is idempotent — safe on every request.
     await _VS.ensure_collection(CHAT_PRIVATE_COLLECTION, with_sparse=True)
 
-    # payload_base stamps both chat_id AND owner_user_id. These double as:
+    safe_filename = _safe_filename(file.filename)
+
+    # payload_base stamps chat_id + owner_user_id + filename. These double as:
     #   - tenant filter keys for Qdrant's is_tenant=True indexes (P2.1),
     #   - read-path filters in retrieve() so neither cross-chat nor
     #     cross-user leaks are possible even though many chats share the
-    #     same collection.
-    chat_payload_base = {"chat_id": chat_id, "owner_user_id": user.id}
+    #     same collection,
+    #   - citation label (filename) visible in the UI without a DB lookup.
+    chat_payload_base = {
+        "chat_id": chat_id,
+        "owner_user_id": user.id,
+        "filename": safe_filename,
+    }
 
     if RAG_SYNC_INGEST:
         n = await ingest_bytes(
             data=data,
             mime_type=file.content_type or "application/octet-stream",
-            filename=_safe_filename(file.filename),
+            filename=safe_filename,
             collection=CHAT_PRIVATE_COLLECTION,
             payload_base=chat_payload_base,
             vector_store=_VS,
@@ -250,7 +259,7 @@ async def upload_private_doc(
     task = ingest_blob.delay(
         sha,
         file.content_type or "application/octet-stream",
-        _safe_filename(file.filename),
+        safe_filename,
         CHAT_PRIVATE_COLLECTION,
         chat_payload_base,
     )

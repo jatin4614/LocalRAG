@@ -1,19 +1,47 @@
+# Kairos — reverse proxy with TLS.
+#
+# By default: self-signed cert valid for kairos.lan / *.kairos.lan / localhost.
+# For production:
+#   1. Drop a real cert/key into volumes/certs/ as kairos.crt + kairos.key, OR
+#   2. Replace the `tls …` line below with `tls admin@your-domain.com` and
+#      remove `auto_https off` so Caddy obtains a cert via ACME.
 {
-    # No external ACME — self-signed only.
     auto_https off
     admin off
+    servers {
+        timeouts {
+            read_body 5m
+            read_header 30s
+            write 5m
+            idle 10m
+        }
+    }
 }
 
-{$DOMAIN}:443 {
-    tls /certs/orgchat.crt /certs/orgchat.key
+{$DOMAIN:kairos.lan}:443 {
+    tls /certs/kairos.crt /certs/kairos.key
 
     encode zstd gzip
 
-    # Open WebUI is the single entry point for the user-facing app.
-    # Upstream listens on :8080 inside the container.
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Permissions-Policy "camera=(self), microphone=(self), geolocation=()"
+        -Server
+    }
+
+    request_body {
+        max_size 100MB
+    }
+
     reverse_proxy open-webui:8080 {
-        # Preserve streaming responses for chat.
         flush_interval -1
+        transport http {
+            keepalive 30s
+            keepalive_idle_conns 50
+        }
     }
 }
 

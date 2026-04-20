@@ -413,7 +413,8 @@ async def _run_pipeline(
             await _emit(progress_cb, {"stage": "budget", "status": "running"})
             _tB = time.perf_counter()
             with time_stage("budget"):
-                budgeted = budget_chunks(reranked, max_tokens=4000)
+                # main-WIP bumped from 4000→5000 before upgrade; preserved here.
+                budgeted = budget_chunks(reranked, max_tokens=5000)
             await _emit(progress_cb, {
                 "stage": "budget", "status": "done",
                 "ms": int((time.perf_counter() - _tB) * 1000),
@@ -431,6 +432,25 @@ async def _run_pipeline(
         })
         return []
 
+    # Collect doc_ids whose payload lacks a filename so we can back-fill from the DB.
+    missing_doc_ids: set[int] = set()
+    for hit in budgeted:
+        if not hit.payload.get("filename") and hit.payload.get("doc_id"):
+            try:
+                missing_doc_ids.add(int(hit.payload["doc_id"]))
+            except (TypeError, ValueError):
+                pass
+
+    doc_filename_map: dict[int, str] = {}
+    if missing_doc_ids:
+        from sqlalchemy import select
+        from ..db.models import KBDocument
+        async with _sessionmaker() as s:
+            rows = (await s.execute(
+                select(KBDocument.id, KBDocument.filename).where(KBDocument.id.in_(missing_doc_ids))
+            )).all()
+            doc_filename_map = {r[0]: r[1] for r in rows}
+
     # Group by source document for cleaner citation display
     sources_by_doc: dict[str, dict] = {}
     # P0.6 — spotlighting flag. Read once up-front for the loop.
@@ -439,10 +459,17 @@ async def _run_pipeline(
         # For private chat docs, payload may have chat_id instead of doc_id
         doc_id = str(hit.payload.get("doc_id", ""))
         chat_scope = hit.payload.get("chat_id")
-        filename = str(hit.payload.get("filename", ""))
+        filename = str(hit.payload.get("filename", "") or "")
+        if not filename and doc_id:
+            try:
+                filename = doc_filename_map.get(int(doc_id), "") or ""
+            except (TypeError, ValueError):
+                filename = ""
         if not filename:
             if chat_scope is not None:
                 filename = f"private-doc (chat {chat_scope})"
+            elif doc_id:
+                filename = f"document-{doc_id}"
             else:
                 filename = f"kb-{hit.payload.get('kb_id', '?')}"
         text_content = str(hit.payload.get("text", ""))
@@ -465,13 +492,18 @@ async def _run_pipeline(
                 "source": {
                     "id": key,
                     "name": filename,
+                    "url": filename,
                 },
                 "document": [],
+                # `metadata[].name` is checked first by the frontend badge renderer —
+                # setting it guarantees the filename appears even if the metadata
+                # `source` field is used for citation-id grouping upstream.
                 "metadata": [],
             }
         sources_by_doc[key]["document"].append(text_content)
         sources_by_doc[key]["metadata"].append({
             "source": filename,
+            "name": filename,
             "kb_id": hit.payload.get("kb_id"),
             "subtag_id": hit.payload.get("subtag_id"),
             "doc_id": doc_id or None,

@@ -106,10 +106,13 @@ services:
       - "--served-model-name"
       - "orgchat-chat"
       - "--max-model-len"
-      - "8192"
+      - "32768"
       - "--gpu-memory-utilization"
-      - "0.40"
+      - "0.45"
       - "--enable-prefix-caching"
+      - "--enable-chunked-prefill"
+      - "--kv-cache-dtype"
+      - "fp8"
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8000/v1/models || exit 1"]
       interval: 20s
@@ -167,10 +170,12 @@ services:
       - "--served-model-name"
       - "orgchat-vision"
       - "--max-model-len"
-      - "4096"
+      - "2048"
       - "--gpu-memory-utilization"
-      - "0.25"
-      - "--enable-sleep-mode"
+      - "0.14"
+      - "--enforce-eager"
+      - "--dtype"
+      - "half"
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8000/v1/models || exit 1"]
       interval: 20s
@@ -191,7 +196,9 @@ services:
     container_name: orgchat-whisper
     restart: unless-stopped
     environment:
-      WHISPER_MODEL: ${WHISPER_MODEL}
+      WHISPER_MODEL: ${WHISPER_MODEL:-base.en}
+      WHISPER_DEVICE: ${WHISPER_DEVICE:-cpu}
+      WHISPER_COMPUTE_TYPE: ${WHISPER_COMPUTE_TYPE:-int8}
       WHISPER_CACHE: /models
       PORT: "9000"
     volumes:
@@ -202,13 +209,20 @@ services:
       timeout: 5s
       retries: 10
       start_period: 30s
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+
+  tts:
+    build:
+      context: ../tts_service
+    container_name: kairos-tts
+    restart: unless-stopped
+    environment:
+      PIPER_DEFAULT_VOICE: ${AUDIO_TTS_VOICE:-en_US-lessac-medium}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9100/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
   model-manager:
     build:
@@ -252,14 +266,33 @@ services:
       ENABLE_OPENAI_API: ${ENABLE_OPENAI_API:-true}
       OPENAI_API_BASE_URL: ${OPENAI_API_BASE_URL:-http://vllm-chat:8000/v1}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-sk-internal-dummy}
+      VISION_API_BASE_URL: ${VISION_API_BASE_URL:-http://vllm-vision:8000/v1}
+      VISION_MODEL_SERVED_NAME: ${VISION_MODEL_SERVED_NAME:-orgchat-vision}
       ENABLE_OLLAMA_API: ${ENABLE_OLLAMA_API:-false}
       ENABLE_WEB_SEARCH: ${ENABLE_WEB_SEARCH:-false}
       ENABLE_IMAGE_GENERATION: ${ENABLE_IMAGE_GENERATION:-false}
       ENABLE_RAG_WEB_LOADER: ${ENABLE_RAG_WEB_LOADER:-false}
-      AUDIO_STT_ENGINE: ${AUDIO_STT_ENGINE:-whisper-local}
+      AUDIO_STT_ENGINE: ${AUDIO_STT_ENGINE:-openai}
+      AUDIO_STT_OPENAI_API_BASE_URL: ${AUDIO_STT_OPENAI_API_BASE_URL:-http://whisper:9000/v1}
+      AUDIO_STT_OPENAI_API_KEY: ${AUDIO_STT_OPENAI_API_KEY:-sk-kairos-stt}
+      AUDIO_STT_MODEL: ${AUDIO_STT_MODEL:-whisper-1}
+      AUDIO_TTS_ENGINE: ${AUDIO_TTS_ENGINE:-openai}
+      AUDIO_TTS_OPENAI_API_BASE_URL: ${AUDIO_TTS_OPENAI_API_BASE_URL:-http://tts:9100/v1}
+      AUDIO_TTS_OPENAI_API_KEY: ${AUDIO_TTS_OPENAI_API_KEY:-sk-kairos-tts}
+      AUDIO_TTS_MODEL: ${AUDIO_TTS_MODEL:-tts-1}
+      AUDIO_TTS_VOICE: ${AUDIO_TTS_VOICE:-en_US-lessac-medium}
       RAG_EMBEDDING_ENGINE: ${RAG_EMBEDDING_ENGINE:-openai}
       RAG_EMBEDDING_OPENAI_API_BASE_URL: ${RAG_EMBEDDING_OPENAI_API_BASE_URL:-http://tei:80/v1}
+      RAG_OPENAI_API_BASE_URL: ${RAG_OPENAI_API_BASE_URL:-http://tei:80/v1}
+      RAG_OPENAI_API_KEY: ${RAG_OPENAI_API_KEY:-sk-kairos-embed}
       RAG_EMBEDDING_MODEL: ${RAG_EMBEDDING_MODEL:-BAAI/bge-m3}
+      RAG_FULL_CONTEXT: ${RAG_FULL_CONTEXT:-false}
+      RAG_TOP_K: ${RAG_TOP_K:-5}
+      RAG_TOP_K_RERANKER: ${RAG_TOP_K_RERANKER:-5}
+      CHUNK_SIZE: ${CHUNK_SIZE:-800}
+      CHUNK_OVERLAP: ${CHUNK_OVERLAP:-100}
+      RAG_FILE_MAX_SIZE: ${RAG_FILE_MAX_SIZE:-26214400}
+      RAG_FILE_MAX_COUNT: ${RAG_FILE_MAX_COUNT:-10}
       VECTOR_DB: ${VECTOR_DB:-qdrant}
       DATABASE_URL: ${DATABASE_URL}
       QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
@@ -278,6 +311,10 @@ services:
       redis:
         condition: service_healthy
       qdrant:
+        condition: service_healthy
+      tts:
+        condition: service_healthy
+      whisper:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]

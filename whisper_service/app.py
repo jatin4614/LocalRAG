@@ -21,11 +21,15 @@ _model_lock = asyncio.Lock()
 _state: str = "asleep"  # "awake" | "asleep"
 
 
+DEVICE = os.environ.get("WHISPER_DEVICE", "cpu").lower()
+COMPUTE_TYPE = os.environ.get("WHISPER_COMPUTE_TYPE", "int8" if DEVICE == "cpu" else "float16")
+
+
 async def _load_to_gpu() -> None:
     global _model, _state
     from faster_whisper import WhisperModel
-    logger.info("loading whisper %s to cuda", MODEL_NAME)
-    _model = WhisperModel(MODEL_NAME, device="cuda", compute_type="float16",
+    logger.info("loading whisper %s on %s (compute=%s)", MODEL_NAME, DEVICE, COMPUTE_TYPE)
+    _model = WhisperModel(MODEL_NAME, device=DEVICE, compute_type=COMPUTE_TYPE,
                           download_root=MODEL_CACHE)
     _state = "awake"
 
@@ -93,12 +97,23 @@ async def transcribe(file: UploadFile = File(...)) -> TranscriptionResponse:
     if current_model is None:
         raise HTTPException(status_code=503, detail="model failed to load")
 
+    import tempfile, re
     content = await file.read()
-    tmp_path = f"/tmp/{file.filename or 'upload.wav'}"
-    with open(tmp_path, "wb") as fh:
+    # faster-whisper's ffmpeg can decode any common audio — pick a safe suffix from
+    # the filename (or default .bin) so libav can demux regardless of actual format.
+    raw_name = file.filename or "upload.bin"
+    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", raw_name) or "upload.bin"
+    ext = "." + safe_name.rsplit(".", 1)[1] if "." in safe_name else ".bin"
+    with tempfile.NamedTemporaryFile(dir="/tmp", suffix=ext, delete=False) as fh:
+        tmp_path = fh.name
         fh.write(content)
 
-    segments, _info = current_model.transcribe(tmp_path, beam_size=5)
-    text = "".join(seg.text for seg in segments).strip()
-    os.remove(tmp_path)
+    try:
+        segments, _info = current_model.transcribe(tmp_path, beam_size=5)
+        text = "".join(seg.text for seg in segments).strip()
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
     return TranscriptionResponse(text=text)

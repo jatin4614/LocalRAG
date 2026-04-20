@@ -65,7 +65,40 @@ def _extract_docx(data: bytes) -> str:
     from docx import Document
 
     doc = Document(io.BytesIO(data))
-    return "\n\n".join(para.text for para in doc.paragraphs if para.text.strip())
+    parts: list[str] = []
+
+    def _iter_block_items(parent):
+        # Walk body elements in document order so prose and tables interleave correctly.
+        from docx.oxml.ns import qn
+        from docx.table import Table
+        from docx.text.paragraph import Paragraph
+        body = parent.element.body if hasattr(parent, "element") else parent._element.body
+        for child in body.iterchildren():
+            if child.tag == qn("w:p"):
+                yield Paragraph(child, parent)
+            elif child.tag == qn("w:tbl"):
+                yield Table(child, parent)
+
+    for block in _iter_block_items(doc):
+        if block.__class__.__name__ == "Paragraph":
+            txt = block.text.strip()
+            if txt:
+                parts.append(txt)
+        else:  # Table
+            for row in block.rows:
+                cells = [c.text.strip() for c in row.cells]
+                if any(cells):
+                    parts.append("\t".join(cells))
+
+    # Headers and footers (policy docs often put key info here).
+    for section in doc.sections:
+        for container in (section.header, section.footer):
+            for para in container.paragraphs:
+                txt = para.text.strip()
+                if txt:
+                    parts.append(txt)
+
+    return "\n\n".join(parts)
 
 
 def _extract_xlsx(data: bytes) -> str:
