@@ -107,8 +107,11 @@ services:
       - "orgchat-chat"
       - "--max-model-len"
       - "32768"
+      # Dropped 0.45 → 0.35 to free ~3 GB VRAM for bge-reranker-v2-m3
+      # loaded inside open-webui (P1.2). 0.35 × 32GB = 11.2 GB is plenty for
+      # Qwen2.5-14B-AWQ (~8GB weights + KV cache on fp8).
       - "--gpu-memory-utilization"
-      - "0.45"
+      - "0.35"
       - "--enable-prefix-caching"
       - "--enable-chunked-prefill"
       - "--kv-cache-dtype"
@@ -322,6 +325,18 @@ services:
       timeout: 10s
       retries: 5
       start_period: 120s
+    # GPU reservation for in-process cross-encoder reranker (P1.2,
+    # bge-reranker-v2-m3 ~1.5 GB). CPU rerank was ~11 s/query; GPU brings
+    # cold to ~40 ms + <1 ms cache-warm. Shares the GPU with vllm-chat +
+    # vllm-vision + TEI; we dropped vllm-chat to 0.35 utilization to leave
+    # ~3 GB VRAM for the reranker + HyDE/embedder bursts.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
 
   # Celery worker for asynchronous ingest. Only used when RAG_SYNC_INGEST=0 on
   # the open-webui producer; in the default sync path this service can run but

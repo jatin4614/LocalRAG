@@ -35,15 +35,26 @@ COPY upstream/backend/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir uv && \
     uv pip install --system --no-cache-dir -r requirements.txt
 
+# Pin torch to cu121 — host GPU driver is 12.2, default upstream torch ships
+# cu130 wheels which silently fall back to CPU (cuda.is_available()=False).
+# cu121 is ABI-compatible with 12.x drivers and correctly detects the Ada GPU.
+# Required by sentence-transformers (reranker) and any torch-using path we
+# add. Installed BEFORE the rest so ucccp doesn't upgrade it transitively.
+RUN uv pip install --system --no-cache-dir --index-url https://download.pytorch.org/whl/cu121 \
+    'torch>=2.3,<2.6'
+
 # Our extra Python deps (not in upstream)
 # Runtime deps added by the RAG upgrade:
-#   fastembed          — P1.1 hybrid BM25 (~150 MB onnxruntime + ~10 MB bm25 model on first call)
-#   prometheus-client  — P2.5 /metrics endpoint
-#   scikit-learn       — P3.4 RAPTOR clustering (loaded lazily only when RAG_RAPTOR=1)
+#   fastembed            — P1.1 hybrid BM25 (~150 MB onnxruntime + ~10 MB bm25 model on first call)
+#   prometheus-client    — P2.5 /metrics endpoint
+#   scikit-learn         — P3.4 RAPTOR clustering (loaded lazily only when RAG_RAPTOR=1)
+#   sentence-transformers — P1.2 cross-encoder reranker (default PyPI wheels; torch pinned above)
+#   transformers         — P1.5 Qwen/Gemma tokenizer for token budgeting
 RUN uv pip install --system --no-cache-dir \
     pyjwt pypdf tiktoken qdrant-client httpx pydantic-settings asyncpg \
     'sqlalchemy[asyncio]' argon2-cffi python-docx openpyxl \
-    fastembed prometheus-client scikit-learn
+    fastembed prometheus-client scikit-learn \
+    'sentence-transformers>=3.0' 'transformers>=4.45'
 
 # Frontend build output
 COPY --from=build /app/build /app/build
