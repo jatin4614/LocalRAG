@@ -28,8 +28,10 @@ _TOKENIZER_REGISTRY: dict[str, dict[str, str]] = {
     "qwen2.5": {"kind": "hf", "id": "Qwen/Qwen2.5-14B-Instruct"},
     "gemma": {
         "kind": "hf",
-        "id": os.environ.get("RAG_BUDGET_TOKENIZER_MODEL", "google/gemma-3-27b-it"),
+        "id": os.environ.get("RAG_BUDGET_TOKENIZER_MODEL", "google/gemma-4-31B-it"),
     },
+    "gemma-4": {"kind": "hf", "id": "google/gemma-4-31B-it"},
+    "gemma-4-31b": {"kind": "hf", "id": "google/gemma-4-31B-it"},
     "gemma-3": {"kind": "hf", "id": "google/gemma-3-27b-it"},
     "gemma-3-12b": {"kind": "hf", "id": "google/gemma-3-12b-it"},
     "llama": {

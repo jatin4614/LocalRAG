@@ -78,10 +78,19 @@ whisper loaded concurrently):
 | --------------------------------------- | ------- | --------------------------------------- |
 | `Qwen/Qwen2.5-14B-Instruct-AWQ`         | ~8 GB   | current default                         |
 | `Qwen/Qwen2.5-32B-Instruct-AWQ`         | ~18 GB  | good 32B quant                          |
-| `google/gemma-3-12b-it`                 | ~24 GB  | tight; disables GPU reranker            |
-| `google/gemma-3-27b-it`                 | ~54 GB  | **does not fit** on 32 GB               |
-| `solidrust/gemma-3-27b-it-AWQ`          | ~14 GB  | recommended Gemma target                |
+| `google/gemma-4-31B-it` (bf16)          | ~62 GB  | **does not fit** on 32 GB               |
+| `unsloth/gemma-4-31B-it-GGUF` (Q4_K_M)  | ~20 GB  | **Gemma 4** — Ollama `gemma4:31b` equiv |
+| `bartowski/google_gemma-4-31B-it-GGUF`  | ~20 GB  | **Gemma 4** — alt community GGUF        |
+| `nvidia/Gemma-4-31B-IT-NVFP4`           | ~16 GB  | **Gemma 4** — NVFP4 quant, vLLM compat  |
+| `google/gemma-3-27b-it` (bf16)          | ~54 GB  | Gemma 3 — doesn't fit                   |
+| `solidrust/gemma-3-27b-it-AWQ`          | ~14 GB  | Gemma 3 AWQ (older gen)                 |
 | `meta-llama/Llama-3.3-70B-Instruct-AWQ` | ~18 GB  | AWQ 4-bit 70B                           |
+
+**Recommended for this stack (RTX 6000 Ada 32 GB):**
+- `gemma4:31b` via Ollama (Q4_K_M, 20 GB) — **also replaces vllm-vision**
+  since Gemma 4 is multimodal (text + image + audio).
+- `nvidia/Gemma-4-31B-IT-NVFP4` via vLLM (16 GB) — keep vLLM + add vision
+  capability via the chat model itself (drop vllm-vision).
 
 ## Model-family tokenizer mapping
 
@@ -93,8 +102,12 @@ whisper loaded concurrently):
 | (fallback)        | `cl100k`               |
 
 Exact-version aliases are also registered: `qwen2.5`, `gemma-3`,
-`gemma-3-12b`. Unknown aliases fall back to `cl100k` with a warning in
-the server log — safe but less accurate for non-English text.
+`gemma-3-12b`, `gemma-4`, `gemma-4-31b`. Unknown aliases fall back to
+`cl100k` with a warning in the server log — safe but less accurate for
+non-English text.
+
+For **Gemma 4 31B**, set `RAG_BUDGET_TOKENIZER=gemma-4` (the alias
+resolves to `google/gemma-4-31B-it` — gated repo, needs HF_TOKEN).
 
 ## Gated repos — Hugging Face tokens
 
