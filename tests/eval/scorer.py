@@ -8,6 +8,7 @@ callers should normalise before passing in).
 """
 from __future__ import annotations
 
+import math
 from typing import Sequence
 
 
@@ -66,3 +67,29 @@ def unique_docs_at_k(retrieved_doc_ids: Sequence[int], k: int) -> int:
     if k <= 0:
         return 0
     return len(set(retrieved_doc_ids[:k]))
+
+
+def ndcg_at_k(
+    retrieved_doc_ids: Sequence[int],
+    gold_doc_ids: set[int],
+    k: int,
+) -> float:
+    """Normalized Discounted Cumulative Gain @ K.
+
+    rel_i = 1 if retrieved[i] in gold else 0
+    DCG = sum(rel_i / log2(1 + (i+1)))  for i in [0, k)
+    IDCG = sum(1 / log2(1 + (j+1))) for j in [0, min(k, |gold|))
+    Convention: empty gold returns 1.0 (trivially perfect, avoids polluting averages).
+    """
+    if not gold_doc_ids:
+        return 1.0
+    if not retrieved_doc_ids:
+        return 0.0
+    top = retrieved_doc_ids[:k]
+    dcg = 0.0
+    for i, doc_id in enumerate(top):
+        if doc_id in gold_doc_ids:
+            dcg += 1.0 / math.log2(i + 2)
+    ideal_hits = min(k, len(gold_doc_ids))
+    idcg = sum(1.0 / math.log2(j + 2) for j in range(ideal_hits))
+    return dcg / idcg if idcg > 0 else 0.0
