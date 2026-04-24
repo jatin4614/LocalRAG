@@ -1,0 +1,16 @@
+# LocalRAG Runbook
+
+Operational reference for the LocalRAG retrieval pipeline. Each phase of Plan A/B fills in its own sections.
+
+## Contents
+- [SLO document](slo.md) — latency / cost / error / quality budgets
+- [Flag reference](flag-reference.md) — every RAG_* env flag, default, runtime-safe-to-toggle status
+- [Troubleshooting](troubleshooting.md) — "if X is happening, check Y then Z"
+
+## On-call first 5 minutes
+
+1. Check Grafana dashboard "RAG overview" — red panels tell you the layer.
+2. `curl http://localhost:6333/collections/kb_1_rebuild` — Qdrant up and collections present?
+3. `docker logs --tail 200 orgchat-open-webui 2>&1 | grep -iE 'error|warn' | tail -50`
+4. `nvidia-smi` — either GPU pegged at 100% util or 95%+ VRAM?
+5. Escalate path: page RAG on-call via usual channel; include screenshots + timestamps.
