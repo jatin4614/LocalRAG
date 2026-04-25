@@ -1,0 +1,51 @@
+{
+  "timestamp": "2026-04-22T04:34:59.102591+00:00",
+  "qdrant_url": "http://qdrant:6333",
+  "collection": "kb_1",
+  "tokenizer": "cl100k_base",
+  "histogram": {
+    "total_chunks": 928,
+    "empty_chunks": 0,
+    "buckets": {
+      "0-100": 242,
+      "100-300": 474,
+      "300-500": 212,
+      "500-800": 0,
+      ">800": 0
+    },
+    "bucket_pct": {
+      "0-100": 26.08,
+      "100-300": 51.08,
+      "300-500": 22.84,
+      "500-800": 0.0,
+      ">800": 0.0
+    },
+    "mean_tokens": 194.47,
+    "median_tokens": 179,
+    "min_tokens": 9,
+    "max_tokens": 450,
+    "percentiles": {
+      "p10": 60,
+      "p25": 96,
+      "p50": 179,
+      "p75": 297,
+      "p90": 317,
+      "p95": 361,
+      "p99": 418
+    },
+    "per_doc": {
+      "n_docs": 110,
+      "chunks_per_doc_min": 4,
+      "chunks_per_doc_max": 16,
+      "chunks_per_doc_mean": 8.44,
+      "chunks_per_doc_median": 8
+    }
+  },
+  "pipeline_version_distribution": {
+    "chunker=v3|extractor=v2|embedder=bge-m3|ctx=none": 928
+  },
+  "block_type_distribution": {
+    "prose": 202,
+    "table": 726
+  }
+}
