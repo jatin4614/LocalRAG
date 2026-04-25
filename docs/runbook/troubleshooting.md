@@ -204,3 +204,29 @@ shadow `_v2` collection, alias-swaps it in, and keeps the source for rollback.
 1. This was mitigated in Phase 2.3 via RRF fallback — but only when cross-encoder rerank is OFF. If you see this with rerank ON, the cross-encoder itself is biased toward one collection's content.
 2. Temporary: `RAG_RERANK=0` — retrieval falls back to RRF.
 3. Long-term: confirm both collections have the canonical schema (Phase 1.7 migration).
+
+## Contextualized chunks look wrong (prefix is irrelevant or hallucinated)
+
+1. Reproduce the prompt the model actually sees:
+   `python -c "from ext.services.contextualizer import build_contextualize_prompt; print(build_contextualize_prompt(document_text='X', chunk_text='Y', document_metadata={'filename':'a.md','kb_name':'K','subtag_name':None,'document_date':None,'related_doc_titles':[]}))"`
+   Optional metadata fields collapse to empty strings when missing — if you see literal `None` / `[]` in the body, the metadata dict isn't matching the contract (see `build_contextualize_prompt` docstring).
+2. Inspect `rag_tokens_prompt_total` for the contextualizer model — is the prompt_tokens per chunk ~stable (vllm-chat prefix cache is reusing the doc-level header) or growing across sibling chunks (cache broken — request body shape changed)? Note: the WIP counter is labelled `(model, kb)` only, NOT by stage. Filter by the model that the contextualizer is calling (env `CHAT_MODEL`, default `orgchat-chat`); other stages (HyDE, rewriter) share that label, so isolate by tailing the timestamp window during a known re-ingest.
+3. For a specific chunk, fetch its payload from Qdrant and confirm `context_prefix` is set:
+   `curl -s http://localhost:6333/collections/kb_1/points/<point_id> | python -m json.tool | grep context_prefix`
+4. If the prefix references the wrong date / wrong KB / wrong related docs: the `document_metadata` threading is broken upstream of the contextualizer. Check `ext/services/ingest.py` at the point it constructs the metadata dict that feeds `contextualize_chunks_with_prefix` — a missing or stale field there propagates to every chunk in that document.
+
+## ColBERT search returns worse results than dense
+
+1. Per-KB `rag_config.colbert` = true but the collection lacks the `colbert` named-vector slot → the retriever silently falls back to 2-head RRF (dense + sparse). Inspect the collection's vector schema:
+   `curl -s http://localhost:6333/collections/kb_1 | grep -E 'colbert|dense'`
+   If only `dense` (and optionally `sparse`) is present, the ColBERT write path never landed — re-ingest the KB after Phase 3.4 to populate the slot.
+2. Evaluate the ColBERT head in isolation. On a dev instance: `RAG_COLBERT=1` and `RAG_HYBRID=0`, then run a few representative queries. If ColBERT alone is materially worse than dense alone, the model cache is likely the wrong checkpoint — confirm the late-interaction model in `compose/.env` matches what was used at ingest time. Mismatched checkpoints (e.g. ingested with one tokenizer, querying with another) silently produce noise.
+
+## Re-ingest stuck — throttle is permanent
+
+Symptom: the `scripts/reingest_kb.py` driver pauses repeatedly because chat p95 keeps tripping the throttle ceiling, and the run never completes within its scheduled window.
+
+1. Chat p95 legitimately > 3000ms all the time? Then base load is too high to absorb the contextualization cost. Three options, in order of preference:
+   (a) Schedule the re-ingest during off-peak hours (defer the run; this is by far the cleanest outcome — see `docs/runbook/reingest-procedure.md` for the off-hours runbook).
+   (b) Raise the throttle ceiling, accepting that user-facing chat will degrade for the duration. Document the degraded window for the on-call.
+   (c) Run contextualization in the background outside the re-ingest path — generate prefixes asynchronously, persist them, then have the re-ingest step skip the LLM call and read the cached prefix. Higher implementation cost but isolates re-ingest cost from chat latency.
