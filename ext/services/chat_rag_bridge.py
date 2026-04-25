@@ -6,6 +6,7 @@ Retrieves KB context and returns it in upstream's source dict format.
 from __future__ import annotations
 
 import contextvars
+import json as _json
 import logging
 import os as _os
 import time
@@ -13,8 +14,105 @@ from typing import Any, Awaitable, Callable, List, Optional
 
 from . import flags
 from .kb_config import config_to_env_overrides, merge_configs
+from .obs import span
 
 logger = logging.getLogger("orgchat.rag_bridge")
+
+# -----------------------------------------------------------------------
+# Phase 4 — intent classification for structured query logging.
+#
+# PURE string matching, no embedding / LLM call / DB lookup. Runs on every
+# query in ``_run_pipeline`` entry so it must be sub-millisecond. Output
+# is a single label that's written into the ``rag_query`` log event; it
+# does NOT yet influence retrieval routing (deferred to Phase 2 in the
+# RAG plan — log-only for now so we can observe the real distribution
+# before committing to a router).
+#
+# Label definitions:
+#   * metadata — enumeration / coverage questions ("list", "what files",
+#     "how many", etc.). These are answered by the KB-catalog preamble,
+#     not by content retrieval.
+#   * global   — cross-document aggregation ("compare", "across all",
+#     "trends", "summarize"). Best served by a summary index when one
+#     exists; today they hit the generic pipeline.
+#   * specific — everything else. Single-doc / content-anchored queries
+#     that the current top-k pipeline handles well.
+# -----------------------------------------------------------------------
+_METADATA_PATTERNS = (
+    "list",
+    "what files",
+    "which files",
+    "how many",
+    "how much",
+    "what reports",
+    "which reports",
+    "catalog",
+    "inventory",
+    "what documents",
+    "which documents",
+)
+_GLOBAL_PATTERNS = (
+    "compare",
+    "across all",
+    "trends",
+    "trend",
+    "summarize",
+    "overview",
+    "recurring",
+    "overall",
+    "aggregate",
+)
+
+
+def classify_intent(query: str) -> str:
+    """Return one of ``metadata`` | ``global`` | ``specific``.
+
+    Lowercase substring match against small, curated keyword lists. Order
+    matters: metadata wins over global (e.g. "list all docs comparing
+    March" → metadata, because answering with a file list is strictly
+    more correct than answering with an aggregated comparison).
+
+    Pure function — no side effects, no I/O. Must be safe to call on an
+    empty or ``None``-looking string.
+    """
+    if not query:
+        return "specific"
+    q = query.lower()
+    for pat in _METADATA_PATTERNS:
+        if pat in q:
+            return "metadata"
+    for pat in _GLOBAL_PATTERNS:
+        if pat in q:
+            return "global"
+    return "specific"
+
+
+def _log_rag_query(
+    *,
+    req_id: str,
+    intent: str,
+    kbs: list,
+    hits: int,
+    total_ms: int,
+) -> None:
+    """Emit one ``event=rag_query`` JSON log line.
+
+    Fail-open: any exception inside ``json.dumps`` / the logger call is
+    swallowed because this is a telemetry side-effect — the retrieval
+    pipeline must not fail because the log record could not be built.
+    """
+    try:
+        payload = {
+            "event": "rag_query",
+            "req_id": req_id,
+            "intent": intent,
+            "kbs": list(kbs or []),
+            "hits": int(hits),
+            "total_ms": int(total_ms),
+        }
+        logger.info(_json.dumps(payload, separators=(",", ":")))
+    except Exception:
+        pass
 
 # P0.5 — history-aware query rewrite (flag-gated OFF by default).
 # When RAG_DISABLE_REWRITE=1 (default), behavior is byte-identical to pre-P0.5.
@@ -105,6 +203,59 @@ async def _load_kb_rag_configs(
         return []
 
 
+async def _lookup_doc_ids_by_date(
+    kb_ids: list[int], date_tuple: tuple[int, str, int],
+) -> list[int]:
+    """Return ``doc_id``s in ``kb_ids`` whose filename matches the date tuple.
+
+    Used by the Tier-2 ``specific_date`` router. Tolerates the common
+    filename-format variants observed in this corpus:
+
+      * zero-padded day vs bare day: ``"05 Jan 2026.docx"`` vs ``"5 Jan 2026.docx"``
+      * 4-digit vs 2-digit year: ``"05 Jan 2026.docx"`` vs ``"05 Apr 26.docx"``
+      * stray whitespace: ``"01  Feb 2026.docx"`` (double space)
+      * case variation: ``"17 JAn 2026.docx"`` (matched case-insensitively)
+
+    Returns an empty list when:
+      * ``kb_ids`` is empty
+      * ``date_tuple`` is None
+      * the session factory is unconfigured
+      * no filename matches (caller falls back to generic ``specific``)
+      * DB error (caller falls back too; error is logged at DEBUG)
+    """
+    if not kb_ids or not date_tuple or _sessionmaker is None:
+        return []
+    day, month, year = date_tuple
+    # day_pattern: match 1-digit days with or without a leading zero, 2-digit
+    # days verbatim. ``\\s+`` instead of literal space tolerates the corpus's
+    # occasional double-space filenames. ``\\b`` at the end prevents
+    # "5 Jan 2026" from matching "5 Jan 20260" (defensive — the corpus has
+    # no such filenames, but the guard costs nothing).
+    day_pattern = f"0?{day}" if day < 10 else str(day)
+    year_short = f"{year % 100:02d}"
+    # PostgreSQL's Advanced Regex (ARE) uses ``\y`` for a word boundary,
+    # NOT Perl's ``\b`` (which PostgreSQL interprets as a literal backspace
+    # character). This is the distinction that took down the first
+    # iteration — the regex matched in Python tests but returned zero rows
+    # from PG. Always ``\y`` here.
+    regex = rf"^{day_pattern}\s+{month}\s+({year}|{year_short})\y"
+    try:
+        from sqlalchemy import text as _sql_text
+        async with _sessionmaker() as s:
+            rows = (await s.execute(
+                _sql_text(
+                    "SELECT id FROM kb_documents "
+                    "WHERE kb_id = ANY(:kbs) AND deleted_at IS NULL "
+                    "AND filename ~* :rx"
+                ),
+                {"kbs": list(kb_ids), "rx": regex},
+            )).all()
+        return [int(r[0]) for r in rows]
+    except Exception as e:
+        logger.debug("_lookup_doc_ids_by_date failed: %s", e)
+        return []
+
+
 async def _emit(cb: Optional[Callable[[dict], Awaitable[None]]], event: dict) -> None:
     """Call the progress callback, swallowing any errors so a broken SSE
     client never breaks retrieval. No-op when cb is None."""
@@ -151,6 +302,41 @@ async def retrieve_kb_sources(
     if not query:
         return []
 
+    # Active sessions gauge — inc on entry, dec on exit. Fail-open: any
+    # metrics hiccup must not break retrieval. Wrapped below in try/finally.
+    _session_inc = False
+    try:
+        from .metrics import active_sessions
+        active_sessions.inc()
+        _session_inc = True
+    except Exception:
+        pass
+    try:
+        return await _retrieve_kb_sources_inner(
+            kb_config=kb_config,
+            query=query,
+            user_id=user_id,
+            chat_id=chat_id,
+            history=history,
+            progress_cb=progress_cb,
+        )
+    finally:
+        if _session_inc:
+            try:
+                active_sessions.dec()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+
+async def _retrieve_kb_sources_inner(
+    *,
+    kb_config: list,
+    query: str,
+    user_id: str,
+    chat_id: Optional[str],
+    history: Optional[List[dict]],
+    progress_cb: Optional[Callable[[dict], Awaitable[None]]],
+) -> List[dict]:
     # P0.5: optionally rewrite the query using conversation history.
     # Default OFF (RAG_DISABLE_REWRITE=1) → code path below is byte-identical
     # to the previous release. Flip the flag to engage.
@@ -220,6 +406,28 @@ async def _run_pipeline(
     Separated from ``retrieve_kb_sources`` so the overlay is active for
     every lazy import and every flag read inside the hot path.
     """
+    # Phase 4 — intent classification for the structured log event at the
+    # tail of this function. Done here (entry of _run_pipeline) so failure
+    # modes (empty hits, LLM-side errors) still get an entry. Pure string
+    # match — sub-millisecond, no external call.
+    _intent_label = classify_intent(query)
+    _kb_ids_for_log = [cfg.get("kb_id") for cfg in selected_kbs or []]
+
+    # Tier 2 — intent routing (gated by RAG_INTENT_ROUTING, default OFF).
+    # When OFF, _intent/_intent_reason are fixed values and every branch
+    # below collapses to the pre-Tier-2 ``specific`` path, making the
+    # pipeline byte-identical. When ON:
+    #   * metadata  → skip chunk retrieve; catalog preamble answers.
+    #   * global    → retrieve only level="doc" summary points; skip
+    #                 rerank/MMR/expand (summaries are self-contained).
+    #   * specific  → unchanged pipeline.
+    _intent: str = "specific"
+    _intent_reason: str = "default"
+    if flags.get("RAG_INTENT_ROUTING", "0") == "1":
+        from .query_intent import classify_with_reason as _ci_classify
+        _intent, _intent_reason = _ci_classify(query)
+        logger.info("rag: intent=%s reason=%s", _intent, _intent_reason)
+
     # Retrieve using our pipeline
     from .retriever import retrieve
     from .reranker import rerank, rerank_with_flag
@@ -263,22 +471,130 @@ async def _run_pipeline(
             await _emit(progress_cb, {"stage": "embed", "status": "running"})
             _t0 = time.perf_counter()
 
-            with time_stage("retrieve"):
-                await _emit(progress_cb, {"stage": "retrieve", "status": "running"})
+            _kb_ids_csv = ",".join(
+                str(c.get("kb_id")) for c in (selected_kbs or [])
+                if c.get("kb_id") is not None
+            )
+            with time_stage("retrieve"), span(
+                "retrieve.parallel",
+                n_kbs=len(selected_kbs or []),
+                kb_ids=_kb_ids_csv,
+                chat_id=str(chat_id) if chat_id else "",
+            ):
                 _tR = time.perf_counter()
-                raw_hits = await retrieve(
-                    query=query,
-                    selected_kbs=selected_kbs,
-                    chat_id=chat_id,  # NOW PASSED THROUGH
-                    vector_store=_vector_store,
-                    embedder=_embedder,
-                    per_kb_limit=10,
-                    total_limit=30,
-                    # P2.2: enforce per-user isolation on chat-scoped hits.
-                    # KB hits are unaffected (retriever only applies the owner
-                    # filter to chat namespaces).
-                    owner_user_id=user_id,
-                )
+                # Tier 2 routing — metadata queries are answered entirely
+                # by the catalog preamble appended later; skipping
+                # retrieval saves a Qdrant round-trip and avoids feeding
+                # irrelevant chunk hits to the LLM for "which files?"
+                # type questions.
+                if _intent == "metadata":
+                    raw_hits = []
+                    await _emit(progress_cb, {
+                        "stage": "retrieve", "status": "skipped_by_intent",
+                        "intent": "metadata", "reason": _intent_reason,
+                    })
+                else:
+                    await _emit(progress_cb, {"stage": "retrieve", "status": "running"})
+
+                    # Tier-2 ``specific_date``: narrow retrieval to documents
+                    # whose filename matches the date the user mentioned.
+                    # Ranking signals alone can't tell "5 Jan" from "5 Feb" /
+                    # "4 Jan" on a daily-reporting corpus — they share the
+                    # same numeric tokens in BM25 and the same template in
+                    # dense space. A doc_id filter guarantees the right doc.
+                    _date_doc_ids: Optional[list[int]] = None
+                    if _intent == "specific_date":
+                        from .query_intent import extract_date_tuple as _ci_date
+                        _date_tuple = _ci_date(query)
+                        if _date_tuple:
+                            _kb_ids_for_date = [
+                                int(c["kb_id"]) for c in selected_kbs
+                                if c.get("kb_id") is not None
+                            ]
+                            _date_doc_ids = await _lookup_doc_ids_by_date(
+                                _kb_ids_for_date, _date_tuple,
+                            )
+                            if not _date_doc_ids:
+                                # Date parsed but no filename matches in scope
+                                # → fall through to regular specific retrieval.
+                                logger.info(
+                                    "rag: specific_date → specific (no filename match for %s)",
+                                    _date_tuple,
+                                )
+                                _intent = "specific"
+                                _intent_reason = (
+                                    f"specific:date_no_filename_match={_date_tuple}"
+                                )
+                            else:
+                                logger.info(
+                                    "rag: specific_date matched %d doc(s) for %s: %s",
+                                    len(_date_doc_ids), _date_tuple, _date_doc_ids,
+                                )
+
+                    # For global intent we search the doc-summary index
+                    # (level="doc") so every document contributes exactly
+                    # one point — the ideal shape for "list every X"
+                    # style questions. For specific intent (ONLY when
+                    # routing is enabled) we filter doc-summaries OUT so
+                    # factoid queries aren't contaminated by the short
+                    # summary points that tend to out-score chunks on
+                    # broad vocabulary matches. Pre-routing default
+                    # (routing flag OFF) stays ``None`` → byte-identical.
+                    _routing_on = flags.get("RAG_INTENT_ROUTING", "0") == "1"
+                    if _intent == "global":
+                        _level_filter = "doc"
+                    elif _routing_on and _intent in ("specific", "specific_date"):
+                        _level_filter = "chunk"
+                    else:
+                        _level_filter = None
+                    # Summaries are self-contained and already widely
+                    # covered; give global queries a wider top-k so all
+                    # documents in the selection can surface. For
+                    # ``specific_date`` the doc_id filter already narrows
+                    # the corpus to typically <= 2 docs (<= 22 chunks per
+                    # doc on this corpus) so a wider top-k lets the
+                    # reranker see ALL of that doc's chunks rather than
+                    # the first 10.
+                    if _intent == "global":
+                        _per_kb, _total = 50, 100
+                    elif _intent == "specific_date":
+                        _per_kb, _total = 30, 60
+                    else:
+                        _per_kb, _total = 10, 30
+                    # For global intent we silence HyDE AND the hybrid
+                    # sparse arm. HyDE's hypothetical answers look like
+                    # chunk content; BM25 inherently ranks term-rich
+                    # chunks above the terser summaries. Both bias the
+                    # retrieval pool away from the doc-summary cluster,
+                    # leaving the ``level="doc"`` post-filter with
+                    # nothing to keep. Pure dense search over the
+                    # subtag-scoped summary points is what we want —
+                    # summaries are homogeneous in length and style, so
+                    # dense similarity separates them cleanly.
+                    _retrieve_overrides = (
+                        {"RAG_HYDE": "0", "RAG_HYDE_N": "0", "RAG_HYBRID": "0"}
+                        if _intent == "global"
+                        else {}
+                    )
+                    with span("embed.query", path="query"), flags.with_overrides(_retrieve_overrides):
+                        # ``retrieve`` internally calls embedder.embed() — the
+                        # embed.call span will nest under this embed.query span
+                        # giving operators a clear query-embed timing.
+                        raw_hits = await retrieve(
+                            query=query,
+                            selected_kbs=selected_kbs,
+                            chat_id=chat_id,  # NOW PASSED THROUGH
+                            vector_store=_vector_store,
+                            embedder=_embedder,
+                            per_kb_limit=_per_kb,
+                            total_limit=_total,
+                            # P2.2: enforce per-user isolation on chat-scoped hits.
+                            # KB hits are unaffected (retriever only applies the owner
+                            # filter to chat namespaces).
+                            owner_user_id=user_id,
+                            level_filter=_level_filter,
+                            doc_ids=_date_doc_ids,
+                        )
                 _retrieve_ms = int((time.perf_counter() - _tR) * 1000)
                 # The embed+retrieve bookend: once Qdrant returns we can
                 # emit the "embed done" and "retrieve done" events
@@ -315,7 +631,7 @@ async def _run_pipeline(
             # byte-identically. An operator may override via ``RAG_RERANK_TOP_K``.
             _final_k = 10
             _rerank_top_k_env = flags.get("RAG_RERANK_TOP_K")
-            _mmr_on = flags.get("RAG_MMR", "0") == "1"
+            _mmr_on = flags.get("RAG_MMR", "0") == "1" and not (_intent == "global")
             if _rerank_top_k_env is not None:
                 _rerank_k = max(int(_rerank_top_k_env), _final_k)
             elif _mmr_on:
@@ -323,7 +639,14 @@ async def _run_pipeline(
             else:
                 _rerank_k = _final_k
 
-            _rerank_on = flags.get("RAG_RERANK", "0") == "1"
+            # Tier 2: for global-intent queries we short-circuit rerank/
+            # MMR/expand because doc-level summaries are already self-
+            # contained and already one-per-document (no duplication to
+            # diversify, no siblings to expand, no cross-encoder gain
+            # over summary prose). This keeps latency proportional to
+            # the broadened top-k.
+            _short_circuit_quality = (_intent == "global")
+            _rerank_on = flags.get("RAG_RERANK", "0") == "1" and not _short_circuit_quality
             if _rerank_on:
                 await _emit(progress_cb, {"stage": "rerank", "status": "running"})
             else:
@@ -383,7 +706,7 @@ async def _run_pipeline(
             # so tests can monkeypatch without module reload. When off (default)
             # the ``context_expand`` module is never imported. Fails open: any
             # exception keeps the reranker/MMR output untouched.
-            _expand_on = flags.get("RAG_CONTEXT_EXPAND", "0") == "1"
+            _expand_on = flags.get("RAG_CONTEXT_EXPAND", "0") == "1" and not (_intent == "global")
             if _expand_on and reranked:
                 await _emit(progress_cb, {"stage": "expand", "status": "running"})
                 try:
@@ -425,11 +748,24 @@ async def _run_pipeline(
         await _emit(progress_cb, {"stage": "error", "message": str(e)})
         return []
 
-    if not budgeted:
+    # Tier 2: for metadata AND global intents, the catalog preamble below
+    # is the load-bearing signal — metadata skipped retrieve entirely, and
+    # global may post-filter to zero doc-summary hits on thin summary
+    # indexes. Skip the empty-short-circuit for both so the preamble still
+    # flows to the LLM.
+    if not budgeted and _intent not in ("metadata", "global"):
+        _total_ms_empty = int((time.perf_counter() - _pipeline_start) * 1000)
         await _emit(progress_cb, {
-            "stage": "done", "total_ms": int((time.perf_counter() - _pipeline_start) * 1000),
+            "stage": "done", "total_ms": _total_ms_empty,
             "sources": 0,
         })
+        _log_rag_query(
+            req_id=request_id_var.get(),
+            intent=_intent_label,
+            kbs=_kb_ids_for_log,
+            hits=0,
+            total_ms=_total_ms_empty,
+        )
         return []
 
     # Collect doc_ids whose payload lacks a filename so we can back-fill from the DB.
@@ -521,32 +857,147 @@ async def _run_pipeline(
     # Sourced from Postgres kb_documents (not Qdrant scroll) because it's
     # O(1) indexed lookup and reflects soft-deletes.
     try:
-        kb_ids = sorted({int(c["kb_id"]) for c in selected_kbs if c.get("kb_id") is not None})
-        if kb_ids and _sessionmaker is not None:
+        # Split selection into two buckets so we respect subtag scoping.
+        # A bare kb_id entry (no subtag_ids / empty list) means "whole KB";
+        # a non-empty subtag_ids list scopes to just those subtags. Mixing
+        # both per-request is allowed, so we build two separate queries and
+        # UNION their results in Python.
+        whole_kb_ids: list[int] = sorted({
+            int(c["kb_id"]) for c in selected_kbs
+            if c.get("kb_id") is not None and not c.get("subtag_ids")
+        })
+        # Deterministic ordering for test repeatability.
+        subtag_entries: list[tuple[int, list[int]]] = sorted(
+            [
+                (int(c["kb_id"]),
+                 sorted({int(s) for s in c.get("subtag_ids") or [] if s is not None}))
+                for c in selected_kbs
+                if c.get("kb_id") is not None and c.get("subtag_ids")
+            ],
+            key=lambda t: t[0],
+        )
+        # Drop entries whose subtag list collapsed to empty after filtering
+        # None-values (defensive; shouldn't normally happen).
+        subtag_entries = [(k, s) for (k, s) in subtag_entries if s]
+
+        if (whole_kb_ids or subtag_entries) and _sessionmaker is not None:
             from sqlalchemy import text as _sql_text
+            from collections import defaultdict as _dd
+
+            # (kb_id, subtag_id_or_None, subtag_name_or_None) -> [filename,...]
+            _buckets: dict[tuple[int, int | None, str | None], list[str]] = _dd(list)
+
             async with _sessionmaker() as _s:
-                res = await _s.execute(
-                    _sql_text(
-                        "SELECT kb_id, filename FROM kb_documents "
-                        "WHERE kb_id = ANY(:ids) AND deleted_at IS NULL "
-                        "ORDER BY kb_id, uploaded_at DESC, filename"
-                    ),
-                    {"ids": kb_ids},
+                if whole_kb_ids:
+                    res = await _s.execute(
+                        _sql_text(
+                            "SELECT kb_id, subtag_id, NULL::text AS subtag_name, filename "
+                            "FROM kb_documents "
+                            "WHERE kb_id = ANY(:ids) AND deleted_at IS NULL "
+                            "ORDER BY uploaded_at DESC, filename"
+                        ),
+                        {"ids": whole_kb_ids},
+                    )
+                    for kb_id_row, _sid, _sname, fn in res.all():
+                        # Whole-KB bucket: key on (kb_id, None, None) so all
+                        # docs across subtags collapse under one header.
+                        _buckets[(kb_id_row, None, None)].append(fn)
+
+                if subtag_entries:
+                    # Build one OR-chain expanding each (kb_id, subtag_ids) pair
+                    # with its own parameter names to avoid collisions.
+                    _where_parts: list[str] = []
+                    _params: dict[str, Any] = {}
+                    for _i, (_k, _sids) in enumerate(subtag_entries):
+                        _where_parts.append(
+                            f"(d.kb_id = :k{_i} AND d.subtag_id = ANY(:s{_i}))"
+                        )
+                        _params[f"k{_i}"] = _k
+                        _params[f"s{_i}"] = _sids
+                    _sql = (
+                        "SELECT d.kb_id, d.subtag_id, t.name AS subtag_name, d.filename "
+                        "FROM kb_documents d "
+                        "JOIN kb_subtags t ON t.id = d.subtag_id "
+                        "WHERE d.deleted_at IS NULL AND (" + " OR ".join(_where_parts) + ") "
+                        "ORDER BY d.uploaded_at DESC, d.filename"
+                    )
+                    res = await _s.execute(_sql_text(_sql), _params)
+                    for kb_id_row, sid, sname, fn in res.all():
+                        # Group rows by (kb_id, frozenset-of-subtags-chosen)
+                        # so the header can name all subtags picked for that
+                        # kb in one line. We stash them under a synthetic key
+                        # that carries the kb_id only; subtag names are
+                        # aggregated below.
+                        _buckets[(kb_id_row, sid, sname)].append(fn)
+
+            if _buckets:
+                # Cap high enough that a full year of daily reports fits
+                # comfortably (365 + headroom). At ~20 chars/filename the
+                # whole catalog is <1% of a 32k context, so trading tokens
+                # for authoritative coverage is the right call. Operators
+                # can lower via RAG_KB_CATALOG_MAX if they ever pack KBs
+                # with 10k+ docs. Applied per bucket.
+                try:
+                    _cap = int(_os.environ.get("RAG_KB_CATALOG_MAX", "500"))
+                except (TypeError, ValueError):
+                    _cap = 500
+
+                _catalog_lines: list[str] = []
+
+                # Whole-KB buckets first, sorted by kb_id for determinism.
+                _whole_keys = sorted(
+                    [k for k in _buckets.keys() if k[1] is None],
+                    key=lambda t: t[0],
                 )
-                rows = res.all()
-            if rows:
-                from collections import defaultdict as _dd
-                _by_kb: dict[int, list[str]] = _dd(list)
-                for kb_id_row, fn in rows:
-                    _by_kb[kb_id_row].append(fn)
-                _catalog_lines = []
-                for kb_id_row, fns in _by_kb.items():
-                    _catalog_lines.append(f"KB {kb_id_row}: {len(fns)} document(s) available")
-                    # Cap at 60 filenames per KB to stay cheap on tokens
-                    for fn in fns[:60]:
+                for _key in _whole_keys:
+                    _kb_id = _key[0]
+                    _fns = _buckets[_key]
+                    _catalog_lines.append(
+                        f"KB {_kb_id}: {len(_fns)} document(s) available"
+                    )
+                    for fn in _fns[:_cap]:
                         _catalog_lines.append(f"  - {fn}")
-                    if len(fns) > 60:
-                        _catalog_lines.append(f"  ... and {len(fns) - 60} more")
+                    if len(_fns) > _cap:
+                        _catalog_lines.append(f"  ... and {len(_fns) - _cap} more")
+
+                # Subtag-scoped buckets: merge rows sharing the same kb_id
+                # under one header that lists all picked subtag names.
+                _subtag_rows: dict[int, dict[int, tuple[str | None, list[str]]]] = _dd(dict)
+                for (_kb_id, _sid, _sname), _fns in _buckets.items():
+                    if _sid is None:
+                        continue
+                    # Merge by (kb_id, subtag_id); if the same subtag appears
+                    # in multiple buckets (shouldn't happen given SQL) we
+                    # concatenate.
+                    if _sid in _subtag_rows[_kb_id]:
+                        _prev_name, _prev_fns = _subtag_rows[_kb_id][_sid]
+                        _subtag_rows[_kb_id][_sid] = (_prev_name or _sname, _prev_fns + _fns)
+                    else:
+                        _subtag_rows[_kb_id][_sid] = (_sname, list(_fns))
+
+                for _kb_id in sorted(_subtag_rows.keys()):
+                    _per_subtag = _subtag_rows[_kb_id]
+                    # Sort subtags by id for deterministic header ordering.
+                    _sids_sorted = sorted(_per_subtag.keys())
+                    _names = [
+                        (_per_subtag[_sid][0] or f"subtag {_sid}")
+                        for _sid in _sids_sorted
+                    ]
+                    # Flatten all filenames in this kb's subtag selection,
+                    # preserving the SQL order (uploaded_at DESC, filename).
+                    _fns_all: list[str] = []
+                    for _sid in _sids_sorted:
+                        _fns_all.extend(_per_subtag[_sid][1])
+                    _header = (
+                        f"KB {_kb_id} \u2192 {', '.join(_names)}: "
+                        f"{len(_fns_all)} document(s) available"
+                    )
+                    _catalog_lines.append(_header)
+                    for fn in _fns_all[:_cap]:
+                        _catalog_lines.append(f"  - {fn}")
+                    if len(_fns_all) > _cap:
+                        _catalog_lines.append(f"  ... and {len(_fns_all) - _cap} more")
+
                 _catalog_text = (
                     "KNOWLEDGE-BASE CATALOG (authoritative list of documents "
                     "available to you; use this for any 'which files / what "
@@ -568,6 +1019,49 @@ async def _run_pipeline(
         # Fail-open: catalog is nice-to-have, not a correctness requirement.
         logger.debug("kb catalog preamble skipped: %s", _e)
 
+    # --- Current-datetime preamble ---------------------------------------
+    # Chat models have a training cutoff and cannot answer "what's today's
+    # date" unless we inject the current wall-clock time. Stamp a small
+    # pseudo-source so the LLM always has an authoritative anchor.
+    # Toggle with ``RAG_INJECT_DATETIME=0`` (default on — cost is ~40 tokens
+    # per request; answers "what day is it" correctly every time).
+    if _os.environ.get("RAG_INJECT_DATETIME", "1") != "0":
+        try:
+            import datetime as _dt
+            try:
+                import zoneinfo as _zi
+                _tz_name = _os.environ.get("RAG_TZ", "UTC")
+                try:
+                    _tz = _zi.ZoneInfo(_tz_name)
+                except Exception:
+                    _tz, _tz_name = _zi.ZoneInfo("UTC"), "UTC"
+                _now = _dt.datetime.now(_tz)
+            except Exception:
+                # zoneinfo unavailable (shouldn't happen on py3.9+) →
+                # fall back to naive local time.
+                _now = _dt.datetime.now()
+                _tz_name = "local"
+            _dt_text = (
+                "CURRENT DATE AND TIME (authoritative — answer "
+                "'what is today' / 'what date is it' / 'what time is it' "
+                "questions using this preamble, not your training data):\n"
+                f"Date: {_now.strftime('%A, %B %d, %Y')}\n"
+                f"Time: {_now.strftime('%I:%M %p')} {_tz_name}\n"
+                f"ISO: {_now.strftime('%Y-%m-%dT%H:%M:%S')}"
+            )
+            sources_out.insert(0, {
+                "source": {"id": "current-datetime", "name": "current-datetime",
+                           "url": "current-datetime"},
+                "document": [_dt_text],
+                "metadata": [{
+                    "source": "current-datetime", "name": "current-datetime",
+                    "kb_id": None, "doc_id": None, "chat_id": None,
+                    "subtag_id": None,
+                }],
+            })
+        except Exception as _e:
+            logger.debug("datetime preamble skipped: %s", _e)
+
     # Emit a "hits" event before "done" so the UI can render citation
     # previews as soon as the backend has them, without waiting for the
     # LLM response stream.
@@ -580,13 +1074,28 @@ async def _run_pipeline(
                 "filename": _src.get("source", {}).get("name"),
                 "kb_id": meta0.get("kb_id"),
             })
-        await _emit(progress_cb, {"stage": "hits", "hits": _hit_summary})
+        await _emit(progress_cb, {
+            "stage": "hits", "hits": _hit_summary,
+            "intent": _intent, "intent_reason": _intent_reason,
+        })
     except Exception:
         pass
 
+    _total_ms_done = int((time.perf_counter() - _pipeline_start) * 1000)
     await _emit(progress_cb, {
         "stage": "done",
-        "total_ms": int((time.perf_counter() - _pipeline_start) * 1000),
+        "total_ms": _total_ms_done,
         "sources": len(sources_out),
     })
+    # Phase 4 — structured per-query log. Single JSON line so Loki /
+    # friends can pivot on ``intent`` without having to parse a
+    # human-formatted message. Best-effort: any logging error is
+    # swallowed so it can never affect the return value.
+    _log_rag_query(
+        req_id=request_id_var.get(),
+        intent=_intent_label,
+        kbs=_kb_ids_for_log,
+        hits=len(sources_out),
+        total_ms=_total_ms_done,
+    )
     return sources_out
