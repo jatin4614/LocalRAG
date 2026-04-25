@@ -32,6 +32,7 @@ from typing import Iterable, Optional
 
 import httpx
 
+from .llm_telemetry import record_llm_call
 from .retry_policy import with_transient_retry
 
 
@@ -94,11 +95,24 @@ async def _contextualize_call(
     of pure wait time, which would dwarf the actual ingest. Fail-open in
     the caller ensures a per-chunk failure just degrades to raw chunk
     text, never crashes ingest.
+
+    Wrapped in ``record_llm_call`` so prompt/completion token counters
+    are emitted for each request — even on retry-exhausted failure the
+    in-flight call still burned tokens upstream and operators need to
+    see that spend.
     """
-    async with httpx.AsyncClient(timeout=timeout_s, transport=transport) as client:
-        r = await client.post(url, json=body, headers=headers)
-        r.raise_for_status()
-        return r.json()
+    model_name = body.get("model") or os.environ.get("CHAT_MODEL", "unknown")
+    async with record_llm_call(stage="contextualizer", model=model_name) as rec:
+        async with httpx.AsyncClient(timeout=timeout_s, transport=transport) as client:
+            r = await client.post(url, json=body, headers=headers)
+            r.raise_for_status()
+            data = r.json()
+        usage = data.get("usage") or {}
+        rec.set_tokens(
+            prompt=usage.get("prompt_tokens", 0),
+            completion=usage.get("completion_tokens", 0),
+        )
+        return data
 
 
 async def contextualize_chunk(

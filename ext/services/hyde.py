@@ -27,10 +27,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import Optional
 
 import httpx
 
+from .llm_telemetry import record_llm_call
 from .obs import inject_context_into_headers, span
 from .retry_policy import with_transient_retry
 
@@ -59,11 +61,24 @@ async def _hyde_call(
     every retrieval — three retries of a 500 ms timeout would put a 1.5 s
     extra latency tax on every miss, which is worse than just falling
     open to the raw-query embedding baseline.
+
+    Wrapped in ``record_llm_call`` so prompt/completion token counters
+    are emitted for each hypothetical-doc request — HyDE is the most
+    chat-call-heavy retrieval feature we have and operators need to see
+    its token spend in the same dashboard as contextualizer / rewriter.
     """
-    async with httpx.AsyncClient(timeout=timeout_s, transport=transport) as client:
-        r = await client.post(url, json=body, headers=headers)
-        r.raise_for_status()
-        return r.json()
+    model_name = body.get("model") or os.environ.get("CHAT_MODEL", "unknown")
+    async with record_llm_call(stage="hyde", model=model_name) as rec:
+        async with httpx.AsyncClient(timeout=timeout_s, transport=transport) as client:
+            r = await client.post(url, json=body, headers=headers)
+            r.raise_for_status()
+            data = r.json()
+        usage = data.get("usage") or {}
+        rec.set_tokens(
+            prompt=usage.get("prompt_tokens", 0),
+            completion=usage.get("completion_tokens", 0),
+        )
+        return data
 
 
 async def _generate_one(

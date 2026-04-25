@@ -12,10 +12,12 @@ effort optimization, never a hard dependency.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 import httpx
 
+from .llm_telemetry import record_llm_call
 from .obs import inject_context_into_headers, span
 
 log = logging.getLogger("orgchat.rewrite")
@@ -121,11 +123,22 @@ async def _rewrite_query_impl(
     headers = inject_context_into_headers(headers)
 
     url = f"{chat_url.rstrip('/')}/chat/completions"
+    model_name = body.get("model") or os.environ.get("CHAT_MODEL", "unknown")
     try:
-        async with httpx.AsyncClient(timeout=timeout_s, transport=transport) as client:
-            r = await client.post(url, json=body, headers=headers)
-            r.raise_for_status()
-            data = r.json()
+        # ``record_llm_call`` wraps the HTTP call so prompt/completion token
+        # counters fire even on retry-exhausted failure — operators get the
+        # rewriter's token spend in the same dashboard as contextualizer /
+        # hyde. Fail-open semantics are preserved by the outer try/except.
+        async with record_llm_call(stage="rewriter", model=model_name) as rec:
+            async with httpx.AsyncClient(timeout=timeout_s, transport=transport) as client:
+                r = await client.post(url, json=body, headers=headers)
+                r.raise_for_status()
+                data = r.json()
+            usage = data.get("usage") or {}
+            rec.set_tokens(
+                prompt=usage.get("prompt_tokens", 0),
+                completion=usage.get("completion_tokens", 0),
+            )
         rewrite = (data["choices"][0]["message"]["content"] or "").strip()
     except Exception as e:  # noqa: BLE001 — fail-open by design
         log.debug("query rewrite failed, falling back to raw turn: %s", e)
