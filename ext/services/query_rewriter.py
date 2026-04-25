@@ -16,6 +16,8 @@ from typing import Optional
 
 import httpx
 
+from .obs import inject_context_into_headers, span
+
 log = logging.getLogger("orgchat.rewrite")
 
 
@@ -67,6 +69,28 @@ async def rewrite_query(
     if not latest_turn:
         return latest_turn
 
+    with span("query.rewrite", model=chat_model, history_turns=len(history or [])):
+        return await _rewrite_query_impl(
+            latest_turn=latest_turn,
+            history=history,
+            chat_url=chat_url,
+            chat_model=chat_model,
+            api_key=api_key,
+            timeout_s=timeout_s,
+            transport=transport,
+        )
+
+
+async def _rewrite_query_impl(
+    latest_turn: str,
+    history: list[dict],
+    *,
+    chat_url: str,
+    chat_model: str,
+    api_key: Optional[str] = None,
+    timeout_s: float = 8.0,
+    transport: Optional[httpx.AsyncBaseTransport] = None,
+) -> str:
     # Trim history to last 6 turns to cap the prompt size. Each content is
     # clipped to 500 chars so a single giant turn can't blow up the request.
     trimmed = history[-6:] if history else []
@@ -94,6 +118,7 @@ async def rewrite_query(
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+    headers = inject_context_into_headers(headers)
 
     url = f"{chat_url.rstrip('/')}/chat/completions"
     try:

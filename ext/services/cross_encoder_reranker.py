@@ -18,6 +18,8 @@ import threading
 from functools import lru_cache
 from typing import Any, Sequence
 
+from .obs import span
+
 _LOCK = threading.Lock()
 
 
@@ -177,11 +179,18 @@ def rerank_cross_encoder(
     """
     if not hits:
         return []
-    passages: list[str] = []
-    for h in hits:
-        payload = getattr(h, "payload", None) or {}
-        text = payload.get("text") or getattr(h, "text", "") or ""
-        passages.append(str(text))
-    scores = score_pairs(query, passages, batch_size=batch_size)
-    scored = sorted(zip(scores, hits), key=lambda t: t[0], reverse=True)
-    return [h for _, h in scored[:top_k]]
+    model_name = os.environ.get("RAG_RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
+    with span(
+        "rerank.score",
+        n_candidates=len(hits),
+        model=model_name,
+        top_k=top_k,
+    ):
+        passages: list[str] = []
+        for h in hits:
+            payload = getattr(h, "payload", None) or {}
+            text = payload.get("text") or getattr(h, "text", "") or ""
+            passages.append(str(text))
+        scores = score_pairs(query, passages, batch_size=batch_size)
+        scored = sorted(zip(scores, hits), key=lambda t: t[0], reverse=True)
+        return [h for _, h in scored[:top_k]]

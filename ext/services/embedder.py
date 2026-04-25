@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import struct
 from typing import Optional, Protocol
 
 import httpx
+
+from .obs import inject_context_into_headers, span
 
 
 class Embedder(Protocol):
@@ -30,7 +33,14 @@ class StubEmbedder:
 
 
 class TEIEmbedder:
-    """HuggingFace Text-Embeddings-Inference client."""
+    """HuggingFace Text-Embeddings-Inference client.
+
+    TEI enforces a server-side max batch size (default 32 inputs per
+    ``/embed`` request). Longer documents routinely produce more chunks
+    than that, so we split the caller's list into batches of
+    ``RAG_TEI_MAX_BATCH`` (default 32) and concatenate the results.
+    Order is preserved.
+    """
 
     def __init__(
         self,
@@ -38,13 +48,41 @@ class TEIEmbedder:
         base_url: str,
         timeout: float = 30.0,
         transport: Optional[httpx.AsyncBaseTransport] = None,
+        max_batch: Optional[int] = None,
     ) -> None:
         self._client = httpx.AsyncClient(base_url=base_url, timeout=timeout, transport=transport)
+        if max_batch is None:
+            try:
+                max_batch = int(os.environ.get("RAG_TEI_MAX_BATCH", "32"))
+            except (TypeError, ValueError):
+                max_batch = 32
+        self._max_batch = max(1, max_batch)
 
     async def aclose(self) -> None:
         await self._client.aclose()
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
-        r = await self._client.post("/embed", json={"inputs": texts})
-        r.raise_for_status()
-        return r.json()
+        if not texts:
+            return []
+        # Heuristic: callers embedding a single input are usually the query
+        # path (retriever/hyde); larger batches come from ingest/doc paths.
+        _path = "query" if len(texts) == 1 else "doc"
+        _bytes = sum(len(t) for t in texts)
+        out: list[list[float]] = []
+        with span(
+            "embed.call",
+            path=_path,
+            batch_size=len(texts),
+            bytes=_bytes,
+        ):
+            for i in range(0, len(texts), self._max_batch):
+                batch = texts[i : i + self._max_batch]
+                headers = inject_context_into_headers({})
+                r = await self._client.post(
+                    "/embed",
+                    json={"inputs": batch},
+                    headers=headers or None,
+                )
+                r.raise_for_status()
+                out.extend(r.json())
+            return out

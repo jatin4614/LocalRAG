@@ -10,6 +10,7 @@ from collections import defaultdict
 from typing import Any, Callable, List, Sequence
 
 from . import flags
+from .obs import span
 from .vector_store import Hit
 
 
@@ -20,6 +21,11 @@ def rerank(hits: List[Hit], *, top_k: int = 10) -> List[Hit]:
     if not hits:
         return []
 
+    with span("rerank.score", n_candidates=len(hits), model="heuristic", top_k=top_k):
+        return _rerank_impl(hits, top_k=top_k)
+
+
+def _rerank_impl(hits: List[Hit], *, top_k: int = 10) -> List[Hit]:
     ordered = sorted(hits, key=lambda h: h.score, reverse=True)
     if len(ordered) >= 2 and ordered[1].score > 0 and (ordered[0].score / ordered[1].score) > FAST_PATH_RATIO:
         return ordered[:top_k]

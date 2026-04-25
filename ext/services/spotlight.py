@@ -14,6 +14,8 @@ References:
 """
 from __future__ import annotations
 
+from .obs import span
+
 _OPEN = "<UNTRUSTED_RETRIEVED_CONTENT>"
 _CLOSE = "</UNTRUSTED_RETRIEVED_CONTENT>"
 
@@ -58,8 +60,9 @@ def wrap_context(chunks_text: str) -> str:
     """
     if not chunks_text:
         return ""
-    sanitized = sanitize_chunk_text(chunks_text)
-    return f"{_OPEN}\n{sanitized}\n{_CLOSE}"
+    with span("spotlight.wrap", bytes=len(chunks_text)):
+        sanitized = sanitize_chunk_text(chunks_text)
+        return f"{_OPEN}\n{sanitized}\n{_CLOSE}"
 
 
 def wrap_chunks(chunks: list[str]) -> str:

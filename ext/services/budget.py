@@ -6,6 +6,7 @@ import os
 from functools import lru_cache
 from typing import List
 
+from .obs import span
 from .vector_store import Hit
 
 
@@ -112,17 +113,24 @@ def _count_tokens(text: str) -> int:
 
 def budget_chunks(hits: List[Hit], *, max_tokens: int = 4000) -> List[Hit]:
     """Assumes hits is pre-sorted best-first. Returns longest prefix that fits."""
-    kept: list[Hit] = []
-    total = 0
-    dropped = 0
-    for h in hits:
-        t = _count_tokens(str(h.payload.get("text", "")))
-        if total + t > max_tokens:
-            dropped += 1
-            continue
-        total += t
-        kept.append(h)
-    if dropped:
-        logger.debug("budget dropped %d of %d chunks (used %d/%d tokens)",
-                     dropped, len(hits), total, max_tokens)
-    return kept
+    with span("budget.truncate", input_size=len(hits), max_tokens=max_tokens) as _sp:
+        kept: list[Hit] = []
+        total = 0
+        dropped = 0
+        for h in hits:
+            t = _count_tokens(str(h.payload.get("text", "")))
+            if total + t > max_tokens:
+                dropped += 1
+                continue
+            total += t
+            kept.append(h)
+        if dropped:
+            logger.debug("budget dropped %d of %d chunks (used %d/%d tokens)",
+                         dropped, len(hits), total, max_tokens)
+        try:
+            _sp.set_attribute("output_size", len(kept))
+            _sp.set_attribute("tokens_used", total)
+            _sp.set_attribute("dropped", dropped)
+        except Exception:
+            pass
+        return kept

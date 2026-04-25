@@ -29,6 +29,8 @@ from typing import Any, Optional, Sequence
 
 from qdrant_client.http import models as qm
 
+from .obs import span
+
 
 @dataclass
 class ExpandedHit:
@@ -139,6 +141,21 @@ async def expand_context(
     if not hits or window <= 0:
         return list(hits)
 
+    with span("context.expand", input_size=len(hits), window=window) as _sp:
+        out = await _expand_context_impl(hits, vs=vs, window=window)
+        try:
+            _sp.set_attribute("output_size", len(out))
+        except Exception:
+            pass
+        return out
+
+
+async def _expand_context_impl(
+    hits: Sequence[Any],
+    *,
+    vs: Any,
+    window: int = 1,
+) -> list[Any]:
     # Pass 1: plan the fetches. For each hit, derive (collection, scope_key,
     # chunk_index); enqueue a coroutine. Hits that can't be expanded (no
     # chunk_index, no collection) are recorded so pass 2 can keep them in

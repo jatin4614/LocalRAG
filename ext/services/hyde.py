@@ -31,6 +31,8 @@ from typing import Optional
 
 import httpx
 
+from .obs import inject_context_into_headers, span
+
 log = logging.getLogger("orgchat.hyde")
 
 
@@ -71,6 +73,7 @@ async def _generate_one(
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+    headers = inject_context_into_headers(headers)
 
     url = f"{chat_url.rstrip('/')}/chat/completions"
     try:
@@ -162,15 +165,16 @@ async def hyde_embed(
     a lexical anchor that keeps the average centered on-topic even when
     a hypothetical doc drifts.
     """
-    docs = await generate_hypothetical_docs(
-        query,
-        n=n,
-        chat_url=chat_url,
-        chat_model=chat_model,
-        api_key=api_key,
-        timeout_s=timeout_s,
-        transport=transport,
-    )
+    with span("hyde.generate", n=n, model=chat_model):
+        docs = await generate_hypothetical_docs(
+            query,
+            n=n,
+            chat_url=chat_url,
+            chat_model=chat_model,
+            api_key=api_key,
+            timeout_s=timeout_s,
+            transport=transport,
+        )
     if not docs:
         # All generations failed. Caller falls back to raw-query embedding
         # via the normal path — no point in duplicating that work here.

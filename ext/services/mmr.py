@@ -29,6 +29,8 @@ from __future__ import annotations
 import math
 from typing import Any, Sequence
 
+from .obs import span
+
 
 def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
     """Cosine similarity between two equal-length float sequences.
@@ -118,6 +120,18 @@ async def mmr_rerank_from_hits(
     if top_k >= len(hits):
         return list(hits)
 
+    with span("mmr.dedupe", input_size=len(hits), top_k=top_k, lambda_=lambda_):
+        return await _mmr_rerank_from_hits_impl(query, hits, embedder, top_k=top_k, lambda_=lambda_)
+
+
+async def _mmr_rerank_from_hits_impl(
+    query: str,
+    hits: Sequence[Any],
+    embedder: Any,
+    *,
+    top_k: int,
+    lambda_: float,
+) -> list[Any]:
     texts = [
         (getattr(h, "payload", {}) or {}).get("text")
         or getattr(h, "text", "")
