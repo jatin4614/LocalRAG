@@ -14,15 +14,28 @@ from testcontainers.postgres import PostgresContainer
 from testcontainers.redis import RedisContainer
 
 ROOT = Path(__file__).resolve().parents[2]
-MIGRATION_001 = ROOT / "ext/db/migrations/001_create_kb_schema.sql"
-MIGRATION_002 = ROOT / "ext/db/migrations/002_soft_delete_kb.sql"
-MIGRATION_003 = ROOT / "ext/db/migrations/003_add_chunk_count.sql"
+MIGRATIONS_DIR = ROOT / "ext/db/migrations"
 
 
 async def _raw_exec(conn, sql: str) -> None:
     """Run multi-statement DDL via asyncpg's raw connection."""
     raw = await conn.get_raw_connection()
     await raw.driver_connection.execute(sql)
+
+
+def _all_migration_paths() -> list[Path]:
+    """Return every NNN_*.sql migration in numeric order.
+
+    Picking up new migrations without conftest churn — when Plan A /
+    Plan B add a new migration the test schema stays in lockstep with
+    production. Each migration is expected to be idempotent enough to
+    run against a fresh DB (CREATE TABLE IF NOT EXISTS / ALTER TABLE
+    ADD COLUMN IF NOT EXISTS).
+    """
+    return sorted(
+        MIGRATIONS_DIR.glob("[0-9][0-9][0-9]_*.sql"),
+        key=lambda p: p.name,
+    )
 
 
 @pytest.fixture(scope="session")
@@ -38,7 +51,7 @@ async def engine(pg):
     async with eng.begin() as conn:
         await _raw_exec(conn, """
             DROP TABLE IF EXISTS kb_access, kb_documents, kb_subtags, knowledge_bases CASCADE;
-            DROP TABLE IF EXISTS chats, user_groups, users, groups CASCADE;
+            DROP TABLE IF EXISTS chat, chats, user_groups, users, groups CASCADE;
             CREATE TABLE users (
               id BIGSERIAL PRIMARY KEY,
               email TEXT UNIQUE NOT NULL,
@@ -61,11 +74,41 @@ async def engine(pg):
               created_at TIMESTAMPTZ NOT NULL DEFAULT now()
             );
         """)
-        await _raw_exec(conn, MIGRATION_001.read_text())
-        if MIGRATION_002.exists():
-            await _raw_exec(conn, MIGRATION_002.read_text())
-        if MIGRATION_003.exists():
-            await _raw_exec(conn, MIGRATION_003.read_text())
+        for mig in _all_migration_paths():
+            await _raw_exec(conn, mig.read_text())
+        # Production has drifted from migration 001: the SQLAlchemy
+        # model declares ``admin_id``, ``uploaded_by``, ``user_id``
+        # as VARCHAR(255) (upstream's user.id is a UUID string) and
+        # ``group_id`` as TEXT, but migration 001 still says BIGINT.
+        # Live production was bootstrapped via SQLAlchemy
+        # ``create_all`` which respects the model types — production
+        # schema is the source of truth.
+        #
+        # ALTER the columns post-migration so SQLAlchemy can round-
+        # trip model-typed values. asyncpg silently coerces ``int`` ->
+        # ``str`` for VARCHAR, so legacy test fixtures that pass
+        # ``admin_id=1`` keep working.
+        await _raw_exec(conn, """
+            ALTER TABLE knowledge_bases
+              DROP CONSTRAINT IF EXISTS knowledge_bases_admin_id_fkey;
+            ALTER TABLE knowledge_bases
+              ALTER COLUMN admin_id TYPE VARCHAR(255) USING admin_id::text;
+
+            ALTER TABLE kb_documents
+              DROP CONSTRAINT IF EXISTS kb_documents_uploaded_by_fkey;
+            ALTER TABLE kb_documents
+              ALTER COLUMN uploaded_by TYPE VARCHAR(255) USING uploaded_by::text;
+
+            ALTER TABLE kb_access
+              DROP CONSTRAINT IF EXISTS kb_access_user_id_fkey;
+            ALTER TABLE kb_access
+              ALTER COLUMN user_id TYPE VARCHAR(255) USING user_id::text;
+
+            ALTER TABLE kb_access
+              DROP CONSTRAINT IF EXISTS kb_access_group_id_fkey;
+            ALTER TABLE kb_access
+              ALTER COLUMN group_id TYPE TEXT USING group_id::text;
+        """)
     yield eng
     await eng.dispose()
 
@@ -246,6 +289,8 @@ async def _seed_rbac_fixtures(
         text("INSERT INTO groups (id, name) VALUES (:gx, 'gx')"),
         {"gx": test_group_x},
     )
+    # admin_id is VARCHAR(255) post-migration drift; cast int -> str
+    # explicitly so asyncpg's type binding doesn't reject the param.
     await s.execute(
         text(
             "INSERT INTO knowledge_bases (id, name, admin_id) VALUES "
@@ -254,7 +299,7 @@ async def _seed_rbac_fixtures(
         {
             "kx": test_kb_x,
             "ky": test_kb_y,
-            "ua": test_user_a,
+            "ua": str(test_user_a),
         },
     )
     await s.commit()
@@ -325,12 +370,13 @@ async def grant_kb_to_group(rbac_db_session, _seed_rbac_fixtures):
     s = rbac_db_session
 
     async def _grant(kb_id: int, group_id: int) -> None:
+        # group_id column is TEXT post-migration drift.
         await s.execute(
             text(
                 "INSERT INTO kb_access (kb_id, user_id, group_id, access_type) "
                 "VALUES (:kb, NULL, :g, 'read')"
             ),
-            {"kb": kb_id, "g": group_id},
+            {"kb": kb_id, "g": str(group_id)},
         )
         await s.commit()
 
@@ -342,12 +388,13 @@ async def grant_kb_to_user(rbac_db_session, _seed_rbac_fixtures):
     s = rbac_db_session
 
     async def _grant(kb_id: int, user_id: int) -> None:
+        # user_id column is VARCHAR(255) post-migration drift.
         await s.execute(
             text(
                 "INSERT INTO kb_access (kb_id, user_id, group_id, access_type) "
                 "VALUES (:kb, :u, NULL, 'read')"
             ),
-            {"kb": kb_id, "u": user_id},
+            {"kb": kb_id, "u": str(user_id)},
         )
         await s.commit()
 
@@ -393,21 +440,25 @@ async def _resolve_allowed_kb_ids_from_db(
     ).scalars().all()
     group_ids = [int(g) for g in group_rows]
 
+    # kb_access.user_id is VARCHAR(255); group_id is TEXT. Cast inputs
+    # to str so the parameter bind matches the column type.
+    uid_str = str(user_id)
     if group_ids:
+        gids_str = [str(g) for g in group_ids]
         rows = (
             await session.execute(
                 text(
                     "SELECT kb_id FROM kb_access "
                     "WHERE user_id = :uid OR group_id = ANY(:gids)"
                 ),
-                {"uid": user_id, "gids": group_ids},
+                {"uid": uid_str, "gids": gids_str},
             )
         ).scalars().all()
     else:
         rows = (
             await session.execute(
                 text("SELECT kb_id FROM kb_access WHERE user_id = :uid"),
-                {"uid": user_id},
+                {"uid": uid_str},
             )
         ).scalars().all()
     return set(int(r) for r in rows)

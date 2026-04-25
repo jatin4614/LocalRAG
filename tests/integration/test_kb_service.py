@@ -9,7 +9,10 @@ pytestmark = pytest.mark.integration
 async def test_create_and_get_kb(session):
     await session.execute(text("INSERT INTO users (id, email, password_hash, role) VALUES (1, 'a@x', 'h', 'admin')"))
     await session.commit()
-    kb = await kb_service.create_kb(session, name="Engineering", description="eng docs", admin_id=1)
+    # admin_id is VARCHAR(255) in production (upstream's user.id is a UUID
+    # string); pass the value as a string so SQLAlchemy's bind-parameter
+    # type matches the column.
+    kb = await kb_service.create_kb(session, name="Engineering", description="eng docs", admin_id="1")
     await session.commit()
     got = await kb_service.get_kb(session, kb_id=kb.id)
     assert got.name == "Engineering"
@@ -45,7 +48,7 @@ async def test_duplicate_kb_name_rejected(session):
     await session.execute(text("INSERT INTO knowledge_bases (id, name, admin_id) VALUES (1, 'Dup', 1)"))
     await session.commit()
     with pytest.raises(Exception):
-        await kb_service.create_kb(session, name="Dup", description=None, admin_id=1)
+        await kb_service.create_kb(session, name="Dup", description=None, admin_id="1")
         await session.commit()
 
 
@@ -92,13 +95,15 @@ async def test_grant_user_and_group_access(session):
     await session.execute(text("INSERT INTO knowledge_bases (id, name, admin_id) VALUES (1, 'K', 1)"))
     await session.commit()
 
-    await kb_service.grant_access(session, kb_id=1, user_id=2, group_id=None)
-    await kb_service.grant_access(session, kb_id=1, user_id=None, group_id=1)
+    # KBAccess.user_id is VARCHAR(255), group_id is TEXT — both string
+    # types, mirroring upstream's UUID-keyed user / group ids.
+    await kb_service.grant_access(session, kb_id=1, user_id="2", group_id=None)
+    await kb_service.grant_access(session, kb_id=1, user_id=None, group_id="1")
     await session.commit()
     grants = await kb_service.list_access(session, kb_id=1)
     assert len(grants) == 2
-    assert {g.user_id for g in grants if g.user_id is not None} == {2}
-    assert {g.group_id for g in grants if g.group_id is not None} == {1}
+    assert {g.user_id for g in grants if g.user_id is not None} == {"2"}
+    assert {g.group_id for g in grants if g.group_id is not None} == {"1"}
 
 
 @pytest.mark.asyncio
@@ -109,7 +114,7 @@ async def test_grant_requires_exactly_one_of_user_or_group(session):
     with pytest.raises(ValueError):
         await kb_service.grant_access(session, kb_id=1, user_id=None, group_id=None)
     with pytest.raises(ValueError):
-        await kb_service.grant_access(session, kb_id=1, user_id=1, group_id=1)
+        await kb_service.grant_access(session, kb_id=1, user_id="1", group_id="1")
 
 
 @pytest.mark.asyncio
