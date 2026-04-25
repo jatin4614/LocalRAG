@@ -186,3 +186,21 @@ shadow `_v2` collection, alias-swaps it in, and keeps the source for rollback.
    bake period, drop it: `curl -X DELETE http://qdrant:6333/collections/kb_X`.
 6. If anything goes wrong post-swap, alias-swap back to the source and investigate before
    re-running the reconciler.
+
+## Retrieval returns weirdly similar chunks (near-duplicates)
+
+1. Intent classified as `specific`? MMR is disabled for specific by design.
+2. If the query is actually about comparison ("compare X vs Y"), it should classify as `global`. Fix: the regex in `classify_intent` may miss the pattern. Check `ext/services/chat_rag_bridge.py:41-64` for pattern gaps.
+3. Override per-KB via `rag_config.RAG_MMR = "1"` to force MMR on for that KB only.
+
+## Retrieval loses local context (chunk mentions "as discussed above")
+
+1. Intent classified as `global`? Context-expand is disabled for global.
+2. Per-KB override: `rag_config.RAG_CONTEXT_EXPAND = "1"` forces on.
+3. Check `RAG_CONTEXT_EXPAND_WINDOW` — default N=1, raise to 2 for long-narrative KBs.
+
+## One KB is dominating results (chatty-KB problem)
+
+1. This was mitigated in Phase 2.3 via RRF fallback — but only when cross-encoder rerank is OFF. If you see this with rerank ON, the cross-encoder itself is biased toward one collection's content.
+2. Temporary: `RAG_RERANK=0` — retrieval falls back to RRF.
+3. Long-term: confirm both collections have the canonical schema (Phase 1.7 migration).
