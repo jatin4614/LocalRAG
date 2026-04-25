@@ -10,6 +10,7 @@ from fastapi.responses import HTMLResponse
 from .config import clear_settings_cache, get_settings
 from .db.session import make_engine, make_sessionmaker
 from .routers import kb_admin, kb_retrieval, rag, rag_stream, upload
+from .services.budget import preflight_tokenizer
 from .services.embedder import TEIEmbedder
 from .services.logging_setup import configure_json_logging
 from .services.obs import init_observability
@@ -54,6 +55,13 @@ def build_app() -> FastAPI:
     # Observability bootstrap — fail-open no-op when OBS_ENABLED != true.
     init_observability(app)
 
+    # Phase 1.1 — tokenizer preflight. Crashes if RAG_BUDGET_TOKENIZER is
+    # set explicitly to a non-cl100k HF alias and the tokenizer can't
+    # load. Silent fallback drifts budget accounting by ~10-15%, which
+    # evicts relevant chunks. Must run before router registration so a
+    # misconfigured deploy fails loudly at startup, not on first chat.
+    preflight_tokenizer()
+
     @app.get("/healthz")
     async def healthz():
         return {"status": "ok"}
@@ -94,6 +102,11 @@ def build_ext_routers():
     # init without an app (OTel SDK still exports; per-request enrichment
     # happens via upstream's middleware stack when it calls us).
     init_observability(None)
+
+    # Phase 1.1 — tokenizer preflight. Same contract as build_app: if an
+    # explicit non-cl100k HF alias can't load, raise here so the upstream
+    # process exits at import time instead of silently drifting budgets.
+    preflight_tokenizer()
 
     # Prom `/metrics` collides with upstream Svelte SPA catch-all — expose
     # on a dedicated in-container port (9464) for Prometheus scrape.

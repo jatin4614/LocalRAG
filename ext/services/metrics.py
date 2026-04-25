@@ -218,6 +218,26 @@ chunk_count = Histogram(
 )
 
 # -----------------------------------------------------------------------
+# Phase 1.1 — tokenizer fallback counter.
+#
+# Incremented when ``ext.services.budget`` falls back to cl100k from a
+# non-cl100k alias. Should be 0 in steady state after the startup
+# preflight passes — any non-zero value means either (a) the preflight
+# was skipped, or (b) the HF cache went away after startup. Either way
+# the alert should fire because ~10-15%% token-budget drift evicts
+# relevant chunks silently.
+#
+# from_alias label: the alias the operator asked for (e.g. "gemma-4")
+# to label: "cl100k" (runtime fallback) | "cl100k_forced_crash" (preflight raised)
+# -----------------------------------------------------------------------
+tokenizer_fallback_total = Counter(
+    f"{_NS}_tokenizer_fallback_total",
+    "Times the budget tokenizer fell back to cl100k from another alias. "
+    "Should be 0 in steady state after preflight passes at startup.",
+    labelnames=("from_alias", "to"),
+)
+
+# -----------------------------------------------------------------------
 # Phase 4 observability: KB health drift + scheduled eval gauges.
 #
 # ``rag_kb_drift_pct`` — per-KB percentage divergence between the

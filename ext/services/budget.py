@@ -11,6 +11,20 @@ from .vector_store import Hit
 
 
 logger = logging.getLogger("rag.budget")
+# Mirror logger named after the module path so caplog filters on
+# ``ext.services.budget`` (used by the preflight tests + standard library
+# convention) capture preflight messages too.
+_module_logger = logging.getLogger(__name__)
+
+
+class TokenizerPreflightError(RuntimeError):
+    """Raised when an explicitly-configured tokenizer fails to load at startup.
+
+    Phase 1.1: silent fallback to cl100k from a non-cl100k alias drifts
+    token counts by ~10-15%% which evicts relevant chunks from the budget
+    pass. We surface this loudly at startup rather than letting it limp
+    along in production.
+    """
 
 
 # Tokenizer registry: maps RAG_BUDGET_TOKENIZER alias -> backend spec.
@@ -84,6 +98,14 @@ def _budget_tokenizer():
                 "require HF_TOKEN with accepted license.",
                 ident, alias, exc,
             )
+            # Phase 1.1: surface runtime fallbacks so dashboards can
+            # alert. Defensive — preflight should crash before we reach
+            # here, but the cache could disappear after startup.
+            try:
+                from ext.services.metrics import tokenizer_fallback_total
+                tokenizer_fallback_total.labels(from_alias=alias, to="cl100k").inc()
+            except Exception:  # pragma: no cover - metrics is fail-open
+                pass
             return _cl100k_counter()
 
         def _count(text: str) -> int:
@@ -109,6 +131,77 @@ def _cl100k_counter():
 
 def _count_tokens(text: str) -> int:
     return _budget_tokenizer()(text)
+
+
+def preflight_tokenizer() -> None:
+    """Validate that the configured tokenizer loads. Called at app startup.
+
+    Rule: if ``RAG_BUDGET_TOKENIZER`` is set to a non-cl100k alias backed
+    by an HF tokenizer, failure to load that tokenizer raises
+    :class:`TokenizerPreflightError` and crashes the process. Silent
+    fallback to cl100k would cause ~10-15%% token-budget drift, which
+    evicts relevant chunks. If the operator explicitly asked for
+    ``gemma-4`` but we fall back to cl100k, ``budget.py`` then lies
+    about how many tokens fit and reranked context gets clipped.
+
+    Non-fatal cases (return cleanly):
+    - Unset env var → default cl100k path.
+    - Explicit ``cl100k`` → same as default.
+    - Unknown alias → operator typo; the runtime fallback to cl100k is
+      safer than crashing on a typo (matches existing ``_budget_tokenizer``
+      behavior).
+    - tiktoken-backed alias → no remote dep, nothing to preload.
+    """
+    alias = os.environ.get("RAG_BUDGET_TOKENIZER")
+    if not alias or alias.lower() == "cl100k":
+        msg = "tokenizer preflight: using cl100k (default or explicit)"
+        logger.info(msg)
+        _module_logger.info(msg)
+        return
+    alias = alias.lower()
+    spec = _TOKENIZER_REGISTRY.get(alias)
+    if spec is None:
+        # Unknown alias — log but don't crash, consistent with the
+        # existing _budget_tokenizer fallback path. Mirror to both
+        # loggers so caplog filters on either name catch it.
+        warn_msg = (
+            f"tokenizer preflight: unknown alias {alias!r} — "
+            f"will fall back to cl100k at runtime"
+        )
+        logger.warning(warn_msg)
+        _module_logger.warning(warn_msg)
+        return
+    if spec.get("kind") != "hf":
+        # tiktoken (and any future non-network kinds) don't need a
+        # network preload — the chunker's encoder loads on first use.
+        return
+    ident = spec["id"]
+    try:
+        from transformers import AutoTokenizer  # type: ignore
+        AutoTokenizer.from_pretrained(ident)
+    except Exception as exc:  # noqa: BLE001
+        # Surface to metrics first — even if the raise prevents the
+        # process from coming up, an operator scraping /metrics during
+        # the failed boot will see the counter tick.
+        try:
+            from ext.services.metrics import tokenizer_fallback_total
+            tokenizer_fallback_total.labels(
+                from_alias=alias, to="cl100k_forced_crash"
+            ).inc()
+        except Exception:  # pragma: no cover - metrics is fail-open
+            pass
+        raise TokenizerPreflightError(
+            f"RAG_BUDGET_TOKENIZER={alias!r} (model={ident!r}) failed to "
+            f"load ({type(exc).__name__}: {exc}). "
+            f"Silent fallback to cl100k would cause ~10-15% token-budget "
+            f"drift. Either (a) ensure the tokenizer is in the HF cache "
+            f"at HF_HOME (see Plan A Appendix A for air-gap staging), or "
+            f"(b) set RAG_BUDGET_TOKENIZER=cl100k to accept the drift "
+            f"explicitly."
+        ) from exc
+    msg = f"tokenizer preflight: {alias} (model={ident}) loaded successfully"
+    logger.info(msg)
+    _module_logger.info(msg)
 
 
 def budget_chunks(hits: List[Hit], *, max_tokens: int = 4000) -> List[Hit]:
