@@ -9,6 +9,10 @@ from typing import Iterable, List, Optional
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http import models as qm
 
+from .metrics import qdrant_search_latency_seconds, qdrant_upsert_latency_seconds
+from .obs import span
+from time import perf_counter as _perf_counter
+
 
 # --- P2.4 HNSW tuning knobs ---------------------------------------------------
 # Env-tunable with sane defaults. Defaults match Qdrant's built-in defaults
@@ -135,6 +139,11 @@ _PAYLOAD_FIELDS = [
     # P3.4 RAPTOR tree provenance: ``chunk_level`` (0 leaf, 1+ summary),
     # ``source_chunk_ids`` (leaf indices a summary node covers).
     "chunk_level", "source_chunk_ids",
+    # Tier 1 doc-summary index (2026-04-22): ``level`` distinguishes
+    # summary points (``"doc"``) from chunks; ``kind`` is the producer
+    # tag (``"doc_summary"``). Required in the allowlist so retriever
+    # post-filters on ``level`` actually see the field.
+    "level", "kind",
 ]
 
 # Name of the named dense vector when a collection is created with sparse vectors
@@ -263,9 +272,20 @@ class VectorStore:
                 )
                 self._sparse_cache[name] = False
         except Exception:
-            # Already exists — verify it's actually there before caching
+            # Already exists — verify via BOTH collections and aliases before
+            # giving up. Qdrant rejects create_collection when ``name`` matches
+            # an existing alias ("Alias with the same name already exists")
+            # even though aliases resolve transparently on every other
+            # operation (search/upsert/payload_index), so treat an
+            # alias-hit the same as a collection-hit.
             cols = await self.list_collections()
-            if name not in cols:
+            aliases: set[str] = set()
+            try:
+                resp = await self._client.get_aliases()
+                aliases = {a.alias_name for a in resp.aliases}
+            except Exception:
+                pass
+            if name not in cols and name not in aliases:
                 raise
         # Create payload indexes for fast filtered queries (idempotent — Qdrant
         # silently ignores duplicate index creation).
@@ -276,8 +296,17 @@ class VectorStore:
         # cross-tenant sub-graphs during search. Within-tenant filters
         # (subtag/doc/deleted) stay as plain KEYWORD — those discriminate
         # rows within a tenant, not between tenants.
-        tenant_fields = ("kb_id", "chat_id", "owner_user_id")
-        filter_fields = ("subtag_id", "doc_id", "deleted")
+        # ``chat_id`` + ``owner_user_id`` are UUID strings in payload and get
+        # ``KeywordIndexParams(is_tenant=True)`` — Qdrant's filtered-HNSW
+        # tenant optimization only applies to keyword indexes, so true
+        # string-tenants stay here. ``kb_id``, ``subtag_id``, ``doc_id`` are
+        # int-typed in payload (autoincrement Postgres PKs) and need
+        # ``IntegerIndexParams``; a keyword index over ints silently indexes
+        # nothing — previous bug that caused ``payload_schema.kb_id.points=0``
+        # on all KB collections. ``deleted`` is boolean-ish, stays keyword.
+        tenant_fields = ("chat_id", "owner_user_id")
+        int_filter_fields = ("kb_id", "subtag_id", "doc_id")
+        filter_fields = ("deleted",)
         for field in tenant_fields:
             try:
                 await self._client.create_payload_index(
@@ -286,6 +315,19 @@ class VectorStore:
                     field_schema=qm.KeywordIndexParams(
                         type="keyword",
                         is_tenant=True,
+                    ),
+                )
+            except Exception:
+                pass  # index already exists
+        for field in int_filter_fields:
+            try:
+                await self._client.create_payload_index(
+                    collection_name=name,
+                    field_name=field,
+                    field_schema=qm.IntegerIndexParams(
+                        type="integer",
+                        lookup=True,
+                        range=False,
                     ),
                 )
             except Exception:
@@ -356,36 +398,53 @@ class VectorStore:
             await self._refresh_sparse_cache(name)
             use_sparse = self._collection_has_sparse(name)
 
-        if not use_sparse:
-            # Legacy path — byte-identical to pre-hybrid behavior.
-            pts = [
-                qm.PointStruct(
-                    id=p["id"], vector=p["vector"], payload=p.get("payload", {})
-                )
-                for p in points
-            ]
-            await self._client.upsert(collection_name=name, points=pts, wait=True)
-            return
+        n_points = len(points)
+        with span(
+            "qdrant.upsert",
+            collection=name,
+            n_points=n_points,
+            vector_size=self._vector_size,
+            hybrid=use_sparse,
+        ):
+            _t = _perf_counter()
+            try:
+                if not use_sparse:
+                    # Legacy path — byte-identical to pre-hybrid behavior.
+                    pts = [
+                        qm.PointStruct(
+                            id=p["id"], vector=p["vector"], payload=p.get("payload", {})
+                        )
+                        for p in points
+                    ]
+                    await self._client.upsert(collection_name=name, points=pts, wait=True)
+                    return
 
-        # Hybrid path — pack dense under _DENSE_NAME and sparse under _SPARSE_NAME.
-        pts = []
-        for p in points:
-            vec_map: dict = {_DENSE_NAME: p["vector"]}
-            sv = p.get("sparse_vector")
-            if sv is not None:
-                indices, values = sv
-                vec_map[_SPARSE_NAME] = qm.SparseVector(indices=list(indices), values=list(values))
-            pts.append(
-                qm.PointStruct(id=p["id"], vector=vec_map, payload=p.get("payload", {}))
-            )
-        await self._client.upsert(collection_name=name, points=pts, wait=True)
+                # Hybrid path — pack dense under _DENSE_NAME and sparse under _SPARSE_NAME.
+                pts = []
+                for p in points:
+                    vec_map: dict = {_DENSE_NAME: p["vector"]}
+                    sv = p.get("sparse_vector")
+                    if sv is not None:
+                        indices, values = sv
+                        vec_map[_SPARSE_NAME] = qm.SparseVector(indices=list(indices), values=list(values))
+                    pts.append(
+                        qm.PointStruct(id=p["id"], vector=vec_map, payload=p.get("payload", {}))
+                    )
+                await self._client.upsert(collection_name=name, points=pts, wait=True)
+            finally:
+                try:
+                    qdrant_upsert_latency_seconds.observe(_perf_counter() - _t)
+                except Exception:
+                    pass
 
     @staticmethod
     def _build_filter(
         *,
         subtag_ids: Optional[list[int]] = None,
+        doc_ids: Optional[list[int]] = None,
         owner_user_id: Optional[int | str] = None,
         chat_id: Optional[int | str] = None,
+        level: Optional[str] = None,
     ) -> qm.Filter:
         """Build the standard Qdrant filter for every read path.
 
@@ -412,6 +471,16 @@ class VectorStore:
             must_conditions.append(
                 qm.FieldCondition(key="subtag_id", match=qm.MatchAny(any=subtag_ids))
             )
+        if doc_ids:
+            # Tier-2 ``specific_date`` router uses this to pin retrieval to
+            # the exact document(s) whose filename matches the date in the
+            # query. Without the filter, ranking signals can't reliably
+            # distinguish "5 Jan 2026" from "5 Feb 2026" or "4 Jan 2026"
+            # (all share the same numeric tokens in BM25 and overlap
+            # structurally in dense space on daily-reporting corpora).
+            must_conditions.append(
+                qm.FieldCondition(key="doc_id", match=qm.MatchAny(any=doc_ids))
+            )
         if owner_user_id is not None:
             match_val: int | str = owner_user_id
             if isinstance(owner_user_id, str):
@@ -435,6 +504,20 @@ class VectorStore:
         must_not_conditions = [
             qm.FieldCondition(key="deleted", match=qm.MatchValue(value=True))
         ]
+        # Tier 1 (2026-04-22): ``level`` pre-filter for the doc-summary
+        # index. ``"doc"`` → keep only summary points; ``"chunk"`` → keep
+        # only leaf chunks (summaries excluded via ``must_not`` since
+        # legacy chunks have no ``level`` field and ``MatchValue`` on
+        # missing keys rejects the point). Default ``None`` = no level
+        # constraint (byte-identical to pre-Tier-1).
+        if level == "doc":
+            must_conditions.append(
+                qm.FieldCondition(key="level", match=qm.MatchValue(value="doc"))
+            )
+        elif level == "chunk":
+            must_not_conditions.append(
+                qm.FieldCondition(key="level", match=qm.MatchValue(value="doc"))
+            )
         return qm.Filter(
             must=must_conditions or None,
             must_not=must_not_conditions,
@@ -447,8 +530,10 @@ class VectorStore:
         *,
         limit: int = 10,
         subtag_ids: Optional[list[int]] = None,
+        doc_ids: Optional[list[int]] = None,
         owner_user_id: Optional[int | str] = None,
         chat_id: Optional[int | str] = None,
+        level: Optional[str] = None,
         rescore: Optional[bool] = None,
     ) -> List[Hit]:
         """Dense-only search.
@@ -477,8 +562,10 @@ class VectorStore:
         """
         flt = self._build_filter(
             subtag_ids=subtag_ids,
+            doc_ids=doc_ids,
             owner_user_id=owner_user_id,
             chat_id=chat_id,
+            level=level,
         )
         # Warm the sparse cache lazily (cheap, cached on first call) so legacy
         # callers that only use dense still route correctly against hybrid collections.
@@ -500,7 +587,17 @@ class VectorStore:
         }
         if self._sparse_cache.get(name):
             kwargs["using"] = _DENSE_NAME
-        response = await self._client.query_points(**kwargs)
+        with span("qdrant.client.search", collection=name, limit=limit, mode="dense"):
+            _t = _perf_counter()
+            try:
+                response = await self._client.query_points(**kwargs)
+            finally:
+                try:
+                    qdrant_search_latency_seconds.labels(collection=name).observe(
+                        _perf_counter() - _t
+                    )
+                except Exception:
+                    pass
         return [Hit(id=r.id, score=r.score, payload=r.payload or {}) for r in response.points]
 
     async def hybrid_search(
@@ -511,8 +608,10 @@ class VectorStore:
         *,
         limit: int = 10,
         subtag_ids: Optional[list[int]] = None,
+        doc_ids: Optional[list[int]] = None,
         owner_user_id: Optional[int | str] = None,
         chat_id: Optional[int | str] = None,
+        level: Optional[str] = None,
         rescore: Optional[bool] = None,
     ) -> List[Hit]:
         """Server-side RRF fusion of dense + BM25 sparse results.
@@ -539,8 +638,10 @@ class VectorStore:
 
         flt = self._build_filter(
             subtag_ids=subtag_ids,
+            doc_ids=doc_ids,
             owner_user_id=owner_user_id,
             chat_id=chat_id,
+            level=level,
         )
         indices, values = embed_sparse_query(query_text)
         # P2.4 + P3.2: SearchParams carries hnsw_ef AND (when rescore is on)
@@ -562,14 +663,24 @@ class VectorStore:
                 limit=limit * 2,
             ),
         ]
-        response = await self._client.query_points(
-            collection_name=name,
-            prefetch=prefetch,
-            query=qm.FusionQuery(fusion=qm.Fusion.RRF),
-            limit=limit,
-            query_filter=flt,
-            with_payload=_PAYLOAD_FIELDS,
-        )
+        with span("qdrant.client.search", collection=name, limit=limit, mode="hybrid"):
+            _t = _perf_counter()
+            try:
+                response = await self._client.query_points(
+                    collection_name=name,
+                    prefetch=prefetch,
+                    query=qm.FusionQuery(fusion=qm.Fusion.RRF),
+                    limit=limit,
+                    query_filter=flt,
+                    with_payload=_PAYLOAD_FIELDS,
+                )
+            finally:
+                try:
+                    qdrant_search_latency_seconds.labels(collection=name).observe(
+                        _perf_counter() - _t
+                    )
+                except Exception:
+                    pass
         return [Hit(id=r.id, score=r.score, payload=r.payload or {}) for r in response.points]
 
     async def delete_by_doc(self, collection: str, doc_id: int | str) -> int:

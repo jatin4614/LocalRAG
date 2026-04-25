@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import asyncio
 import os
+from time import perf_counter
 from typing import List, Optional, Sequence
 
 from . import flags
 from .embedder import Embedder
+from .obs import span
 from .vector_store import CHAT_PRIVATE_COLLECTION, Hit, VectorStore
 
 
@@ -33,6 +35,8 @@ async def retrieve(
     per_kb_limit: int = 10,
     total_limit: int = 30,
     owner_user_id: Optional[int | str] = None,
+    level_filter: Optional[str] = None,
+    doc_ids: Optional[list[int]] = None,
 ) -> List[Hit]:
     """Run parallel searches against each selected KB and an optional chat namespace.
 
@@ -133,27 +137,67 @@ async def retrieve(
                     use_hybrid = await refresh(collection)
                 except Exception:
                     use_hybrid = False
+        _filter_summary = []
+        if subtag_ids:
+            _filter_summary.append(f"subtag_ids={list(subtag_ids)}")
+        if owner_filter is not None:
+            _filter_summary.append(f"owner={owner_filter}")
+        if chat_filter is not None:
+            _filter_summary.append(f"chat={chat_filter}")
+        _t_qd = perf_counter()
         try:
-            if use_hybrid:
-                return await vector_store.hybrid_search(
-                    collection, qvec, query,
-                    limit=per_kb_limit, subtag_ids=subtag_ids,
+            with span(
+                "qdrant.search",
+                collection=collection,
+                top_k=per_kb_limit,
+                filter=",".join(_filter_summary) or "none",
+                hybrid=use_hybrid,
+            ):
+                if use_hybrid:
+                    return await vector_store.hybrid_search(
+                        collection, qvec, query,
+                        limit=per_kb_limit, subtag_ids=subtag_ids,
+                        doc_ids=doc_ids,
+                        owner_user_id=owner_filter,
+                        chat_id=chat_filter,
+                        level=level_filter,
+                    )
+                return await vector_store.search(
+                    collection, qvec, limit=per_kb_limit, subtag_ids=subtag_ids,
+                    doc_ids=doc_ids,
                     owner_user_id=owner_filter,
                     chat_id=chat_filter,
+                    level=level_filter,
                 )
-            return await vector_store.search(
-                collection, qvec, limit=per_kb_limit, subtag_ids=subtag_ids,
-                owner_user_id=owner_filter,
-                chat_id=chat_filter,
-            )
         except Exception:
             return []
+        finally:
+            try:
+                from .metrics import qdrant_search_latency_seconds
+                qdrant_search_latency_seconds.labels(collection=collection).observe(
+                    perf_counter() - _t_qd
+                )
+            except Exception:
+                pass
 
     async def _search_kb(cfg: dict) -> List[Hit]:
         kb_id = cfg["kb_id"]
         subtag_ids = cfg.get("subtag_ids") or None
         # KB collections are shared — do NOT filter by owner_user_id.
-        return await _search_one(f"kb_{kb_id}", subtag_ids=subtag_ids)
+        hits = await _search_one(f"kb_{kb_id}", subtag_ids=subtag_ids)
+        # Tier 1/2: when level_filter is set (e.g. "doc" for global-intent
+        # queries) keep only points whose payload carries that level tag.
+        # Post-filter in Python so the default path (level_filter=None)
+        # remains byte-identical to pre-Tier-2 behaviour — no extra Qdrant
+        # filter clause, no extra round-trip. Points predating the
+        # doc-summary feature have no "level" field and are treated as
+        # chunks (level=="chunk" by convention).
+        if level_filter is not None:
+            hits = [
+                h for h in hits
+                if (h.payload.get("level") or "chunk") == level_filter
+            ]
+        return hits
 
     async def _search_chat() -> List[Hit]:
         """Read private chat docs from both chat_private (primary) AND the
