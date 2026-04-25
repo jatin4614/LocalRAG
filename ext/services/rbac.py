@@ -1,13 +1,16 @@
 """RBAC: resolve which KB ids a user is allowed to read."""
 from __future__ import annotations
 
-from typing import Any, List
+import logging
+from typing import Any, List, Optional
 
 from sqlalchemy import or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db.models import KBAccess, KnowledgeBase
 from .obs import span
+
+_logger = logging.getLogger(__name__)
 
 
 async def get_allowed_kb_ids(session: AsyncSession, *, user_id: str) -> List[int]:
@@ -63,6 +66,69 @@ async def get_allowed_kb_ids(session: AsyncSession, *, user_id: str) -> List[int
         except Exception:
             pass
         return allowed
+
+
+async def resolved_allowed_kb_ids(
+    session: AsyncSession,
+    *,
+    user_id: str,
+    redis: Optional[Any] = None,
+) -> set[int]:
+    """Cache-first wrapper around :func:`get_allowed_kb_ids`.
+
+    Mirrors the production flow used in
+    :mod:`ext.services.chat_rag_bridge._run_pipeline` so every KB-RBAC
+    call site shares one read path:
+
+    1. Look up ``rbac:user:{user_id}`` in Redis (TTL =
+       ``RAG_RBAC_CACHE_TTL_SECS``, default 30s).
+    2. Cache hit -> return immediately.
+    3. Cache miss / cache outage / corrupt value -> hit Postgres via
+       :func:`get_allowed_kb_ids`, then write the result back to the
+       cache. Cache write failure is non-fatal (next request just
+       re-fetches).
+
+    Sacred CLAUDE.md §2 invariant: the DB miss path MUST always run
+    when the cache returns ``None``. The cache is purely an
+    accelerator — never a gate that could weaken isolation under a
+    Redis outage.
+
+    Args:
+        session:  active AsyncSession for the DB-side fallback.
+        user_id:  caller's user id (string for namespace stability).
+        redis:    optional async redis handle for the cache layer. If
+                  ``None`` the cache is bypassed and we go straight to
+                  the DB — this is the "pure DB lookup" path, used by
+                  call sites that don't have a redis handle wired up
+                  yet (e.g. unit tests with a fake session).
+
+    Returns:
+        ``set[int]`` of allowed kb_ids.
+    """
+    if redis is not None:
+        try:
+            from .rbac_cache import get_shared_cache
+
+            cache = get_shared_cache(redis=redis)
+            cached = await cache.get(user_id=str(user_id))
+            if cached is not None:
+                return cached
+        except Exception as exc:  # noqa: BLE001
+            # Fail-open on cache errors: log and fall through to DB.
+            _logger.debug("rbac cache get failed: %s", exc)
+
+    allowed = set(await get_allowed_kb_ids(session, user_id=user_id))
+
+    if redis is not None:
+        try:
+            from .rbac_cache import get_shared_cache
+
+            cache = get_shared_cache(redis=redis)
+            await cache.set(user_id=str(user_id), allowed_kb_ids=allowed)
+        except Exception as exc:  # noqa: BLE001
+            _logger.debug("rbac cache set failed: %s", exc)
+
+    return allowed
 
 
 async def users_affected_by_grant(

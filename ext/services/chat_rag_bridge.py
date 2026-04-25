@@ -482,26 +482,16 @@ async def _retrieve_kb_sources_inner(
     # is never weakened by cache outage.
     selected_kbs = []
     if kb_config:
-        from .rbac import get_allowed_kb_ids
-        from .rbac_cache import get_shared_cache
-        allowed: set[int] | None = None
-        try:
-            cache = get_shared_cache(redis=_redis_client())
-            allowed = await cache.get(user_id=user_id)
-        except Exception as _cache_exc:  # noqa: BLE001
-            # Fail-open on cache errors: log and fall through to DB.
-            logger.debug("rbac cache get failed: %s", _cache_exc)
-            allowed = None
-        if allowed is None:
-            async with _sessionmaker() as s:
-                allowed = set(await get_allowed_kb_ids(s, user_id=user_id))
-            try:
-                cache = get_shared_cache(redis=_redis_client())
-                await cache.set(user_id=user_id, allowed_kb_ids=allowed)
-            except Exception as _cache_exc:  # noqa: BLE001
-                # Cache write failure is non-fatal: next request just
-                # re-fetches from the DB.
-                logger.debug("rbac cache set failed: %s", _cache_exc)
+        # Phase 1.5 — cache-first lookup via the shared helper. Both the
+        # SSE / chat path here AND ``/api/rag/retrieve`` (rag.py) call
+        # this so the cache contract is identical across surfaces. The
+        # helper itself is the source of truth for the cache namespace
+        # / TTL / fail-open semantics — see ``rbac.resolved_allowed_kb_ids``.
+        from .rbac import resolved_allowed_kb_ids
+        async with _sessionmaker() as s:
+            allowed = await resolved_allowed_kb_ids(
+                s, user_id=user_id, redis=_redis_client(),
+            )
         selected_kbs = [cfg for cfg in kb_config if cfg.get("kb_id") in allowed]
         if not selected_kbs and not chat_id:
             return []

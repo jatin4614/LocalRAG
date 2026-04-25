@@ -13,7 +13,7 @@ from ..services.auth import CurrentUser, get_current_user
 from ..services.budget import budget_chunks
 from ..services.embedder import Embedder
 from ..services.obs import span
-from ..services.rbac import get_allowed_kb_ids
+from ..services.rbac import resolved_allowed_kb_ids
 from ..services.reranker import rerank
 from ..services.retriever import retrieve
 from ..services.vector_store import VectorStore
@@ -99,7 +99,18 @@ async def rag_retrieve(
         except ValueError as e:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
 
-        allowed = set(await get_allowed_kb_ids(session, user_id=user.id))
+        # Phase 1.5 follow-up — share the RBAC cache contract with
+        # ``chat_rag_bridge._run_pipeline``. ``resolved_allowed_kb_ids``
+        # is the single helper for cache-first allowed-kb lookup; both
+        # call sites pass the same redis handle (lazy-init shared).
+        try:
+            from ..services import chat_rag_bridge as _bridge
+            _redis_h = _bridge._redis_client()
+        except Exception:  # noqa: BLE001 — fail open to DB-only path
+            _redis_h = None
+        allowed = await resolved_allowed_kb_ids(
+            session, user_id=user.id, redis=_redis_h,
+        )
         for entry in parsed:
             if entry.kb_id not in allowed:
                 try:
