@@ -299,21 +299,31 @@ def classify_with_reason(query: str) -> Tuple[Intent, str]:
 
 
 def _llm_classify(query: str) -> Tuple[Intent, str]:
-    """LLM tiebreaker — TODO stub.
+    """LLM tiebreaker — explicit not-implemented sentinel.
 
     When ``RAG_INTENT_LLM=1`` and the fast path returned ``specific``,
-    this function is called to second-guess the label. It's a deliberate
-    stub today: returns ``"specific"`` unconditionally so the LLM path is
-    byte-identical to the fast path in the default config (flag off).
+    this function is called to second-guess the label. It is **not**
+    implemented today and must NOT silently succeed: a stub returning
+    ``("specific", "llm:stub_unimplemented")`` would let an operator
+    flip the flag in production and silently degrade intent
+    classification (the LLM-tier branch would behave exactly like the
+    regex tier with no diagnostic).
 
-    To wire a real classifier later:
-      1. Build a short prompt: "Classify into metadata|global|specific: ..."
-      2. Call the chat endpoint via httpx (mirror query_rewriter.py).
-      3. Parse the label, fall open to ``specific`` on any error.
+    Plan B Phase 4 will replace this with the Qwen3-4B Query
+    Understanding LLM. Until then, the only correct behaviour for the
+    flag-on path is to fail loudly so the operator either:
+      * unsets ``RAG_INTENT_LLM`` (regex tier, current default), or
+      * waits for Plan B Phase 4 to land the real classifier.
+
+    Raises:
+        NotImplementedError: always, when ``RAG_INTENT_LLM=1``.
     """
-    # Intentionally minimal — keeps the module import-clean so the default
-    # path (flag off) never loads httpx / chat endpoint config.
-    return "specific", "llm:stub_unimplemented"
+    raise NotImplementedError(
+        "RAG_INTENT_LLM is set but _llm_classify is not implemented. "
+        "Plan B Phase 4 will replace this with the Qwen3-4B Query "
+        "Understanding LLM. Unset RAG_INTENT_LLM to use the regex "
+        "classifier."
+    )
 
 
 __all__ = ["Intent", "classify", "classify_with_reason", "extract_date_tuple"]
