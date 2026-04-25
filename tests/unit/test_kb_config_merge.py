@@ -103,6 +103,14 @@ def test_merge_all_valid_keys():
         # P3.3
         "hyde": True,
         "hyde_n": 3,
+        # Phase 1a per-KB chunking + Phase 3.3 short-form contextualize gate.
+        "chunk_tokens": 800,
+        "overlap_tokens": 100,
+        "contextualize": True,
+        # Tier 1/2 doc-summary + intent-router gates.
+        "doc_summaries": True,
+        "intent_routing": True,
+        "intent_llm": True,
     }
     out = merge_configs([cfg])
     for key in VALID_KEYS:
@@ -210,9 +218,23 @@ def test_validate_drops_uncoerceable_float():
 
 
 def test_validate_accepts_all_whitelisted_keys():
-    raw = {key: (True if key in {"rerank", "mmr", "context_expand", "spotlight",
-                                 "semcache", "contextualize_on_ingest"}
-                 else 1 if key in {"rerank_top_k", "context_expand_window"}
+    # Per-key sample value. Bool keys → True; int keys → in-range int (chunk
+    # bounds are 100-2000, overlap 0-1000); float keys → 0.5. Ensures every
+    # whitelisted key is accepted by validate_config without being dropped.
+    _bool_keys = {
+        "rerank", "mmr", "context_expand", "spotlight", "semcache",
+        "contextualize_on_ingest", "contextualize", "hyde",
+        "doc_summaries", "intent_routing", "intent_llm",
+    }
+    _int_sample = {
+        "rerank_top_k": 30,
+        "context_expand_window": 2,
+        "hyde_n": 3,
+        "chunk_tokens": 800,
+        "overlap_tokens": 100,
+    }
+    raw = {key: (True if key in _bool_keys
+                 else _int_sample[key] if key in _int_sample
                  else 0.5)
            for key in VALID_KEYS}
     out = validate_config(raw)
