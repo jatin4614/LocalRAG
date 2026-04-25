@@ -322,9 +322,154 @@ async def contextualize_batch(
     return await asyncio.gather(*(_one(ct, dt) for ct, dt in pairs))
 
 
+async def _chat_call(
+    messages: list[dict[str, str]],
+    *,
+    chat_url: Optional[str] = None,
+    chat_model: Optional[str] = None,
+    api_key: Optional[str] = None,
+    timeout_s: float = 10.0,
+    max_tokens: int = 96,
+    transport: Optional[httpx.AsyncBaseTransport] = None,
+) -> str:
+    """Send ``messages`` to the chat endpoint and return the assistant content.
+
+    Thin wrapper over ``_contextualize_call`` that returns just the content
+    string instead of the full chat-completions JSON. Preserves the existing
+    OTel/retry/telemetry on ``_contextualize_call`` (we delegate to it) so
+    operators still see prompt/completion token counts per request.
+
+    Designed as a module-level seam for ``contextualize_chunks_with_prefix``
+    — the test suite patches ``ext.services.contextualizer._chat_call`` to
+    inject canned LLM responses without standing up an httpx transport.
+
+    Returns the raw assistant content (untrimmed). Caller is responsible
+    for empty / oversized handling and prefix-strip semantics.
+    """
+    resolved_url = chat_url or os.environ.get("OPENAI_API_BASE_URL") or ""
+    resolved_model = chat_model or os.environ.get("CHAT_MODEL", "orgchat-chat")
+    body = {
+        "model": resolved_model,
+        "messages": messages,
+        "temperature": 0.0,
+        "max_tokens": max_tokens,
+    }
+    headers = {"Content-Type": "application/json"}
+    if api_key is None:
+        api_key = os.environ.get("OPENAI_API_KEY")
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    url = f"{resolved_url.rstrip('/')}/chat/completions"
+    data = await _contextualize_call(url, body, headers, timeout_s, transport)
+    return data["choices"][0]["message"]["content"] or ""
+
+
+async def contextualize_chunks_with_prefix(
+    chunks: list[dict],
+    *,
+    document_text: str,
+    document_metadata: dict[str, Any],
+    chat_url: Optional[str] = None,
+    chat_model: Optional[str] = None,
+    api_key: Optional[str] = None,
+    concurrency: int = 8,
+    timeout_s: float = 10.0,
+    transport: Optional[httpx.AsyncBaseTransport] = None,
+) -> list[dict]:
+    """Augment each chunk dict with a separate ``context_prefix`` field.
+
+    Phase-3.2 evolution of ``contextualize_batch``: instead of returning a
+    list of concatenated strings (which throws away the prefix as its own
+    datum), this mutates each chunk dict to carry BOTH the LLM-generated
+    prefix (``chunk["context_prefix"]``) AND the concatenated text
+    (``chunk["text"] = f"{prefix}\\n\\n{original}"``). This lets us
+    regenerate prefixes later — e.g. after a prompt tweak or model upgrade
+    — without re-embedding the originals, and lets retrieval / debugging
+    tooling reason about the prefix independently of the chunk body.
+
+    Fail-open per chunk: on any LLM error (timeout, 5xx, oversized reply,
+    schema mismatch) we leave the chunk's ``text`` unchanged and set
+    ``context_prefix=None``. A bad context pass is never worse than no
+    context pass — augmentation is best-effort, ingest never crashes
+    because the chat endpoint hiccupped on one chunk.
+
+    Args:
+        chunks: list of chunk dicts. Each must have a ``text`` field;
+            the caller may pre-seed ``context_prefix=None`` (the
+            test contract) but the function ignores any prior value.
+        document_text: full document text passed into the cache-friendly
+            prompt builder so vllm-chat's automatic prefix caching can
+            reuse the doc-level KV cache across sibling chunks.
+        document_metadata: dict carrying ``filename``, ``kb_name``,
+            ``subtag_name``, ``document_date``, ``related_doc_titles``.
+            Forwarded to ``build_contextualize_prompt`` — see that
+            function for the optional-fields contract.
+        Other args: forwarded to the chat call.
+
+    Returns:
+        The same list of chunk dicts, mutated in place. Each chunk has
+        ``context_prefix`` set (str on success, None on failure) and its
+        ``text`` updated to ``f"{prefix}\\n\\n{original_text}"`` on
+        success (unchanged on failure).
+    """
+    import asyncio  # local import — only needed when contextualization is enabled
+
+    if not chunks:
+        return chunks
+
+    sem = asyncio.Semaphore(max(1, concurrency))
+
+    async def _one(chunk: dict) -> None:
+        original_text = chunk.get("text") or ""
+        if not original_text:
+            chunk["context_prefix"] = None
+            return
+        clipped = original_text[:_MAX_CHUNK_CHARS]
+        messages = build_contextualize_prompt(
+            document_text=document_text,
+            chunk_text=clipped,
+            document_metadata=document_metadata,
+        )
+        async with sem:
+            try:
+                content = await _chat_call(
+                    messages,
+                    chat_url=chat_url,
+                    chat_model=chat_model,
+                    api_key=api_key,
+                    timeout_s=timeout_s,
+                    transport=transport,
+                )
+            except Exception as e:  # noqa: BLE001 — fail-open per chunk
+                log.debug("contextualize_with_prefix failed for chunk, keeping raw: %s", e)
+                chunk["context_prefix"] = None
+                return
+
+        prefix = (content or "").strip()
+        # Empty / oversized → fall open. Same guards as the legacy path.
+        if not prefix or len(prefix) > _MAX_CONTEXT_CHARS:
+            chunk["context_prefix"] = None
+            return
+        # Strip canonical echo prefixes the model emits despite instructions.
+        for echo in _ECHO_PREFIXES:
+            if prefix.lower().startswith(echo.lower()):
+                prefix = prefix[len(echo):].strip()
+                break
+        if not prefix:
+            chunk["context_prefix"] = None
+            return
+
+        chunk["context_prefix"] = prefix
+        chunk["text"] = f"{prefix}\n\n{original_text}"
+
+    await asyncio.gather(*(_one(c) for c in chunks))
+    return chunks
+
+
 __all__ = [
     "build_contextualize_prompt",
     "contextualize_chunk",
     "contextualize_batch",
+    "contextualize_chunks_with_prefix",
     "is_enabled",
 ]

@@ -111,6 +111,81 @@ async def _maybe_contextualize_chunks(
 _POINT_NS = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
 
 
+def build_point_payload(
+    *,
+    kb_id: int,
+    doc_id: int | None,
+    subtag_id: int | None,
+    filename: str,
+    owner_user_id: str,
+    chunk_meta: Mapping[str, object],
+    chat_id: str | None = None,
+    level: str = "chunk",
+) -> dict:
+    """Return the canonical Qdrant payload dict for one point.
+
+    Centralizes payload construction so the upsert loop in ``ingest_bytes``
+    (and any future callers — eval harness, repair scripts) all produce
+    payloads with the same shape and the same field set as
+    ``ext/db/qdrant_schema.py``'s ``canonical_payload_schema``. Phase 3.2
+    adds the ``context_prefix`` field; centralizing means the next field
+    addition only changes one spot.
+
+    The function is pure: no I/O, no mutation of inputs. The caller
+    attaches the vector + sparse_vector and computes the point ID
+    separately — vectors are large and shouldn't round-trip through this
+    helper, and point IDs depend on the caller's deterministic scheme.
+
+    Args:
+        kb_id: knowledge-base ID this point belongs to.
+        doc_id: ``kb_documents.id`` for KB uploads, or ``None`` for
+            ephemeral chat-scoped uploads (in which case ``chat_id``
+            must be set).
+        subtag_id: optional ``kb_subtags.id`` (None → unfiled in KB).
+        filename: original filename — surfaced at retrieval time for
+            citations and KB catalog rendering.
+        owner_user_id: principal who owns this point. RBAC filters use
+            this for chat-scoped (private) uploads.
+        chunk_meta: dict carrying per-chunk fields. Required keys:
+            ``text``, ``chunk_index``. Optional keys (all canonical):
+            ``context_prefix``, ``page``, ``heading_path``, ``sheet``,
+            ``uploaded_at``, ``deleted``, ``model_version``,
+            ``chunk_level``, ``source_chunk_ids``, ``kind``.
+        chat_id: chat namespace for ephemeral uploads; mutually
+            exclusive with ``doc_id`` for KB uploads but the schema
+            tolerates both being present (filters key off doc_id when set).
+        level: 'chunk' (default) for chunk-level points or 'doc' for
+            tier-1 doc-summary points.
+
+    Returns:
+        Dict matching the canonical Qdrant payload shape, including the
+        ``context_prefix`` field (None when no prefix was generated).
+    """
+    payload: dict = {
+        "kb_id": kb_id,
+        "doc_id": doc_id,
+        "subtag_id": subtag_id,
+        "owner_user_id": owner_user_id,
+        "chat_id": chat_id,
+        "filename": filename,
+        "level": level,
+        "chunk_index": chunk_meta.get("chunk_index"),
+        "text": chunk_meta.get("text"),
+        "context_prefix": chunk_meta.get("context_prefix"),
+        "page": chunk_meta.get("page"),
+        "heading_path": list(chunk_meta.get("heading_path") or []),
+        "sheet": chunk_meta.get("sheet"),
+    }
+    # Optional canonical fields — only stamp when the caller provided them
+    # so callers that don't compute these (tests, simple repair scripts)
+    # produce minimal but still-valid payloads.
+    for k in ("uploaded_at", "deleted", "model_version", "chunk_level",
+              "source_chunk_ids", "kind"):
+        if k in chunk_meta:
+            payload[k] = chunk_meta[k]
+    return payload
+
+
 async def ingest_bytes(
     *,
     data: bytes,
@@ -230,6 +305,33 @@ async def ingest_bytes(
         except Exception:  # noqa: BLE001 — fail-open
             tree_nodes = None
 
+    # Identity fields used by build_point_payload — extracted once. We tolerate
+    # legacy callers that pass kb_id/subtag_id as None or omit them entirely
+    # (e.g. private-chat ingest where chat_id is the routing key).
+    pb_kb_id = payload_base.get("kb_id")  # type: ignore[union-attr]
+    pb_subtag_id = payload_base.get("subtag_id")  # type: ignore[union-attr]
+    pb_owner = payload_base.get("owner_user_id")  # type: ignore[union-attr]
+    pb_filename = payload_base.get("filename") or filename
+    # Pull any extra payload_base fields that aren't part of the canonical
+    # build_point_payload signature so we preserve them on the way out
+    # (forward-compat: routers / scripts may stamp custom fields and the
+    # legacy code path used to carry them via ``dict(payload_base)``).
+    _CANONICAL_KEYS = {
+        "kb_id", "subtag_id", "doc_id", "owner_user_id", "chat_id", "filename",
+    }
+    extra_payload_fields = {
+        k: v for k, v in dict(payload_base).items() if k not in _CANONICAL_KEYS
+    }
+    # Preserve the legacy "lift forward only what was provided" contract:
+    # if payload_base did NOT carry a given identity key, the resulting
+    # payload should not stamp it either (private-chat ingest historically
+    # produced payloads without ``doc_id``; ingest_bytes callers depend on
+    # that — see ``test_doc_id_coercion.test_missing_doc_id_does_not_crash``).
+    _absent_identity_keys = tuple(
+        k for k in ("doc_id", "subtag_id", "kb_id", "chat_id", "owner_user_id")
+        if k not in payload_base  # type: ignore[operator]
+    )
+
     points = []
     if tree_nodes:
         # Tree-node path: one point per RAPTOR node (leaves + summaries).
@@ -241,24 +343,45 @@ async def ingest_bytes(
         for nidx, node in enumerate(tree_nodes):
             if node.embedding is None:
                 continue  # build_tree couldn't embed this summary — skip
-            payload = dict(payload_base)
-            payload["chunk_index"] = nidx
-            payload["text"] = node.text
-            payload["uploaded_at"] = now
-            payload["deleted"] = False
-            payload["model_version"] = pv
-            payload["chunk_level"] = int(node.level)
-            payload["source_chunk_ids"] = list(node.source_chunk_ids)
             if node.level == 0 and nidx < len(paired):
                 # Leaf: inherit the source block's structural metadata.
-                _chunk, block = paired[nidx]
-                payload["page"] = block.page
-                payload["heading_path"] = list(block.heading_path)
-                payload["sheet"] = block.sheet
+                src_chunk, block = paired[nidx]
+                page = block.page
+                heading_path = list(block.heading_path)
+                sheet = block.sheet
+                # Source chunk's context_prefix (set by contextualize_chunks_with_prefix
+                # when contextual augmentation ran). Frozen-dataclass chunks may not
+                # carry this attribute — getattr with default keeps the default-off
+                # path byte-identical (no context_prefix in payload at all when None).
+                ctx_prefix = getattr(src_chunk, "context_prefix", None)
             else:
-                payload["page"] = None
-                payload["heading_path"] = []
-                payload["sheet"] = None
+                page = None
+                heading_path = []
+                sheet = None
+                ctx_prefix = None
+            chunk_meta: dict = {
+                "chunk_index": nidx,
+                "text": node.text,
+                "context_prefix": ctx_prefix,
+                "page": page,
+                "heading_path": heading_path,
+                "sheet": sheet,
+                "uploaded_at": now,
+                "deleted": False,
+                "model_version": pv,
+                "chunk_level": int(node.level),
+                "source_chunk_ids": list(node.source_chunk_ids),
+            }
+            payload = build_point_payload(
+                kb_id=pb_kb_id, doc_id=doc_id, subtag_id=pb_subtag_id,
+                filename=pb_filename, owner_user_id=pb_owner,
+                chunk_meta=chunk_meta, chat_id=chat_id, level="chunk",
+            )
+            # Re-stamp any extra payload_base fields (forward-compat for
+            # custom payloads we don't recognize in the canonical schema).
+            payload.update(extra_payload_fields)
+            for k in _absent_identity_keys:
+                payload.pop(k, None)
 
             if doc_id is not None:
                 id_seed = f"doc:{doc_id}:chunk:{nidx}"
@@ -277,16 +400,25 @@ async def ingest_bytes(
             points.append(point)
     else:
         for gidx, ((chunk, block), vec) in enumerate(zip(paired, vectors)):
-            payload = dict(payload_base)
-            payload["chunk_index"] = gidx
-            payload["text"] = chunk.text
-            payload["uploaded_at"] = now
-            payload["deleted"] = False
-            # Structural metadata from the source block (may be None / []).
-            payload["page"] = block.page
-            payload["heading_path"] = list(block.heading_path)
-            payload["sheet"] = block.sheet
-            payload["model_version"] = pv
+            chunk_meta = {
+                "chunk_index": gidx,
+                "text": chunk.text,
+                "context_prefix": getattr(chunk, "context_prefix", None),
+                "page": block.page,
+                "heading_path": list(block.heading_path),
+                "sheet": block.sheet,
+                "uploaded_at": now,
+                "deleted": False,
+                "model_version": pv,
+            }
+            payload = build_point_payload(
+                kb_id=pb_kb_id, doc_id=doc_id, subtag_id=pb_subtag_id,
+                filename=pb_filename, owner_user_id=pb_owner,
+                chunk_meta=chunk_meta, chat_id=chat_id, level="chunk",
+            )
+            payload.update(extra_payload_fields)
+            for k in _absent_identity_keys:
+                payload.pop(k, None)
 
             # Deterministic point ID: same doc + global chunk index always maps
             # to the same Qdrant point. This lets delete_by_doc reconstruct point
