@@ -62,6 +62,22 @@ def build_app() -> FastAPI:
     # misconfigured deploy fails loudly at startup, not on first chat.
     preflight_tokenizer()
 
+    # Phase 1.2 — reranker preload. Loading on first request blocks that
+    # request for ~3-5s on GPU cold start. Preloading at app init shifts
+    # the cost to startup time and surfaces load failures before user
+    # traffic hits. Non-fatal: reranker fails open to heuristic.
+    import os as _os
+    if _os.environ.get("RAG_RERANK", "0") == "1":
+        try:
+            from ext.services.cross_encoder_reranker import get_model
+            get_model()
+        except Exception as exc:
+            _logger.error(
+                "reranker preload failed (%s: %s) — feature will fail open. "
+                "Check GPU 1 VRAM and RAG_RERANK_MODEL cache.",
+                type(exc).__name__, exc,
+            )
+
     @app.get("/healthz")
     async def healthz():
         return {"status": "ok"}
@@ -107,6 +123,21 @@ def build_ext_routers():
     # explicit non-cl100k HF alias can't load, raise here so the upstream
     # process exits at import time instead of silently drifting budgets.
     preflight_tokenizer()
+
+    # Phase 1.2 — reranker preload (mirrors build_app). Surface model load
+    # failures at upstream startup, not on first user query. Non-fatal:
+    # reranker fails open to heuristic if the load doesn't recover.
+    import os as _os
+    if _os.environ.get("RAG_RERANK", "0") == "1":
+        try:
+            from ext.services.cross_encoder_reranker import get_model
+            get_model()
+        except Exception as exc:
+            _logger.error(
+                "reranker preload failed (%s: %s) — feature will fail open. "
+                "Check GPU 1 VRAM and RAG_RERANK_MODEL cache.",
+                type(exc).__name__, exc,
+            )
 
     # Prom `/metrics` collides with upstream Svelte SPA catch-all — expose
     # on a dedicated in-container port (9464) for Prometheus scrape.
