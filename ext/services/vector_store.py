@@ -529,6 +529,44 @@ class VectorStore:
             return False
         return cb_cache.get(name, False)
 
+    async def collection_has_vector(
+        self, collection: str, vector_name: str
+    ) -> bool:
+        """Check if a collection has a specific named vector slot. Cached 60s.
+
+        Generic counterpart to ``_collection_has_sparse`` /
+        ``_collection_has_colbert`` that doesn't hard-code a slot name —
+        used by the read path (Phase 3.5) to gate the optional ColBERT
+        arm of tri-fusion per collection. Fail-closed (returns False)
+        when the collection doesn't exist OR the lookup raises, so the
+        caller silently skips the extra retrieval arm rather than
+        crashing the whole search.
+
+        The cache is keyed by ``(collection, vector_name)`` and entries
+        expire after 60s — short enough that an admin who just ran
+        ``scripts/enable_colbert.py`` on a previously-legacy collection
+        sees the new slot within a minute, long enough that this lookup
+        adds no measurable per-query overhead under steady load.
+        """
+        cache = getattr(self, "_named_vec_cache", {})
+        key = (collection, vector_name)
+        now = _time.monotonic()
+        if key in cache and now - cache[key][0] < 60.0:
+            return cache[key][1]
+        try:
+            info = await self._client.get_collection(collection)
+            params = info.config.params if info and info.config else None
+            vectors = getattr(params, "vectors", None) if params is not None else None
+            # Named-vector form is dict[name, VectorParams]; legacy single-
+            # unnamed-vector form returns a bare VectorParams (no membership
+            # test). Only the dict form can carry an extra named slot.
+            ok = isinstance(vectors, dict) and vector_name in vectors
+        except Exception:
+            ok = False
+        cache[key] = (now, ok)
+        self._named_vec_cache = cache
+        return ok
+
     async def upsert(self, name: str, points: Iterable[dict]) -> None:
         """Upsert points. Each point may carry ``sparse_vector: (indices, values)``.
 
@@ -809,7 +847,7 @@ class VectorStore:
         level: Optional[str] = None,
         rescore: Optional[bool] = None,
     ) -> List[Hit]:
-        """Server-side RRF fusion of dense + BM25 sparse results.
+        """Server-side RRF fusion of dense + BM25 sparse (+ optional ColBERT) results.
 
         Only valid for collections created with ``ensure_collection(..., with_sparse=True)``.
         Uses Qdrant's ``query_points`` with two ``Prefetch`` arms (dense + sparse)
@@ -828,6 +866,15 @@ class VectorStore:
         search is rescored against the original fp32 vectors. The sparse
         (BM25) arm has no vectors and ignores the hint. Default follows the
         ``RAG_QDRANT_RESCORE`` env knob.
+
+        P3.5 (tri-fusion): when ``RAG_COLBERT=1`` AND the collection has the
+        named ``colbert`` vector slot (checked via ``collection_has_vector``,
+        cached 60s), a third Prefetch arm is added that queries the ColBERT
+        multi-vector slot using ``MAX_SIM`` late interaction. The outer
+        ``FusionQuery(RRF)`` then fuses all three arms server-side — same RRF
+        formula, one extra round-trip avoided. Default-off:
+        ``RAG_COLBERT=0`` OR a collection without the slot keeps the
+        two-arm dense+sparse path byte-identical to pre-P3.5.
         """
         from .sparse_embedder import embed_sparse_query
 
@@ -858,6 +905,33 @@ class VectorStore:
                 limit=limit * 2,
             ),
         ]
+        # P3.5: third arm — ColBERT late-interaction multi-vector query.
+        # Gated behind BOTH the env flag AND the per-collection slot check
+        # so a collection that pre-dates Task 3.4 silently falls back to the
+        # two-arm dense+sparse path (no Qdrant error from querying a missing
+        # named vector). The flag check first short-circuits before any
+        # network call when ColBERT is process-wide off.
+        if _env_bool("RAG_COLBERT", False) and await self.collection_has_vector(
+            name, _COLBERT_NAME
+        ):
+            try:
+                from .embedder import colbert_embed
+                colbert_vecs = colbert_embed([query_text])
+                if colbert_vecs and colbert_vecs[0]:
+                    prefetch.append(
+                        qm.Prefetch(
+                            query=colbert_vecs[0],
+                            using=_COLBERT_NAME,
+                            filter=flt,
+                            limit=limit * 2,
+                        )
+                    )
+            except Exception:
+                # Embedder failure (model not cached, ONNX runtime issue,
+                # fastembed not installed) → fall back to the two-arm path
+                # rather than break the whole search. Operators see this in
+                # the qdrant.client.search span trace.
+                pass
         # Phase 1.3: per-collection circuit breaker — hybrid path mirrors the
         # dense ``search`` path. Same trip rules: only transport errors count.
         cb = breaker_for(f"qdrant:{name}")

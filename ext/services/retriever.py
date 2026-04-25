@@ -19,6 +19,36 @@ from .vector_store import CHAT_PRIVATE_COLLECTION, Hit, VectorStore
 RRF_K = 60
 
 
+def rrf_fuse_heads(
+    heads: list[list[tuple[str, int]]],
+    *,
+    k: int = 60,
+    top_k: int,
+) -> list[tuple[str, float]]:
+    """Reciprocal Rank Fusion across multiple retrieval heads.
+
+    Each head is a list of ``(doc_id, rank)`` tuples (rank is 0-indexed
+    within that head). The fused score for a doc is::
+
+        score(doc) = Σ_heads 1 / (k + rank + 1)
+
+    Missing from a head → no contribution from that head (this is what
+    makes RRF degrade gracefully when one arm — e.g. ColBERT on a legacy
+    collection — returns empty: the fusion still ranks the remaining
+    arms correctly).
+
+    Used by the per-KB search path (Phase 3.5 tri-fusion) to combine
+    dense + sparse + ColBERT result lists when ``RAG_COLBERT=1`` AND the
+    collection has the named ``colbert`` vector slot. Pure function — no
+    Qdrant or model dependencies, fully unit-testable.
+    """
+    scores: dict[str, float] = {}
+    for head in heads:
+        for doc_id, rank in head:
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank + 1)
+    return sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
+
+
 def _field(h: Any, key: str, default: Any = None) -> Any:
     """Read a field from either a plain dict (test fixtures) or a ``Hit``
     dataclass (production). For ``Hit`` objects, ``score`` and ``id`` are
