@@ -238,6 +238,26 @@ tokenizer_fallback_total = Counter(
 )
 
 # -----------------------------------------------------------------------
+# Phase 2.1 — Spotlighting wrap counter.
+#
+# Incremented once per call to ``ext.services.spotlight.wrap_chunks`` (or
+# ``wrap_context``) that actually produces a wrapped payload. Lets
+# operators verify the flag is on in production (a flat zero line means
+# Spotlight isn't running on the hot path) and trend per-request volume.
+#
+# No labels: the wrap call site is intentionally minimal — KB-level
+# attribution can be derived from ``rag_retrieval_hits_total`` joined on
+# request timestamp. Adding labels here would explode cardinality without
+# materially helping debugging.
+# -----------------------------------------------------------------------
+spotlight_wrapped_total = Counter(
+    f"{_NS}_spotlight_wrapped_total",
+    "Number of retrieved chunks (or context blobs) wrapped with Spotlight "
+    "untrusted-content tags. Increments once per wrap call when Spotlight "
+    "is enabled.",
+)
+
+# -----------------------------------------------------------------------
 # Phase 4 observability: KB health drift + scheduled eval gauges.
 #
 # ``rag_kb_drift_pct`` — per-KB percentage divergence between the

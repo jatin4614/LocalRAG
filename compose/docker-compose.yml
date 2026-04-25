@@ -298,6 +298,12 @@ services:
       CHUNK_OVERLAP: ${CHUNK_OVERLAP:-100}
       RAG_FILE_MAX_SIZE: ${RAG_FILE_MAX_SIZE:-26214400}
       RAG_FILE_MAX_COUNT: ${RAG_FILE_MAX_COUNT:-10}
+      # Phase 2.1 — Spotlighting (indirect prompt-injection defense) is now
+      # default-on. Wraps every retrieved chunk in <UNTRUSTED_RETRIEVED_CONTENT>
+      # tags and instructs the model to treat the payload as data only.
+      # See ext/services/spotlight.py and tests/unit/test_spotlight_default.py.
+      # Override via RAG_SPOTLIGHT=0 in the deploy env to disable.
+      RAG_SPOTLIGHT: ${RAG_SPOTLIGHT:-1}
       # Auto-inject current date/time as a pseudo-source on every retrieval so
       # the chat model can answer "what day is it?" without hallucinating from
       # its training cutoff. Toggle with RAG_INJECT_DATETIME=0 to disable.
