@@ -50,8 +50,11 @@ async def engine(pg):
     eng = create_async_engine(url)
     async with eng.begin() as conn:
         await _raw_exec(conn, """
+            DROP VIEW IF EXISTS chat CASCADE;
+            DROP VIEW IF EXISTS group_member CASCADE;
+            DROP VIEW IF EXISTS "user" CASCADE;
             DROP TABLE IF EXISTS kb_access, kb_documents, kb_subtags, knowledge_bases CASCADE;
-            DROP TABLE IF EXISTS chat, chats, user_groups, users, groups CASCADE;
+            DROP TABLE IF EXISTS chats, user_groups, users, groups CASCADE;
             CREATE TABLE users (
               id BIGSERIAL PRIMARY KEY,
               email TEXT UNIQUE NOT NULL,
@@ -109,6 +112,32 @@ async def engine(pg):
             ALTER TABLE kb_access
               ALTER COLUMN group_id TYPE TEXT USING group_id::text;
         """)
+        # Upstream Open WebUI uses singular ``"user"`` and
+        # ``group_member`` table names with UUID-keyed ids;
+        # ``ext.services.rbac.get_allowed_kb_ids`` queries them
+        # directly via raw SQL. Test conftest seeds the legacy
+        # plural ``users`` / ``user_groups`` tables — expose them
+        # under the upstream names via VIEWs (cast id to text so
+        # the UUID-string contract is preserved) so the rbac code
+        # path runs without modification.
+        await _raw_exec(conn, '''
+            DROP VIEW IF EXISTS group_member CASCADE;
+            DROP VIEW IF EXISTS "user" CASCADE;
+            DROP VIEW IF EXISTS chat CASCADE;
+            CREATE VIEW "user" AS
+              SELECT id::text AS id, email, role, password_hash
+              FROM users;
+            CREATE VIEW group_member AS
+              SELECT user_id::text AS user_id, group_id::text AS group_id
+              FROM user_groups;
+            -- Upstream's chat table is singular and uses TEXT ids
+            -- (chat_id from upstream is a UUID-string). Wrap the
+            -- legacy plural ``chats`` table so the rag bridge's
+            -- ``SELECT user_id FROM chat WHERE id = :cid`` works.
+            CREATE VIEW chat AS
+              SELECT id::text AS id, user_id::text AS user_id, title, created_at
+              FROM chats;
+        ''')
     yield eng
     await eng.dispose()
 
