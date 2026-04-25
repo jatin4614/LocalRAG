@@ -1,10 +1,20 @@
-"""Unit tests for ``is_tenant=True`` payload-index wiring in VectorStore.
+"""Unit tests for payload-index wiring in VectorStore.
 
-Qdrant 1.11+ treats keyword fields marked with ``is_tenant=True`` as the
-tenant-partitioning boundary. We assert that ``ensure_collection`` registers
-``kb_id`` / ``chat_id`` / ``owner_user_id`` with that flag and leaves
-``subtag_id`` / ``doc_id`` / ``deleted`` as plain KEYWORD (within-tenant
-filters — the tenant marker would only waste memory there).
+Field-by-field expectations (matches ``ensure_collection`` in
+``ext/services/vector_store.py``):
+
+* True tenants (string UUIDs): ``chat_id``, ``owner_user_id`` →
+  ``KeywordIndexParams(is_tenant=True)``. Qdrant 1.11+'s filtered-HNSW
+  tenant optimisation only applies to keyword indexes, so these stay
+  keyword + tenant.
+* Int filter fields: ``kb_id``, ``subtag_id``, ``doc_id`` →
+  ``IntegerIndexParams(type="integer", lookup=True, range=False)``. They
+  used to be KeywordIndexParams (with ``kb_id`` flagged is_tenant) but a
+  WIP commit moved them to IntegerIndexParams because the underlying
+  payload values are autoincrement Postgres PKs (ints) — a keyword index
+  over int values silently indexes nothing, which had caused
+  ``payload_schema.kb_id.points=0`` on all KB collections.
+* Bool/enum filter fields: ``deleted`` → ``PayloadSchemaType.KEYWORD``.
 
 No real Qdrant — ``AsyncQdrantClient`` is mocked.
 """
@@ -30,7 +40,12 @@ def _make_vs() -> VectorStore:
 
 @pytest.mark.asyncio
 async def test_ensure_collection_marks_tenant_fields_with_is_tenant() -> None:
-    """kb_id / chat_id / owner_user_id → KeywordIndexParams(is_tenant=True)."""
+    """chat_id / owner_user_id → KeywordIndexParams(is_tenant=True).
+
+    Note: ``kb_id`` is no longer in this set — it's an int field now and
+    uses ``IntegerIndexParams`` (see _keeps_integer_indexed_fields below).
+    The is_tenant tenant-partitioning hint only applies to keyword indexes.
+    """
     vs = _make_vs()
     vs._client.create_collection = AsyncMock()
     vs._client.create_payload_index = AsyncMock()
@@ -45,8 +60,8 @@ async def test_ensure_collection_marks_tenant_fields_with_is_tenant() -> None:
         kwargs = call.kwargs
         by_field[kwargs["field_name"]] = kwargs["field_schema"]
 
-    # Tenant fields must carry is_tenant=True via KeywordIndexParams.
-    for field in ("kb_id", "chat_id", "owner_user_id"):
+    # True keyword tenants (UUID strings) must carry is_tenant=True.
+    for field in ("chat_id", "owner_user_id"):
         schema = by_field.get(field)
         assert isinstance(
             schema, qm.KeywordIndexParams
@@ -60,8 +75,13 @@ async def test_ensure_collection_marks_tenant_fields_with_is_tenant() -> None:
 
 
 @pytest.mark.asyncio
-async def test_ensure_collection_keeps_filter_fields_plain_keyword() -> None:
-    """subtag_id / doc_id / deleted → PayloadSchemaType.KEYWORD (no tenant flag)."""
+async def test_ensure_collection_keeps_int_filter_fields_indexed_as_integer() -> None:
+    """kb_id / subtag_id / doc_id → IntegerIndexParams(lookup=True, range=False).
+
+    Underlying payload values are Postgres autoincrement PKs (ints).
+    A keyword index over int values silently indexes nothing — the WIP
+    commit moved these to IntegerIndexParams to fix that bug.
+    """
     vs = _make_vs()
     vs._client.create_collection = AsyncMock()
     vs._client.create_payload_index = AsyncMock()
@@ -73,7 +93,31 @@ async def test_ensure_collection_keeps_filter_fields_plain_keyword() -> None:
         for c in vs._client.create_payload_index.await_args_list
     }
 
-    for field in ("subtag_id", "doc_id", "deleted"):
+    for field in ("kb_id", "subtag_id", "doc_id"):
+        schema = by_field.get(field)
+        assert isinstance(
+            schema, qm.IntegerIndexParams
+        ), f"{field} must use IntegerIndexParams, got {type(schema).__name__}"
+        assert schema.lookup is True, f"{field} must enable lookup index"
+        # range=False — these are pure equality filters, not range queries.
+        assert schema.range is False, f"{field} must disable range index"
+
+
+@pytest.mark.asyncio
+async def test_ensure_collection_keeps_filter_fields_plain_keyword() -> None:
+    """deleted → PayloadSchemaType.KEYWORD (no tenant flag, bool-ish enum)."""
+    vs = _make_vs()
+    vs._client.create_collection = AsyncMock()
+    vs._client.create_payload_index = AsyncMock()
+
+    await vs.ensure_collection("kb_99")
+
+    by_field = {
+        c.kwargs["field_name"]: c.kwargs["field_schema"]
+        for c in vs._client.create_payload_index.await_args_list
+    }
+
+    for field in ("deleted",):
         schema = by_field.get(field)
         assert schema == qm.PayloadSchemaType.KEYWORD, (
             f"{field} must stay plain KEYWORD, got {schema!r}"

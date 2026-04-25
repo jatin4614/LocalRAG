@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import os
+import time as _time
 import uuid
 from dataclasses import dataclass
 from typing import Iterable, List, Optional
 
+import httpx
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http import models as qm
 
+from .circuit_breaker import CircuitOpenError, breaker_for
 from .metrics import qdrant_search_latency_seconds, qdrant_upsert_latency_seconds
 from .obs import span
 from time import perf_counter as _perf_counter
@@ -151,6 +154,14 @@ _PAYLOAD_FIELDS = [
 # so ``_DENSE_NAME`` is *only* used on hybrid-enabled collections.
 _DENSE_NAME = "dense"
 _SPARSE_NAME = "bm25"
+# P3.4 ColBERT multi-vector slot. Per-token 128-dim vectors with
+# ``MultiVectorConfig(MAX_SIM)``. Only created when the collection is
+# explicitly opt-in via ``ensure_collection(..., with_colbert=True)`` or
+# the ``RAG_COLBERT=1`` env switch — Qdrant requires the named slot to
+# exist before any upsert can target it. Read-side fusion (Task 3.5)
+# will use ``using=_COLBERT_NAME`` against the same slot.
+_COLBERT_NAME = "colbert"
+_COLBERT_DIM = 128
 
 
 # P2.3: Single consolidated collection for all private chat documents.
@@ -176,6 +187,10 @@ class VectorStore:
         # under high concurrency don't starve or time out. ``pool_size`` maps
         # to httpx's max_connections; ``timeout`` is the per-request deadline
         # (the default 5s is fine for reads but tight for big upsert batches).
+        # Phase 1.3: ``_url`` is also retained so ``health_check()`` can probe
+        # the Qdrant root endpoint via a fresh httpx client (the qdrant-client
+        # itself doesn't expose a cheap "is the server up?" call).
+        self._url = url
         self._client = AsyncQdrantClient(
             url=url,
             timeout=30.0,
@@ -187,9 +202,37 @@ class VectorStore:
         # Cache of collection name → bool (does this collection have a sparse
         # named vector?). Populated lazily; cleared when collection is deleted.
         self._sparse_cache: dict[str, bool] = {}
+        # P3.4 — analogous cache for the colbert multi-vector slot. Read-side
+        # (Task 3.5) and ingest both consult ``_collection_has_colbert`` to
+        # decide whether to compute / upsert the multi-vectors at all.
+        self._colbert_cache: dict[str, bool] = {}
 
     async def close(self) -> None:
         await self._client.close()
+
+    async def health_check(self) -> bool:
+        """Lightweight Qdrant health probe. Result cached 5s.
+
+        Phase 1.3 — used by ``chat_rag_bridge._run_pipeline`` as a pre-flight
+        check before fanning out N parallel KB searches. The Qdrant root
+        endpoint returns ``{"title":...,"version":...}`` in <5ms when the
+        server is up; on connection error / timeout we report False without
+        raising so callers can decide whether to short-circuit retrieval.
+
+        The 5s cache means N concurrent requests share one probe — important
+        because ``health_check()`` runs on every chat turn.
+        """
+        now = _time.monotonic()
+        if hasattr(self, "_health_cache") and now - self._health_cache[0] < 5.0:
+            return self._health_cache[1]
+        try:
+            async with httpx.AsyncClient(timeout=2.0) as c:
+                r = await c.get(f"{self._url}/")
+                ok = r.status_code == 200
+        except Exception:
+            ok = False
+        self._health_cache = (now, ok)
+        return ok
 
     async def list_collections(self) -> list[str]:
         cols = (await self._client.get_collections()).collections
@@ -201,6 +244,7 @@ class VectorStore:
         *,
         with_sparse: bool = False,
         with_quantization: Optional[bool] = None,
+        with_colbert: Optional[bool] = None,
     ) -> None:
         """Idempotently create a collection.
 
@@ -216,6 +260,15 @@ class VectorStore:
         When enabled, the dense VectorParams also gets ``on_disk=True`` so the
         original fp32 vectors spill to disk (only paged in for rescoring);
         the 4×-smaller quantized index stays RAM-resident.
+
+        P3.4: ``with_colbert`` opts the collection into a third named vector
+        slot (``colbert``, 128-dim, COSINE, ``MultiVectorConfig(MAX_SIM)``) so
+        ColBERT late-interaction multi-vectors can be upserted alongside dense
+        + sparse. Implies the named-vector shape — passed without
+        ``with_sparse``, the dense slot is also given a name (``dense``) so
+        Qdrant accepts the multi-vectors_config dict. When ``None`` (default),
+        the ``RAG_COLBERT`` env switch decides. The colbert slot is purely
+        additive: read paths that don't query it are byte-identical.
 
         This method never upgrades an existing collection; if ``name`` already
         exists with the wrong shape, callers must recreate it externally
@@ -237,27 +290,65 @@ class VectorStore:
         # Originals-on-disk pairs with always-RAM quantized — that's the whole
         # tier trade: tiny fast index in RAM, big precise index on disk.
         dense_on_disk = True if with_quantization else None
+        # P3.4: per-call arg wins; env is the fallback (same convention as
+        # quantization). ColBERT requires the named-vector shape regardless
+        # of ``with_sparse`` because Qdrant only accepts MultiVectorConfig
+        # under a named slot in a vectors_config dict (legacy single-unnamed
+        # vector form has no slot to attach the multi-vector params to).
+        if with_colbert is None:
+            with_colbert = _env_bool("RAG_COLBERT", False)
+        # Pre-build colbert vector params once — same shape regardless of
+        # sparse/legacy branch below.
+        colbert_params = (
+            qm.VectorParams(
+                size=_COLBERT_DIM,
+                distance=qm.Distance.COSINE,
+                multivector_config=qm.MultiVectorConfig(
+                    comparator=qm.MultiVectorComparator.MAX_SIM,
+                ),
+            )
+            if with_colbert
+            else None
+        )
         try:
-            if with_sparse:
+            if with_sparse or with_colbert:
+                # Named-vector form — required when there's any second slot
+                # (sparse OR colbert). Dense always lands under ``_DENSE_NAME``
+                # so the read path can route via ``using=_DENSE_NAME``.
+                vectors_config: dict = {
+                    _DENSE_NAME: qm.VectorParams(
+                        size=self._vector_size,
+                        distance=qm.Distance[self._distance.upper()],
+                        on_disk=dense_on_disk,
+                    ),
+                }
+                if colbert_params is not None:
+                    vectors_config[_COLBERT_NAME] = colbert_params
+                # ``sparse_vectors_config`` is only valid alongside the
+                # named-vector form; pass it as None when sparse is off so
+                # qdrant-client doesn't reject the request.
+                sparse_cfg = (
+                    {_SPARSE_NAME: qm.SparseVectorParams(modifier=qm.Modifier.IDF)}
+                    if with_sparse
+                    else None
+                )
                 await self._client.create_collection(
                     collection_name=name,
-                    vectors_config={
-                        _DENSE_NAME: qm.VectorParams(
-                            size=self._vector_size,
-                            distance=qm.Distance[self._distance.upper()],
-                            on_disk=dense_on_disk,
-                        ),
-                    },
-                    sparse_vectors_config={
-                        _SPARSE_NAME: qm.SparseVectorParams(
-                            modifier=qm.Modifier.IDF,
-                        ),
-                    },
+                    vectors_config=vectors_config,
+                    sparse_vectors_config=sparse_cfg,
                     hnsw_config=hnsw,
                     on_disk_payload=on_disk_payload,
                     quantization_config=quant_config,
                 )
-                self._sparse_cache[name] = True
+                self._sparse_cache[name] = bool(with_sparse)
+                # Defensive: a few legacy unit tests construct VectorStore
+                # via ``__new__`` and only set the pre-3.4 attributes, so use
+                # a ``getattr`` fallback to avoid AttributeError on the new
+                # cache. Production paths always go through ``__init__`` and
+                # always have the dict.
+                cb_cache = getattr(self, "_colbert_cache", None)
+                if cb_cache is not None:
+                    cb_cache[name] = bool(with_colbert)
             else:
                 await self._client.create_collection(
                     collection_name=name,
@@ -271,6 +362,9 @@ class VectorStore:
                     quantization_config=quant_config,
                 )
                 self._sparse_cache[name] = False
+                cb_cache = getattr(self, "_colbert_cache", None)
+                if cb_cache is not None:
+                    cb_cache[name] = False
         except Exception:
             # Already exists — verify via BOTH collections and aliases before
             # giving up. Qdrant rejects create_collection when ``name`` matches
@@ -350,6 +444,13 @@ class VectorStore:
             pass
         self._known.discard(name)
         self._sparse_cache.pop(name, None)
+        # Defensive: legacy unit-test stubs (see ``_make_vs`` in
+        # ``tests/unit/test_vector_store_*``) construct the instance via
+        # ``__new__`` and only set ``_sparse_cache``. The colbert cache
+        # is added in P3.4 and may legitimately be absent on those stubs.
+        cb_cache = getattr(self, "_colbert_cache", None)
+        if cb_cache is not None:
+            cb_cache.pop(name, None)
 
     async def _refresh_sparse_cache(self, name: str) -> bool:
         """Ask Qdrant whether ``name`` has the ``bm25`` sparse named vector.
@@ -379,6 +480,93 @@ class VectorStore:
         """
         return self._sparse_cache.get(name, False)
 
+    async def _refresh_colbert_cache(self, name: str) -> bool:
+        """Ask Qdrant whether ``name`` has the ``colbert`` named vector slot.
+
+        Mirrors ``_refresh_sparse_cache``: cached, returns False for legacy
+        collections, safe on missing collections. The slot we look for is a
+        named vector under ``_COLBERT_NAME`` whose ``multivector_config`` is
+        present (only multi-vector slots have that field set).
+        """
+        # Defensive: legacy unit-test stubs may not have ``_colbert_cache``;
+        # promote to an instance dict so subsequent calls hit the cache.
+        if not hasattr(self, "_colbert_cache"):
+            self._colbert_cache = {}
+        if name in self._colbert_cache:
+            return self._colbert_cache[name]
+        try:
+            info = await self._client.get_collection(collection_name=name)
+        except Exception:
+            self._colbert_cache[name] = False
+            return False
+        has = False
+        try:
+            params = info.config.params if info and info.config else None
+            vectors = getattr(params, "vectors", None) if params is not None else None
+            # ``vectors`` is a dict[name, VectorParams] for named-vector
+            # collections; legacy single-unnamed-vector form returns a bare
+            # VectorParams (no ``__contains__``). Only the dict form can have
+            # the colbert slot, so the isinstance guard covers both shapes.
+            if isinstance(vectors, dict) and _COLBERT_NAME in vectors:
+                slot = vectors[_COLBERT_NAME]
+                # multivector_config is only set on multi-vector slots —
+                # presence alone confirms the slot was created with
+                # MultiVectorConfig (vs. a same-named regular dense slot).
+                has = getattr(slot, "multivector_config", None) is not None
+        except Exception:
+            has = False
+        self._colbert_cache[name] = has
+        return has
+
+    def _collection_has_colbert(self, name: str) -> bool:
+        """Return cached colbert-support flag without hitting the network.
+
+        Same convention as ``_collection_has_sparse``: returns False for
+        unknown collections (fail-closed → ingest skips the colbert arm).
+        """
+        cb_cache = getattr(self, "_colbert_cache", None)
+        if cb_cache is None:
+            return False
+        return cb_cache.get(name, False)
+
+    async def collection_has_vector(
+        self, collection: str, vector_name: str
+    ) -> bool:
+        """Check if a collection has a specific named vector slot. Cached 60s.
+
+        Generic counterpart to ``_collection_has_sparse`` /
+        ``_collection_has_colbert`` that doesn't hard-code a slot name —
+        used by the read path (Phase 3.5) to gate the optional ColBERT
+        arm of tri-fusion per collection. Fail-closed (returns False)
+        when the collection doesn't exist OR the lookup raises, so the
+        caller silently skips the extra retrieval arm rather than
+        crashing the whole search.
+
+        The cache is keyed by ``(collection, vector_name)`` and entries
+        expire after 60s — short enough that an admin who just ran
+        ``scripts/enable_colbert.py`` on a previously-legacy collection
+        sees the new slot within a minute, long enough that this lookup
+        adds no measurable per-query overhead under steady load.
+        """
+        cache = getattr(self, "_named_vec_cache", {})
+        key = (collection, vector_name)
+        now = _time.monotonic()
+        if key in cache and now - cache[key][0] < 60.0:
+            return cache[key][1]
+        try:
+            info = await self._client.get_collection(collection)
+            params = info.config.params if info and info.config else None
+            vectors = getattr(params, "vectors", None) if params is not None else None
+            # Named-vector form is dict[name, VectorParams]; legacy single-
+            # unnamed-vector form returns a bare VectorParams (no membership
+            # test). Only the dict form can carry an extra named slot.
+            ok = isinstance(vectors, dict) and vector_name in vectors
+        except Exception:
+            ok = False
+        cache[key] = (now, ok)
+        self._named_vec_cache = cache
+        return ok
+
     async def upsert(self, name: str, points: Iterable[dict]) -> None:
         """Upsert points. Each point may carry ``sparse_vector: (indices, values)``.
 
@@ -386,6 +574,13 @@ class VectorStore:
         (hybrid-enabled), points are written in the named-vector form
         (``{dense: [...], bm25: SparseVector(...)}``). Otherwise the legacy
         single-unnamed-vector path is used (byte-identical to before).
+
+        P3.4: each point may also carry ``colbert_vector: list[list[float]]``
+        (one 128-dim vector per token). When present AND the collection has
+        the colbert slot, the named-vector dict picks up
+        ``{colbert: [[...],...]}`` alongside dense (and sparse if hybrid).
+        Colbert alone (no sparse) still triggers the named-vector path, since
+        Qdrant requires the named shape for the multi-vector slot to exist.
         """
         points = list(points)
         # Decide encoding: sparse is only used if (a) any point carries it AND
@@ -398,6 +593,16 @@ class VectorStore:
             await self._refresh_sparse_cache(name)
             use_sparse = self._collection_has_sparse(name)
 
+        # Same gate for colbert: only emit when the point carries multi-vectors
+        # AND the collection actually has the slot. Either condition false →
+        # silently skip (no Qdrant error, ingest doesn't have to special-case
+        # collections that pre-date Task 3.4).
+        has_colbert_points = any(p.get("colbert_vector") is not None for p in points)
+        use_colbert = False
+        if has_colbert_points:
+            await self._refresh_colbert_cache(name)
+            use_colbert = self._collection_has_colbert(name)
+
         n_points = len(points)
         with span(
             "qdrant.upsert",
@@ -405,10 +610,11 @@ class VectorStore:
             n_points=n_points,
             vector_size=self._vector_size,
             hybrid=use_sparse,
+            colbert=use_colbert,
         ):
             _t = _perf_counter()
             try:
-                if not use_sparse:
+                if not use_sparse and not use_colbert:
                     # Legacy path — byte-identical to pre-hybrid behavior.
                     pts = [
                         qm.PointStruct(
@@ -419,14 +625,29 @@ class VectorStore:
                     await self._client.upsert(collection_name=name, points=pts, wait=True)
                     return
 
-                # Hybrid path — pack dense under _DENSE_NAME and sparse under _SPARSE_NAME.
+                # Named-vector path — pack dense under _DENSE_NAME, sparse
+                # under _SPARSE_NAME, colbert under _COLBERT_NAME. Each slot is
+                # only populated when both the per-point payload AND the
+                # collection support it (set above), so a hybrid-only
+                # collection ignores stray colbert_vector fields and vice
+                # versa.
                 pts = []
                 for p in points:
                     vec_map: dict = {_DENSE_NAME: p["vector"]}
-                    sv = p.get("sparse_vector")
-                    if sv is not None:
-                        indices, values = sv
-                        vec_map[_SPARSE_NAME] = qm.SparseVector(indices=list(indices), values=list(values))
+                    if use_sparse:
+                        sv = p.get("sparse_vector")
+                        if sv is not None:
+                            indices, values = sv
+                            vec_map[_SPARSE_NAME] = qm.SparseVector(
+                                indices=list(indices), values=list(values)
+                            )
+                    if use_colbert:
+                        cv = p.get("colbert_vector")
+                        if cv is not None:
+                            # cv is already list[list[float]] (JSON-safe); the
+                            # qdrant-client serializer accepts that directly
+                            # for multi-vector slots.
+                            vec_map[_COLBERT_NAME] = cv
                     pts.append(
                         qm.PointStruct(id=p["id"], vector=vec_map, payload=p.get("payload", {}))
                     )
@@ -587,10 +808,21 @@ class VectorStore:
         }
         if self._sparse_cache.get(name):
             kwargs["using"] = _DENSE_NAME
+        # Phase 1.3: per-collection circuit breaker. If Qdrant has been
+        # failing for this collection, raise CircuitOpenError immediately
+        # instead of issuing yet another doomed RPC. Only transport errors
+        # (timeout / connect / read) trip the breaker — application errors
+        # (bad filter, unknown collection) propagate normally without
+        # affecting breaker state.
+        cb = breaker_for(f"qdrant:{name}")
+        cb.raise_if_open()
         with span("qdrant.client.search", collection=name, limit=limit, mode="dense"):
             _t = _perf_counter()
             try:
                 response = await self._client.query_points(**kwargs)
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError):
+                cb.record_failure()
+                raise
             finally:
                 try:
                     qdrant_search_latency_seconds.labels(collection=name).observe(
@@ -598,6 +830,7 @@ class VectorStore:
                     )
                 except Exception:
                     pass
+            cb.record_success()
         return [Hit(id=r.id, score=r.score, payload=r.payload or {}) for r in response.points]
 
     async def hybrid_search(
@@ -614,7 +847,7 @@ class VectorStore:
         level: Optional[str] = None,
         rescore: Optional[bool] = None,
     ) -> List[Hit]:
-        """Server-side RRF fusion of dense + BM25 sparse results.
+        """Server-side RRF fusion of dense + BM25 sparse (+ optional ColBERT) results.
 
         Only valid for collections created with ``ensure_collection(..., with_sparse=True)``.
         Uses Qdrant's ``query_points`` with two ``Prefetch`` arms (dense + sparse)
@@ -633,6 +866,15 @@ class VectorStore:
         search is rescored against the original fp32 vectors. The sparse
         (BM25) arm has no vectors and ignores the hint. Default follows the
         ``RAG_QDRANT_RESCORE`` env knob.
+
+        P3.5 (tri-fusion): when ``RAG_COLBERT=1`` AND the collection has the
+        named ``colbert`` vector slot (checked via ``collection_has_vector``,
+        cached 60s), a third Prefetch arm is added that queries the ColBERT
+        multi-vector slot using ``MAX_SIM`` late interaction. The outer
+        ``FusionQuery(RRF)`` then fuses all three arms server-side — same RRF
+        formula, one extra round-trip avoided. Default-off:
+        ``RAG_COLBERT=0`` OR a collection without the slot keeps the
+        two-arm dense+sparse path byte-identical to pre-P3.5.
         """
         from .sparse_embedder import embed_sparse_query
 
@@ -663,6 +905,37 @@ class VectorStore:
                 limit=limit * 2,
             ),
         ]
+        # P3.5: third arm — ColBERT late-interaction multi-vector query.
+        # Gated behind BOTH the env flag AND the per-collection slot check
+        # so a collection that pre-dates Task 3.4 silently falls back to the
+        # two-arm dense+sparse path (no Qdrant error from querying a missing
+        # named vector). The flag check first short-circuits before any
+        # network call when ColBERT is process-wide off.
+        if _env_bool("RAG_COLBERT", False) and await self.collection_has_vector(
+            name, _COLBERT_NAME
+        ):
+            try:
+                from .embedder import colbert_embed
+                colbert_vecs = colbert_embed([query_text])
+                if colbert_vecs and colbert_vecs[0]:
+                    prefetch.append(
+                        qm.Prefetch(
+                            query=colbert_vecs[0],
+                            using=_COLBERT_NAME,
+                            filter=flt,
+                            limit=limit * 2,
+                        )
+                    )
+            except Exception:
+                # Embedder failure (model not cached, ONNX runtime issue,
+                # fastembed not installed) → fall back to the two-arm path
+                # rather than break the whole search. Operators see this in
+                # the qdrant.client.search span trace.
+                pass
+        # Phase 1.3: per-collection circuit breaker — hybrid path mirrors the
+        # dense ``search`` path. Same trip rules: only transport errors count.
+        cb = breaker_for(f"qdrant:{name}")
+        cb.raise_if_open()
         with span("qdrant.client.search", collection=name, limit=limit, mode="hybrid"):
             _t = _perf_counter()
             try:
@@ -674,6 +947,9 @@ class VectorStore:
                     query_filter=flt,
                     with_payload=_PAYLOAD_FIELDS,
                 )
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError):
+                cb.record_failure()
+                raise
             finally:
                 try:
                     qdrant_search_latency_seconds.labels(collection=name).observe(
@@ -681,6 +957,7 @@ class VectorStore:
                     )
                 except Exception:
                     pass
+            cb.record_success()
         return [Hit(id=r.id, score=r.score, payload=r.payload or {}) for r in response.points]
 
     async def delete_by_doc(self, collection: str, doc_id: int | str) -> int:

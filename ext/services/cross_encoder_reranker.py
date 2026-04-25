@@ -13,14 +13,34 @@ reranker still serves correct results from model inference.
 """
 from __future__ import annotations
 
+import logging
 import os
 import threading
-from functools import lru_cache
+import time
 from typing import Any, Sequence
 
 from .obs import span
 
+logger = logging.getLogger(__name__)
+
 _LOCK = threading.Lock()
+
+# Phase 1.2 — retryable singleton state. The original implementation used
+# ``@lru_cache(maxsize=1)`` which had a critical bug: any exception raised
+# during model load was re-raised on every subsequent call (lru_cache caches
+# the exception object, so the singleton was poisoned forever once a load
+# failed — even after the underlying issue resolved). Now we track the loaded
+# instance under a lock and only cache successes; failures retry from scratch
+# on the next call.
+_MODEL_LOCK = threading.Lock()
+_MODEL_INSTANCE = None  # type: ignore[var-annotated]
+
+
+def _reset_model_for_test() -> None:
+    """Clear the cached model. Test-only helper."""
+    global _MODEL_INSTANCE
+    with _MODEL_LOCK:
+        _MODEL_INSTANCE = None
 
 
 def _resolve_device() -> str:
@@ -44,16 +64,65 @@ def _resolve_device() -> str:
     return pref
 
 
-@lru_cache(maxsize=1)
-def _load_model():
-    from sentence_transformers import CrossEncoder
+def get_model():
+    """Return the cross-encoder model, loading it if necessary.
 
-    model_name = os.environ.get("RAG_RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
-    max_len = int(os.environ.get("RAG_RERANK_MAX_LEN", "512"))
-    device = _resolve_device()
-    # sentence-transformers 5.x accepts ``device`` as a keyword; it is
-    # forwarded to BaseModel.__init__ and the module is ``.to(device)``-ed.
-    return CrossEncoder(model_name, max_length=max_len, device=device)
+    Thread-safe singleton. On transient failure (network blip during HF
+    download, OOM on first CUDA init, sentence-transformers ImportError on
+    a lazy dep), retries with exponential backoff. On permanent failure
+    (max retries exhausted) raises; the NEXT call retries from scratch —
+    failures are NOT cached. Regression guard against the original
+    @lru_cache behavior which poisoned the singleton forever.
+    """
+    global _MODEL_INSTANCE
+    if _MODEL_INSTANCE is not None:
+        return _MODEL_INSTANCE
+    with _MODEL_LOCK:
+        if _MODEL_INSTANCE is not None:
+            return _MODEL_INSTANCE
+        from sentence_transformers import CrossEncoder
+        model_name = os.environ.get("RAG_RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
+        max_len = int(os.environ.get("RAG_RERANK_MAX_LEN", "512"))
+        device = _resolve_device()
+        retries = int(os.environ.get("RAG_RERANK_LOAD_RETRIES", "3"))
+        base_sec = float(os.environ.get("RAG_RERANK_LOAD_RETRY_BASE_SEC", "1.0"))
+        last_exc: BaseException | None = None
+        for attempt in range(retries):
+            try:
+                logger.info(
+                    "reranker load attempt %d/%d: %s on %s",
+                    attempt + 1, retries, model_name, device,
+                )
+                _MODEL_INSTANCE = CrossEncoder(model_name, max_length=max_len, device=device)
+                logger.info("reranker loaded")
+                return _MODEL_INSTANCE
+            except Exception as exc:
+                last_exc = exc
+                wait = base_sec * (2 ** attempt)
+                logger.warning(
+                    "reranker load attempt %d/%d failed (%s: %s); sleeping %.1fs",
+                    attempt + 1, retries, type(exc).__name__, exc, wait,
+                )
+                if attempt < retries - 1:
+                    time.sleep(wait)
+        assert last_exc is not None
+        raise last_exc
+
+
+def _load_model():
+    """Backward-compat shim — existing call sites use ``_load_model()``.
+
+    Kept as a thin wrapper over :func:`get_model` so older code paths and
+    monkeypatch-based tests don't break. New code should call ``get_model``
+    directly.
+    """
+    return get_model()
+
+
+# Backward-compat: the old ``@lru_cache`` ``_load_model`` exposed
+# ``cache_clear()`` for tests to reset between cases. Forward that to
+# the new singleton-reset helper so existing tests continue to work.
+_load_model.cache_clear = _reset_model_for_test  # type: ignore[attr-defined]
 
 
 class CrossEncoderUnavailable(RuntimeError):

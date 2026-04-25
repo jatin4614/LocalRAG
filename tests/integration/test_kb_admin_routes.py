@@ -104,13 +104,13 @@ async def test_access_grant_and_list(client, engine):
     kb_id = r.json()["id"]
 
     r = await client.post(f"/api/kb/{kb_id}/access", headers=ADMIN,
-                          json={"group_id": 1, "access_type": "read"})
+                          json={"group_id": "1", "access_type": "read"})
     assert r.status_code == 201, r.text
     grant_id = r.json()["id"]
 
     r = await client.get(f"/api/kb/{kb_id}/access", headers=ADMIN)
     assert r.status_code == 200
-    assert r.json()[0]["group_id"] == 1
+    assert r.json()[0]["group_id"] == "1"
 
     r = await client.delete(f"/api/kb/{kb_id}/access/{grant_id}", headers=ADMIN)
     assert r.status_code == 204

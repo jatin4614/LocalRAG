@@ -23,8 +23,9 @@ async def seed(engine):
         await s.execute(text("INSERT INTO users (id,email,password_hash,role) VALUES (9,'a@x','h','admin'),(1,'u@x','h','user')"))
         await s.execute(text("INSERT INTO groups (id,name) VALUES (1,'eng')"))
         await s.execute(text("INSERT INTO user_groups (user_id, group_id) VALUES (1,1)"))
-        await s.execute(text("INSERT INTO knowledge_bases (id,name,admin_id) VALUES (10,'Eng',9),(11,'Secret',9)"))
-        await s.execute(text("INSERT INTO kb_access (kb_id, group_id, access_type) VALUES (10,1,'read')"))
+        # admin_id is VARCHAR(255); group_id is TEXT post-migration drift
+        await s.execute(text("INSERT INTO knowledge_bases (id,name,admin_id) VALUES (10,'Eng','9'),(11,'Secret','9')"))
+        await s.execute(text("INSERT INTO kb_access (kb_id, group_id, access_type) VALUES (10,'1','read')"))
         await s.execute(text("INSERT INTO chats (id,user_id) VALUES (500,1)"))
         await s.commit()
 
@@ -53,7 +54,7 @@ async def client(engine, clean_qdrant):
 @pytest.mark.asyncio
 async def test_retrieve_returns_hits_for_authorized_kb(client):
     r = await client.post("/api/rag/retrieve", headers=ALICE, json={
-        "chat_id": 500,
+        "chat_id": "500",
         "query": "quick brown fox",
         "selected_kb_config": [{"kb_id": 10, "subtag_ids": []}],
     })
@@ -66,7 +67,7 @@ async def test_retrieve_returns_hits_for_authorized_kb(client):
 @pytest.mark.asyncio
 async def test_retrieve_rejects_unauthorized_kb(client):
     r = await client.post("/api/rag/retrieve", headers=ALICE, json={
-        "chat_id": 500,
+        "chat_id": "500",
         "query": "x",
         "selected_kb_config": [{"kb_id": 11, "subtag_ids": []}],
     })
@@ -77,5 +78,5 @@ async def test_retrieve_rejects_unauthorized_kb(client):
 async def test_retrieve_rejects_other_users_chat(client):
     r = await client.post("/api/rag/retrieve",
                           headers={"X-User-Id": "2", "X-User-Role": "user"},
-                          json={"chat_id": 500, "query": "x", "selected_kb_config": []})
+                          json={"chat_id": "500", "query": "x", "selected_kb_config": []})
     assert r.status_code == 404

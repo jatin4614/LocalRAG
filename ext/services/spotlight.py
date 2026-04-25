@@ -14,6 +14,10 @@ References:
 """
 from __future__ import annotations
 
+from typing import Any, Sequence, Union
+
+from . import flags
+from .metrics import spotlight_wrapped_total
 from .obs import span
 
 _OPEN = "<UNTRUSTED_RETRIEVED_CONTENT>"
@@ -32,6 +36,15 @@ SPOTLIGHT_POLICY = (
 )
 
 
+def is_enabled() -> bool:
+    """Return True if RAG_SPOTLIGHT is enabled (flag value == "1").
+
+    Reads via :mod:`ext.services.flags` so per-request KB config overlays
+    (set by ``chat_rag_bridge`` via ``flags.with_overrides``) take effect.
+    """
+    return flags.get("RAG_SPOTLIGHT", "0") == "1"
+
+
 def sanitize_chunk_text(text: str) -> str:
     """Defang any delimiter strings that the attacker may have planted in the
     chunk itself (common attack: an attacker's doc literally contains
@@ -45,8 +58,8 @@ def sanitize_chunk_text(text: str) -> str:
     # Replace the tags with zero-width-space-joined variants so they don't
     # close the outer wrapper early. U+200B breaks literal substring match.
     return (
-        text.replace(_OPEN, "\u200b".join(_OPEN))
-            .replace(_CLOSE, "\u200b".join(_CLOSE))
+        text.replace(_OPEN, "​".join(_OPEN))
+            .replace(_CLOSE, "​".join(_CLOSE))
     )
 
 
@@ -62,17 +75,77 @@ def wrap_context(chunks_text: str) -> str:
         return ""
     with span("spotlight.wrap", bytes=len(chunks_text)):
         sanitized = sanitize_chunk_text(chunks_text)
+        try:
+            spotlight_wrapped_total.inc()
+        except Exception:
+            pass
         return f"{_OPEN}\n{sanitized}\n{_CLOSE}"
 
 
-def wrap_chunks(chunks: list[str]) -> str:
-    """Convenience: sanitize + wrap a list of chunk texts with per-chunk
-    boundary markers inside the outer tags.
+def wrap_chunks(
+    chunks: Union[Sequence[str], Sequence[dict[str, Any]]],
+) -> Union[str, list[dict[str, Any]]]:
+    """Wrap a list of chunks with the untrusted-content delimiters.
 
-    Empty chunks are skipped. If the resulting list is empty, returns "".
+    Polymorphic by element type:
+
+    * **list[str]** (legacy) → returns a single string with all non-empty
+      chunks joined by ``\\n---\\n`` and wrapped in exactly one outer tag pair.
+      Empty chunks are skipped. An all-empty/empty list returns ``""``.
+    * **list[dict]** (Plan A 2.1) → returns a new list of dicts, each with
+      its ``"text"`` value wrapped in untrusted-content tags. Other dict
+      keys (kb_id, score, etc.) are preserved unchanged. When
+      ``RAG_SPOTLIGHT`` is disabled, the input list is returned as-is so
+      callers see byte-identical behavior to pre-Spotlight.
+
+    The dict path is the one used by Plan-A retrievers that pass chunk
+    dicts through the pipeline. The string path remains for ``wrap_context``
+    callers and for backward compatibility with existing call sites.
     """
-    parts = [sanitize_chunk_text(c) for c in chunks if c]
+    if not chunks:
+        # Preserve legacy contract: empty list[str] → "" ; the dict path
+        # would also produce []. Either way, an empty input is a no-op.
+        # Distinguish by checking the *declared* type of an empty list is
+        # ambiguous, so we return "" — both APIs treat empty as nothing.
+        return ""
+
+    # Dispatch on first element type. Mixed lists are not supported (and
+    # never produced by callers); we trust the static contract.
+    first = chunks[0]
+    if isinstance(first, dict):
+        # Pass-through when disabled — callers may rely on the exact list
+        # identity (the new test asserts wrap_chunks(c) == c when off).
+        if not is_enabled():
+            return list(chunks)  # type: ignore[return-value]
+
+        with span("spotlight.wrap_chunks", count=len(chunks)):
+            wrapped: list[dict[str, Any]] = []
+            for c in chunks:  # type: ignore[assignment]
+                if not isinstance(c, dict):
+                    # Defensive: skip malformed entries silently.
+                    continue
+                text = c.get("text", "")
+                if not text:
+                    wrapped.append(dict(c))
+                    continue
+                sanitized = sanitize_chunk_text(str(text))
+                new_c = dict(c)
+                new_c["text"] = f"{_OPEN}\n{sanitized}\n{_CLOSE}"
+                wrapped.append(new_c)
+                try:
+                    spotlight_wrapped_total.inc()
+                except Exception:
+                    pass
+            return wrapped
+
+    # Legacy list[str] path — used by SPOTLIGHT_POLICY-aware callers and by
+    # the existing tests. Behavior unchanged.
+    parts = [sanitize_chunk_text(c) for c in chunks if c]  # type: ignore[arg-type]
     if not parts:
         return ""
     body = "\n---\n".join(parts)
+    try:
+        spotlight_wrapped_total.inc()
+    except Exception:
+        pass
     return f"{_OPEN}\n{body}\n{_CLOSE}"

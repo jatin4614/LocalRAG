@@ -24,7 +24,9 @@ def test_valid_headers_parsed():
 
     r = TestClient(app).get("/me", headers={"X-User-Id": "42", "X-User-Role": "user"})
     assert r.status_code == 200
-    assert r.json() == {"id": 42, "role": "user"}
+    # CurrentUser.id is now str (UUIDs from upstream Open WebUI). Stub mode
+    # passes the X-User-Id header through verbatim, so "42" stays "42".
+    assert r.json() == {"id": "42", "role": "user"}
 
 
 def test_non_admin_cannot_access_admin_route():

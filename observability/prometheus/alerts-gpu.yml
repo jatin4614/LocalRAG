@@ -1,0 +1,77 @@
+# GPU contention alert rules for the orgchat RAG stack.
+#
+# Source: docs/superpowers/plans/2026-04-24-rag-robustness-and-quality.md
+#         Task 1.9 ("GPU contention alerts").
+#
+# DCGM metrics consumed (emitted by the orgchat-obs-dcgm-exporter sidecar
+# scraped via the `dcgm` job in prometheus.yml):
+#   * DCGM_FI_DEV_FB_USED   — frame-buffer (VRAM) bytes in use, per gpu
+#   * DCGM_FI_DEV_FB_FREE   — frame-buffer (VRAM) bytes free, per gpu
+#   * DCGM_FI_DEV_GPU_UTIL  — SM utilization percentage, per gpu
+#
+# Adaptation vs Plan A spec (ChatLatencyDuringIngest):
+#   The plan template references `llm_latency_seconds_bucket{stage="chat"}`
+#   and `llm_requests_total{stage="contextualizer"}` — these counter+
+#   histogram pairs do NOT exist in the WIP. Phase 1.6 instead wired
+#   per-model histograms and per-kb prompt counters under the `rag_`
+#   namespace (see ext/services/metrics.py + ext/services/llm_telemetry.py):
+#     * rag_llm_ttft_seconds_bucket{model}       — TTFT histogram
+#     * rag_llm_tpot_seconds_bucket{model}       — per-token streaming latency
+#     * rag_tokens_prompt_total{model, kb}       — prompt-token counter (kb on prompt only)
+#     * rag_tokens_completion_total{model}       — completion-token counter
+#   The chat path is the gemma model family (gemma-3-12b-it via vllm-chat),
+#   so we proxy "chat is slow" via TTFT p95 over gemma.* and "contextualizer
+#   is running" via prompt-token rate against any KB-scoped call (kb!="none"
+#   — Phase 1.6 sets the kb label to comma-joined kb_ids on retrieval and
+#   leaves it as "none" for non-KB callers like the rewriter/HyDE).
+groups:
+  - name: rag-gpu-contention
+    interval: 30s
+    rules:
+      - alert: GpuVramHigh
+        expr: |
+          (DCGM_FI_DEV_FB_USED / (DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE)) > 0.95
+        for: 2m
+        labels:
+          severity: warning
+          component: gpu
+        annotations:
+          summary: "GPU {{ $labels.gpu }} VRAM >95% for 2m"
+          description: |
+            Used/Total = {{ $value }}. On GPU 0 this likely means vllm-chat +
+            contextualization ingest or external frams workers are competing.
+            See docs/runbook/troubleshooting.md "retrieval is slow" section.
+
+      - alert: GpuUtilPinned
+        expr: DCGM_FI_DEV_GPU_UTIL > 95
+        for: 5m
+        labels:
+          severity: info
+          component: gpu
+        annotations:
+          summary: "GPU {{ $labels.gpu }} util pinned >95% for 5m"
+          description: |
+            Could be legitimate (batch inference) or a runaway process.
+            Confirm via `nvidia-smi` and the vllm chat latency histogram.
+
+      - alert: ChatLatencyDuringIngest
+        expr: |
+          histogram_quantile(0.95, rate(rag_llm_ttft_seconds_bucket{model=~"gemma.*"}[5m])) > 3
+          and
+          rate(rag_tokens_prompt_total{kb!="none"}[5m]) > 0
+        for: 3m
+        labels:
+          severity: warning
+          component: rag
+        annotations:
+          summary: "Chat p95 TTFT >3s while KB-scoped LLM calls are running"
+          description: |
+            Gemma chat TTFT p95 over the last 5m exceeds 3s while contextualizer
+            (or other KB-scoped LLM calls — kb!="none") is firing. Phase 3
+            re-ingest contextualizer is likely competing with chat inference
+            on GPU 0. Throttle policy should pause ingest — confirm via
+            `docker logs orgchat-celery-worker | grep throttle`.
+            Metric adaptation: see comment header in alerts-gpu.yml — the
+            plan's `llm_latency_seconds_bucket{stage}` schema does not exist;
+            we proxy via `rag_llm_ttft_seconds_bucket{model=~"gemma.*"}` and
+            `rag_tokens_prompt_total{kb!="none"}` (Phase 1.6 wiring).

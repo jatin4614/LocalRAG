@@ -37,6 +37,16 @@ async def _fake_flush(self):  # noqa: ARG001
 
 
 class _FakeResult:
+    """Wrap a value so both ``.scalar_one_or_none()`` and ``.first()`` work.
+
+    ``first()`` returns the raw value verbatim so callers can pass a tuple
+    like ``("rag-cfg-json",)`` and subscript ``row[0]`` without surprises.
+    Single-value (non-tuple) callers must continue to use
+    ``scalar_one_or_none()`` — that's what upload.py does for the subtag
+    lookup, and what private-chat upload does for the chat-row check via
+    ``first()`` (already passes a tuple).
+    """
+
     def __init__(self, value):
         self._value = value
 
@@ -49,10 +59,24 @@ class _FakeResult:
 
 class _FakeSession:
     """Minimal async-session stand-in. ``session.add`` stamps a numeric id
-    onto the KBDocument so downstream code sees a non-None ``doc.id``."""
+    onto the KBDocument so downstream code sees a non-None ``doc.id``.
+
+    ``execute_return`` may be a single value (one execute call) or a list
+    of values (multiple execute calls — returned in FIFO order). The
+    upload_kb_doc handler calls ``execute`` twice — first for the subtag
+    lookup (consumed via ``scalar_one_or_none``), then for the KB
+    rag_config row (consumed via ``first()``, must be subscriptable).
+    Tests that only exercise one execute call may keep passing a single
+    value for back-compat.
+    """
 
     def __init__(self, *, execute_return=None):
-        self._execute_return = execute_return
+        # Coerce single value into a one-element queue for uniform
+        # consumption inside ``execute``.
+        if isinstance(execute_return, list):
+            self._execute_queue = list(execute_return)
+        else:
+            self._execute_queue = [execute_return]
         self.added: list = []
 
     def add(self, obj):
@@ -68,7 +92,14 @@ class _FakeSession:
         pass
 
     async def execute(self, *a, **kw):  # noqa: ARG002
-        return _FakeResult(self._execute_return)
+        # FIFO: each execute call consumes one return value. After the
+        # queue is drained, repeat the last value indefinitely so
+        # accidental extra execute calls don't crash with IndexError.
+        if len(self._execute_queue) > 1:
+            value = self._execute_queue.pop(0)
+        else:
+            value = self._execute_queue[0]
+        return _FakeResult(value)
 
 
 # ---------- KB upload path ---------------------------------------------------
@@ -99,9 +130,14 @@ async def test_kb_upload_stamps_owner_user_id(monkeypatch) -> None:
 
     monkeypatch.setattr(upload_mod.kb_service, "get_kb", fake_get_kb)
 
-    # Session: execute returns the subtag.
+    # Two execute calls happen inside upload_kb_doc:
+    #   (1) subtag lookup → scalar_one_or_none → SimpleNamespace
+    #   (2) KB.rag_config lookup → first() → tuple-like row
+    # Pass a list so the FIFO _FakeSession.execute hands the right thing
+    # to each. (None,) for the rag_config row signals "no per-KB config",
+    # which makes resolve_chunk_params fall back to env defaults.
     subtag = SimpleNamespace(id=100, kb_id=10)
-    session = _FakeSession(execute_return=subtag)
+    session = _FakeSession(execute_return=[subtag, (None,)])
 
     # Build an UploadFile stand-in. ``_read_bounded`` does ``await file.read(...)``
     # in a loop; a minimal async generator stand-in is enough.
@@ -161,8 +197,10 @@ async def test_kb_upload_stamps_owner_user_id_numeric(monkeypatch) -> None:
 
     monkeypatch.setattr(upload_mod.kb_service, "get_kb", fake_get_kb)
 
+    # See sibling test for why execute_return is a 2-element list:
+    # subtag for the first execute, (None,) tuple for the rag_config row.
     subtag = SimpleNamespace(id=100, kb_id=10)
-    session = _FakeSession(execute_return=subtag)
+    session = _FakeSession(execute_return=[subtag, (None,)])
 
     class _FakeFile:
         def __init__(self):

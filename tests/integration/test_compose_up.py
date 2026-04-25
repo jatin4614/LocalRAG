@@ -15,6 +15,28 @@ COMPOSE = ["docker", "compose", "-f", str(ROOT / "compose/docker-compose.yml"),
 SKIP_GPU = os.environ.get("SKIP_GPU_SMOKE") == "1"
 
 
+def _live_stack_present() -> bool:
+    """If the production orgchat stack is already running on the host
+    (orgchat-postgres / orgchat-redis containers up), trying to ``docker
+    compose up`` from a test fixture would either no-op or conflict on
+    port bindings. Skip cleanly so a dev machine running the live stack
+    doesn't fail the test suite.
+    """
+    try:
+        r = subprocess.run(
+            ["docker", "ps", "--format", "{{.Names}}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        names = (r.stdout or "").splitlines()
+        return any(n.startswith("orgchat-") for n in names)
+    except Exception:
+        return False
+
+
+_SKIP_REASON = "live orgchat-* stack already running on this host"
+_LIVE_STACK = _live_stack_present()
+
+
 def _wait(pred, timeout_s=300, interval_s=5):
     start = time.monotonic()
     while time.monotonic() - start < timeout_s:
@@ -29,6 +51,8 @@ def _wait(pred, timeout_s=300, interval_s=5):
 
 @pytest.fixture(scope="module", autouse=True)
 def compose_stack():
+    if _LIVE_STACK:
+        pytest.skip(_SKIP_REASON)
     env_file = ROOT / "compose/.env"
     created_env = False
     if not env_file.exists():
@@ -38,9 +62,13 @@ def compose_stack():
     # Caddy is excluded from the base list because it binds host ports 80/443,
     # which may already be allocated on a shared/dev server.  It is implicitly
     # tested on a GPU host via the full-stack path below.
+    #
+    # vllm-vision was removed in the 2026-04-20 Gemma 4 swap; the chat
+    # model now handles vision natively. Don't include it in the start
+    # list — docker compose up would fail with "no such service".
     target_services = ["postgres", "redis", "qdrant"]
     if not SKIP_GPU:
-        target_services += ["caddy", "vllm-chat", "vllm-vision", "tei", "whisper"]
+        target_services += ["caddy", "vllm-chat", "tei", "whisper"]
     subprocess.run(COMPOSE + ["up", "-d", *target_services], check=True)
     yield
     subprocess.run(COMPOSE + ["down"], check=True)

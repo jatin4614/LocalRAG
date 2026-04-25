@@ -72,3 +72,37 @@ logs:
 clean:
 	rm -rf $(VENV) .pytest_cache .mypy_cache .ruff_cache
 	find . -type d -name __pycache__ -prune -exec rm -rf {} +
+
+# ---- Eval harness targets (Plan A Phase 0.6) ----
+
+KB_EVAL_ID ?= 1
+API_BASE   ?= http://localhost:6100
+GOLDEN     ?= tests/eval/golden_starter.jsonl
+BASELINE   ?= tests/eval/results/phase-0-baseline.json
+LATEST     ?= tests/eval/results/latest.json
+
+.PHONY: eval eval-baseline eval-gate eval-seed
+
+eval-seed:
+	@test -n "$$RAG_ADMIN_TOKEN" || { echo "ERROR: export RAG_ADMIN_TOKEN"; exit 2; }
+	$(ACTIVATE) && python -m tests.eval.seed_test_kb \
+	  --kb-id $(KB_EVAL_ID) \
+	  --api-base-url $(API_BASE)
+
+eval:
+	@mkdir -p tests/eval/results
+	$(ACTIVATE) && python -m tests.eval.harness \
+	  --golden $(GOLDEN) \
+	  --kb-id $(KB_EVAL_ID) \
+	  --api-base-url $(API_BASE) \
+	  --out $(LATEST)
+
+eval-baseline: eval
+	cp $(LATEST) $(BASELINE)
+	@echo "baseline committed to $(BASELINE); include in commit"
+
+eval-gate: eval
+	$(ACTIVATE) && python -m tests.eval.gate \
+	  --baseline $(BASELINE) \
+	  --latest $(LATEST) \
+	  --slo docs/runbook/slo.md

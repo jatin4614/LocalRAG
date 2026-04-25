@@ -1,0 +1,31 @@
+groups:
+  - name: rag-retrieval-quality
+    interval: 5m
+    rules:
+      - alert: RetrievalNdcgDrop
+        expr: |
+          (avg_over_time(retrieval_ndcg_daily[7d]) - retrieval_ndcg_daily) > 0.05
+        for: 1d
+        labels:
+          severity: warning
+          component: rag
+        annotations:
+          summary: "Daily eval nDCG dropped >5pp from 7d median (intent={{ $labels.intent }})"
+          description: |
+            Intent stratum {{ $labels.intent }}: current nDCG {{ $value }} is
+            >5pp below the 7-day rolling mean. Check for:
+            - Silent model drift (reranker swap, embedding model change)
+            - Corpus growth shifting query difficulty distribution
+            - Recent config change (check /metrics rag_flag_enabled gauges)
+
+      - alert: RetrievalDailyLatencyHigh
+        expr: retrieval_daily_latency_p95_ms > 1500
+        for: 2d
+        labels:
+          severity: warning
+          component: rag
+        annotations:
+          summary: "Daily eval p95 retrieval latency exceeds SLO band"
+          description: |
+            p95 {{ $value }}ms > 1500ms budget. See docs/runbook/slo.md for
+            current phase's expected band.

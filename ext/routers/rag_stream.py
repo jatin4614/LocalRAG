@@ -141,52 +141,72 @@ async def stream_retrieval(
 
         task = asyncio.create_task(drain())
 
-        _t_start = perf_counter()
-        _first_recorded = False
-        _last_event_t: Optional[float] = None
+        # Phase 1.6 follow-up — wrap the streaming response in
+        # ``record_llm_call`` so the chat path emits the same TTFT /
+        # TPOT histograms as the contextualizer / hyde / rewriter paths
+        # via a single canonical helper. Token counts aren't available
+        # from the SSE retrieval stream itself (the LLM call is fired
+        # by the frontend in parallel and goes through upstream's chat
+        # middleware), so we leave ``set_tokens`` as zeros — recorder
+        # skips zero-valued counter increments. The TTFT histogram
+        # observation still fires because we call ``set_first_token_at``
+        # at the first real SSE event below.
+        from ..services.llm_telemetry import record_llm_call as _rec
 
         try:
             # Initial comment keeps the connection open through proxy
             # buffers (Caddy default buffer is empty-until-flush-on-EOL).
             yield b": stream open\n\n"
-            while True:
-                # Bail out early if the client disconnected — StreamingResponse
-                # won't cancel the task automatically in every FastAPI version.
-                if await request.is_disconnected():
-                    task.cancel()
-                    break
-                try:
-                    event = await asyncio.wait_for(queue.get(), timeout=15.0)
-                except asyncio.TimeoutError:
-                    # Send a heartbeat so intermediaries don't close the idle connection.
-                    yield b": keepalive\n\n"
-                    continue
-                if event is None:
-                    yield _sse("done", {})
-                    break
-                # Record TTFT on first real event, TPOT between subsequent events.
-                _now = perf_counter()
-                try:
-                    from ..services.metrics import llm_ttft_seconds, llm_tpot_seconds
-                    if not _first_recorded:
-                        llm_ttft_seconds.labels(model=_model).observe(_now - _t_start)
-                        _first_recorded = True
-                    elif _last_event_t is not None:
-                        llm_tpot_seconds.labels(model=_model).observe(_now - _last_event_t)
-                except Exception:
-                    pass
-                _last_event_t = _now
-                # "hits" and "done" events get their own SSE event name so
-                # clients can switch on addEventListener; everything else
-                # is a "stage" event.
-                name = "stage"
-                if event.get("stage") == "hits":
-                    name = "hits"
-                elif event.get("stage") == "done":
-                    name = "done"
-                elif event.get("stage") == "error":
-                    name = "error"
-                yield _sse(name, event)
+
+            async with _rec(
+                stage="chat",
+                model=_model,
+                kb=_kb_ids_attr or None,
+            ) as _llm_rec:
+                _last_event_t: Optional[float] = None
+                while True:
+                    # Bail out early if the client disconnected — StreamingResponse
+                    # won't cancel the task automatically in every FastAPI version.
+                    if await request.is_disconnected():
+                        task.cancel()
+                        break
+                    try:
+                        event = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    except asyncio.TimeoutError:
+                        # Send a heartbeat so intermediaries don't close the idle connection.
+                        yield b": keepalive\n\n"
+                        continue
+                    if event is None:
+                        yield _sse("done", {})
+                        break
+                    # First real event → record TTFT on the recorder so
+                    # the canonical histogram gets the observation. TPOT
+                    # is observed manually for subsequent events; the
+                    # recorder's automatic TPOT path needs completion
+                    # tokens (which we don't have for SSE retrieval).
+                    _now = perf_counter()
+                    try:
+                        if _llm_rec._first_token_at is None:
+                            _llm_rec.set_first_token_at(_now)
+                        elif _last_event_t is not None:
+                            from ..services.metrics import llm_tpot_seconds
+                            llm_tpot_seconds.labels(model=_model).observe(
+                                _now - _last_event_t,
+                            )
+                    except Exception:
+                        pass
+                    _last_event_t = _now
+                    # "hits" and "done" events get their own SSE event name so
+                    # clients can switch on addEventListener; everything else
+                    # is a "stage" event.
+                    name = "stage"
+                    if event.get("stage") == "hits":
+                        name = "hits"
+                    elif event.get("stage") == "done":
+                        name = "done"
+                    elif event.get("stage") == "error":
+                        name = "error"
+                    yield _sse(name, event)
         finally:
             if not task.done():
                 task.cancel()

@@ -298,6 +298,12 @@ services:
       CHUNK_OVERLAP: ${CHUNK_OVERLAP:-100}
       RAG_FILE_MAX_SIZE: ${RAG_FILE_MAX_SIZE:-26214400}
       RAG_FILE_MAX_COUNT: ${RAG_FILE_MAX_COUNT:-10}
+      # Phase 2.1 — Spotlighting (indirect prompt-injection defense) is now
+      # default-on. Wraps every retrieved chunk in <UNTRUSTED_RETRIEVED_CONTENT>
+      # tags and instructs the model to treat the payload as data only.
+      # See ext/services/spotlight.py and tests/unit/test_spotlight_default.py.
+      # Override via RAG_SPOTLIGHT=0 in the deploy env to disable.
+      RAG_SPOTLIGHT: ${RAG_SPOTLIGHT:-1}
       # Auto-inject current date/time as a pseudo-source on every retrieval so
       # the chat model can answer "what day is it?" without hallucinating from
       # its training cutoff. Toggle with RAG_INJECT_DATETIME=0 to disable.
@@ -311,6 +317,12 @@ services:
       AUTH_MODE: ${AUTH_MODE:-jwt}
       RAG_VECTOR_SIZE: ${RAG_VECTOR_SIZE:-1024}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      # Phase 1.5 — Redis-backed RBAC cache. DB 3 is reserved so the cache
+      # is isolated from the application redis (DB 0) and the celery
+      # broker. TTL=0 disables the cache (operator escape hatch); default
+      # 30s balances admin-grant freshness against DB load reduction.
+      RAG_RBAC_CACHE_REDIS_URL: ${RAG_RBAC_CACHE_REDIS_URL:-redis://redis:6379/3}
+      RAG_RBAC_CACHE_TTL_SECS: ${RAG_RBAC_CACHE_TTL_SECS:-30}
       SESSION_SECRET: ${SESSION_SECRET}
     volumes:
       - ../volumes/uploads:/app/backend/data/uploads

@@ -49,7 +49,7 @@ async def test_alice_private_doc_invisible_to_bob(client):
     assert r.status_code == 201
 
     r = await client.post("/api/rag/retrieve", headers=BOB, json={
-        "chat_id": 200,
+        "chat_id": "200",
         "query": "account number",
         "selected_kb_config": [],
     })
@@ -64,7 +64,7 @@ async def test_alice_private_doc_invisible_to_bob(client):
 async def test_bob_cannot_query_alices_chat(client):
     BOB = {"X-User-Id": "2", "X-User-Role": "user"}
     r = await client.post("/api/rag/retrieve", headers=BOB, json={
-        "chat_id": 100,
+        "chat_id": "100",
         "query": "anything",
         "selected_kb_config": [],
     })

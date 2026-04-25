@@ -4,12 +4,116 @@ from __future__ import annotations
 import asyncio
 import os
 from time import perf_counter
-from typing import List, Optional, Sequence
+from typing import Any, List, Optional, Sequence
 
 from . import flags
 from .embedder import Embedder
 from .obs import span
 from .vector_store import CHAT_PRIVATE_COLLECTION, Hit, VectorStore
+
+
+# RRF (Reciprocal Rank Fusion) constant. The canonical value 60 from the
+# original RRF paper (Cormack et al. 2009) — large enough that the
+# contribution of rank-N items decays gradually rather than collapsing
+# everything onto rank 0. Tuning this is rarely worthwhile.
+RRF_K = 60
+
+
+def rrf_fuse_heads(
+    heads: list[list[tuple[str, int]]],
+    *,
+    k: int = 60,
+    top_k: int,
+) -> list[tuple[str, float]]:
+    """Reciprocal Rank Fusion across multiple retrieval heads.
+
+    Each head is a list of ``(doc_id, rank)`` tuples (rank is 0-indexed
+    within that head). The fused score for a doc is::
+
+        score(doc) = Σ_heads 1 / (k + rank + 1)
+
+    Missing from a head → no contribution from that head (this is what
+    makes RRF degrade gracefully when one arm — e.g. ColBERT on a legacy
+    collection — returns empty: the fusion still ranks the remaining
+    arms correctly).
+
+    Used by the per-KB search path (Phase 3.5 tri-fusion) to combine
+    dense + sparse + ColBERT result lists when ``RAG_COLBERT=1`` AND the
+    collection has the named ``colbert`` vector slot. Pure function — no
+    Qdrant or model dependencies, fully unit-testable.
+    """
+    scores: dict[str, float] = {}
+    for head in heads:
+        for doc_id, rank in head:
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank + 1)
+    return sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
+
+
+def _field(h: Any, key: str, default: Any = None) -> Any:
+    """Read a field from either a plain dict (test fixtures) or a ``Hit``
+    dataclass (production). For ``Hit`` objects, ``score`` and ``id`` are
+    top-level attributes while everything else lives in ``payload``.
+    """
+    if isinstance(h, dict):
+        return h.get(key, default)
+    if key in ("score", "id"):
+        return getattr(h, key, default)
+    payload = getattr(h, "payload", None) or {}
+    return payload.get(key, default)
+
+
+def merge_kb_results(
+    per_kb: dict,
+    *,
+    rerank_enabled: bool,
+    top_k: int,
+) -> list:
+    """Combine per-KB hit lists into one sorted list.
+
+    With rerank ON: simple global sort by score. The cross-encoder will
+    re-score everything against the same query later anyway, so absolute
+    Qdrant scores at this stage are just a coarse pre-filter — order
+    doesn't have to be perfect across collections.
+
+    With rerank OFF: RRF (Reciprocal Rank Fusion) by within-KB rank, so
+    a chatty KB whose Qdrant scores are systematically higher doesn't
+    dominate the result set. Each hit gets ``Σ 1/(60 + rank_in_kb + 1)``
+    summed across every KB it appears in (typically just one — the same
+    chunk lives in exactly one collection — but the formulation is
+    rank-fusion-canonical).
+
+    Accepts either plain dicts (test fixtures shape:
+    ``{"kb_id", "doc_id", "chunk_index", "score"}``) or ``Hit`` dataclass
+    instances; ``_field`` handles the difference. Output type matches
+    input type — production callers continue to receive ``Hit`` objects.
+    """
+    if rerank_enabled:
+        flat = [h for hits in per_kb.values() for h in hits]
+        flat.sort(key=lambda h: _field(h, "score", 0.0), reverse=True)
+        return flat[:top_k]
+    # RRF — rank-based fusion across KBs.
+    #
+    # The dedup key is ``(kb_id, doc_id, chunk_index)`` when those payload
+    # fields are present (canonical chunk identity, lets the same chunk in
+    # two collections share an RRF bucket — rare but theoretically right);
+    # otherwise we fall back to the hit's own id. Without the fallback,
+    # production hits with sparse payloads (e.g. chat-private docs that
+    # don't carry kb_id) would all collapse to the (None, None, None) key
+    # and overwrite each other.
+    rrf_scores: dict = {}
+    hit_by_key: dict = {}
+    for _kb_id, hits in per_kb.items():
+        for rank, h in enumerate(hits):
+            payload_key = (
+                _field(h, "kb_id"),
+                _field(h, "doc_id"),
+                _field(h, "chunk_index"),
+            )
+            key = payload_key if any(v is not None for v in payload_key) else _field(h, "id")
+            rrf_scores[key] = rrf_scores.get(key, 0.0) + 1.0 / (RRF_K + rank + 1)
+            hit_by_key[key] = h
+    sorted_keys = sorted(rrf_scores, key=rrf_scores.get, reverse=True)
+    return [hit_by_key[k] for k in sorted_keys[:top_k]]
 
 
 def _hybrid_enabled() -> bool:
@@ -246,11 +350,19 @@ async def retrieve(
     tasks.append(_search_chat())
     results = await asyncio.gather(*tasks)
 
-    flat: list[Hit] = []
-    for lst in results:
-        flat.extend(lst)
-    flat.sort(key=lambda h: h.score, reverse=True)
-    trimmed = flat[:total_limit]
+    # Build per-bucket map for ``merge_kb_results``. RRF treats every bucket
+    # symmetrically so we key by index, not kb_id — that also means duplicate
+    # kb_ids in ``selected_kbs`` (rare, but possible) keep their hits in
+    # separate buckets instead of silently overwriting. The trailing entry
+    # is the chat-private bucket. With rerank ON the helper just does a
+    # global sort by score, byte-equivalent to the previous inlined merge.
+    per_kb: dict[int, list[Hit]] = {i: list(lst) for i, lst in enumerate(results)}
+    rerank_enabled = flags.get("RAG_RERANK", "0") == "1"
+    trimmed = merge_kb_results(
+        per_kb,
+        rerank_enabled=rerank_enabled,
+        top_k=total_limit,
+    )
 
     # P2.6: write cache entry after successful Qdrant fan-out.
     # Same env-gate as above so the module stays unloaded in the default path.

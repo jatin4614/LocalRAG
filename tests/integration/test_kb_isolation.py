@@ -46,12 +46,12 @@ async def test_user_cannot_see_other_users_kb(client):
     r = await client.post("/api/kb", headers=ADMIN, json={"name": "AliceKB"})
     alice_kb_id = r.json()["id"]
     await client.post(f"/api/kb/{alice_kb_id}/access", headers=ADMIN,
-                      json={"group_id": 100, "access_type": "read"})
+                      json={"group_id": "100", "access_type": "read"})
 
     r = await client.post("/api/kb", headers=ADMIN, json={"name": "BobKB"})
     bob_kb_id = r.json()["id"]
     await client.post(f"/api/kb/{bob_kb_id}/access", headers=ADMIN,
-                      json={"group_id": 200, "access_type": "read"})
+                      json={"group_id": "200", "access_type": "read"})
 
     r = await client.get("/api/kb/available", headers=ALICE)
     names = {kb["name"] for kb in r.json()}

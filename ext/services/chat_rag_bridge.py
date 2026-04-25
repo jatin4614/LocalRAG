@@ -10,7 +10,7 @@ import json as _json
 import logging
 import os as _os
 import time
-from typing import Any, Awaitable, Callable, List, Optional
+from typing import Any, Awaitable, Callable, List, Mapping, Optional
 
 from . import flags
 from .kb_config import config_to_env_overrides, merge_configs
@@ -87,6 +87,91 @@ def classify_intent(query: str) -> str:
     return "specific"
 
 
+# -----------------------------------------------------------------------
+# Phase 2.2 — intent-conditional MMR / context-expand defaults.
+#
+# Different intent classes need different pipeline shapes:
+#   * specific / specific_date — one chunk is the answer; want adjacent
+#     chunks for context (RAG_CONTEXT_EXPAND=1), MMR would dilute the
+#     single best hit (RAG_MMR=0).
+#   * global — broad aggregation across docs; diversity matters
+#     (RAG_MMR=1), context expansion just inflates already-broad
+#     summaries (RAG_CONTEXT_EXPAND=0).
+#   * metadata — answered by the catalog preamble alone; both off.
+#
+# Reconciled with the 4-class ``query_intent.classify_with_reason``
+# (``specific_date`` is mapped like ``specific``). The simple 3-class
+# ``classify_intent`` above never emits ``specific_date`` — the entry
+# is defensive so swapping classifiers later (Plan B Task 4) is a
+# zero-touch change.
+# -----------------------------------------------------------------------
+_INTENT_FLAG_POLICY: dict[str, dict[str, str]] = {
+    "specific":      {"RAG_MMR": "0", "RAG_CONTEXT_EXPAND": "1"},
+    "specific_date": {"RAG_MMR": "0", "RAG_CONTEXT_EXPAND": "1"},
+    "global":        {"RAG_MMR": "1", "RAG_CONTEXT_EXPAND": "0"},
+    "metadata":      {"RAG_MMR": "0", "RAG_CONTEXT_EXPAND": "0"},
+}
+
+
+def resolve_intent_flags(
+    *,
+    intent: str,
+    per_kb_overrides: Mapping[str, str],
+) -> dict[str, str]:
+    """Return the merged ``{RAG_*: "0"|"1"}`` overlay for ``intent``.
+
+    Precedence (default mode = ``intent``):
+      1. ``_INTENT_FLAG_POLICY[intent]``      — base
+      2. per-KB ``rag_config`` overrides      — wins over base
+      3. ``flags.with_overrides`` overlay     — applied by caller around
+         the returned dict; the returned keys SHADOW process env at lookup.
+
+    With ``RAG_INTENT_OVERLAY_MODE=env``, the precedence inverts for the
+    flag-keys we'd otherwise stamp: if the operator set ``RAG_MMR=1`` in
+    their env, we DROP ``RAG_MMR`` from the overlay so the env value
+    shows through ``flags.get`` unshadowed. Per-KB ``rag_config`` still
+    wins over both — it's an explicit per-collection statement.
+
+    Why the toggle exists (B3 design call, 2026-04-25):
+      * ``intent`` (default) — operator picks per-intent policy ONCE; the
+        intent classifier picks the right shape per query without
+        re-deploying. Production-safe defaults baked in. Per-KB
+        ``rag_config`` is the right escape hatch for collection-level
+        customisation.
+      * ``env``               — operator escape hatch. If retrieval is
+        misbehaving and we need to force MMR or expand on globally
+        without restarting the intent classifier or touching
+        ``rag_config``, env vars become a debug knob. Costs: blast
+        radius (env stays set forever), defeats the per-intent shaping.
+
+    Per Plan A B3 memory note: A/B both modes against real production
+    queries before locking the default. Until then, ``intent`` is the
+    safer default and matches the current behaviour Phase 2.2 shipped.
+
+    Unknown intents (typo, future label) fall back to the ``specific``
+    defaults — the largest bucket on real corpora, generally-useful
+    pipeline shape.
+
+    Pure function — no side effects (env reads are deterministic given
+    a process snapshot). Inputs are not mutated. Returns a fresh dict.
+    """
+    intent_defaults = _INTENT_FLAG_POLICY.get(intent, _INTENT_FLAG_POLICY["specific"])
+    merged: dict[str, str] = dict(intent_defaults)
+
+    # B3 mode toggle: when env should win, drop overlay keys that env has set.
+    overlay_mode = _os.environ.get("RAG_INTENT_OVERLAY_MODE", "intent").lower()
+    if overlay_mode == "env":
+        for key in list(merged.keys()):
+            if _os.environ.get(key) is not None:
+                del merged[key]
+
+    # Per-KB explicit overrides ALWAYS win, in either mode.
+    if per_kb_overrides:
+        for k, v in per_kb_overrides.items():
+            merged[str(k)] = str(v)
+    return merged
+
+
 def _log_rag_query(
     *,
     req_id: str,
@@ -127,6 +212,29 @@ user_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("user_id", def
 _vector_store = None
 _embedder = None
 _sessionmaker = None
+
+# Phase 1.5 — process-wide redis handle for the RBAC cache. Lazy-init via
+# _redis_client() so unit tests that never touch RBAC don't pay the cost
+# of opening a connection to a redis that isn't running.
+_rbac_redis = None
+
+
+def _redis_client():
+    """Return the shared async redis handle used by the RBAC cache.
+
+    Creates the handle on first call from ``RAG_RBAC_CACHE_REDIS_URL``
+    (default ``redis://localhost:6379/3`` so it's isolated from the
+    application redis on DB 0). Subsequent calls return the same
+    handle.
+    """
+    global _rbac_redis
+    if _rbac_redis is None:
+        import redis.asyncio as _redis
+        url = _os.environ.get(
+            "RAG_RBAC_CACHE_REDIS_URL", "redis://localhost:6379/3"
+        )
+        _rbac_redis = _redis.from_url(url)
+    return _rbac_redis
 
 
 def configure(*, vector_store, embedder, sessionmaker) -> None:
@@ -361,12 +469,29 @@ async def _retrieve_kb_sources_inner(
                 request_id_var.get(), user_id_var.get(),
                 len(kb_config or []), bool(chat_id))
 
-    # RBAC check — only if kb_config is non-empty
+    # RBAC check — only if kb_config is non-empty.
+    #
+    # Phase 1.5 — cache-first lookup. The cache is keyed on
+    # ``rbac:user:{user_id}`` (per-user namespace -> zero collision risk)
+    # with TTL = ``RAG_RBAC_CACHE_TTL_SECS`` (default 30s). Cache miss
+    # falls through to the DB. Any redis failure (connection refused,
+    # timeout, corrupt value) returns ``None`` from the cache layer so
+    # we still hit the DB -- the DB query is the source of truth and
+    # the cache is purely an accelerator. A sacred CLAUDE.md §2 invariant
+    # is that the DB miss MUST always run on cache absence so isolation
+    # is never weakened by cache outage.
     selected_kbs = []
     if kb_config:
-        from .rbac import get_allowed_kb_ids
+        # Phase 1.5 — cache-first lookup via the shared helper. Both the
+        # SSE / chat path here AND ``/api/rag/retrieve`` (rag.py) call
+        # this so the cache contract is identical across surfaces. The
+        # helper itself is the source of truth for the cache namespace
+        # / TTL / fail-open semantics — see ``rbac.resolved_allowed_kb_ids``.
+        from .rbac import resolved_allowed_kb_ids
         async with _sessionmaker() as s:
-            allowed = set(await get_allowed_kb_ids(s, user_id=user_id))
+            allowed = await resolved_allowed_kb_ids(
+                s, user_id=user_id, redis=_redis_client(),
+            )
         selected_kbs = [cfg for cfg in kb_config if cfg.get("kb_id") in allowed]
         if not selected_kbs and not chat_id:
             return []
@@ -383,7 +508,22 @@ async def _retrieve_kb_sources_inner(
     merged_cfg = merge_configs(kb_rag_configs)
     overrides = config_to_env_overrides(merged_cfg)
 
-    with flags.with_overrides(overrides):
+    # Phase 2.2 — intent-conditional defaults for MMR / context_expand.
+    # Layer the intent's preferred shape UNDER the per-KB overrides so an
+    # admin's explicit ``rag_config`` value always wins. The classifier is
+    # the simple regex-based one (matching what's plumbed today); when the
+    # 4-class classifier from ``query_intent`` is wired (Plan B Task 4) the
+    # ``specific_date`` policy entry will start firing automatically with
+    # no code change here.
+    _intent_label_for_flags = classify_intent(query)
+    _intent_flag_overrides = resolve_intent_flags(
+        intent=_intent_label_for_flags, per_kb_overrides=overrides,
+    )
+    # ``resolve_intent_flags`` already applied the per-KB overrides on top
+    # of the intent defaults, so its return value IS the effective overlay.
+    merged_overrides = _intent_flag_overrides
+
+    with flags.with_overrides(merged_overrides):
         return await _run_pipeline(
             query=query,
             selected_kbs=selected_kbs,
@@ -412,6 +552,28 @@ async def _run_pipeline(
     # match — sub-millisecond, no external call.
     _intent_label = classify_intent(query)
     _kb_ids_for_log = [cfg.get("kb_id") for cfg in selected_kbs or []]
+
+    # Phase 1.3 — Qdrant preflight. Fails fast (returning empty sources) if
+    # Qdrant is fully down, before we fan out N parallel KB searches that
+    # would all time out individually. ``health_check()`` is cached 5s so N
+    # concurrent chat turns share one probe. ``getattr`` guard so unit tests
+    # that wire an ``object()`` stub as ``_vector_store`` (no health_check
+    # attribute) are unaffected — preflight is purely defensive against
+    # network outages, not a contract on the VectorStore interface.
+    _hc = getattr(_vector_store, "health_check", None)
+    if callable(_hc):
+        try:
+            if not await _hc():
+                logger.warning(
+                    "rag: qdrant preflight failed; returning empty sources"
+                )
+                return []
+        except Exception as _hc_exc:
+            # Probe itself raised — log but DO NOT short-circuit. Falling
+            # through lets downstream code surface the real Qdrant error
+            # with full context (collection name, filter shape) rather
+            # than the opaque preflight failure.
+            logger.warning("rag: qdrant preflight raised %s; continuing", _hc_exc)
 
     # Tier 2 — intent routing (gated by RAG_INTENT_ROUTING, default OFF).
     # When OFF, _intent/_intent_reason are fixed values and every branch
