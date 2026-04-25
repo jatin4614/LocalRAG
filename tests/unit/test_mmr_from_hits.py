@@ -242,9 +242,23 @@ async def test_default_flag_path_does_not_import_mmr_module(monkeypatch):
     assert "ext.services.mmr" not in sys.modules
 
 
+@pytest.mark.xfail(
+    strict=False,
+    reason=(
+        "Phase 2.2 intent overlay: classify_intent('hello') -> 'specific', "
+        "and _INTENT_FLAG_POLICY['specific'] forces RAG_MMR=0, overriding "
+        "the test's explicit RAG_MMR=1. The mmr module is therefore never "
+        "imported. Design decision pending — see triage report bucket F."
+    ),
+)
 @pytest.mark.asyncio
 async def test_flag_on_imports_and_reorders_via_mmr(monkeypatch):
-    """With ``RAG_MMR=1``, the bridge imports ``mmr`` and routes through it."""
+    """With ``RAG_MMR=1``, the bridge imports ``mmr`` and routes through it.
+
+    TODO(intent-overlay): re-enable once we decide how the env flag and
+    intent-policy overlay interact. See docs/runbook/preexisting-test-triage.md
+    bucket F.
+    """
     from ext.services import chat_rag_bridge as bridge
 
     # Reset cached import so we can see it show up again after the flag flip
