@@ -308,4 +308,128 @@ async def ingest_bytes(
                 point["sparse_vector"] = sv
             points.append(point)
     await vector_store.upsert(collection, points)
+
+    # Tier 1: per-document summary point.
+    # Gated by RAG_DOC_SUMMARIES (default OFF). When ON and we have a
+    # doc_id (KB uploads — not ephemeral chat uploads), call the chat
+    # model to produce a 3-sentence summary, embed it, and upsert one
+    # more point into the same collection with level="doc". Also mirror
+    # the summary into kb_documents.doc_summary so it's queryable from
+    # Postgres (UI "what does this doc cover?" previews).
+    #
+    # Fail-open at every step: a failed summary never blocks the
+    # chunk-level ingest (which already succeeded above). Default path
+    # (flag off) does not import doc_summarizer — zero cost.
+    if flags.get("RAG_DOC_SUMMARIES", "0") == "1" and doc_id is not None and texts:
+        try:
+            await _emit_doc_summary_point(
+                chunks_texts=texts,
+                filename=filename,
+                doc_id=int(doc_id),
+                payload_base=payload_base,
+                collection=collection,
+                vector_store=vector_store,
+                embedder=embedder,
+                pipeline_version=pv,
+                now_ns=now,
+            )
+        except Exception as e:  # noqa: BLE001 — best-effort
+            import logging as _log
+            _log.getLogger("orgchat.ingest").warning(
+                "doc summary emit failed for doc_id=%s: %s", doc_id, e
+            )
+
     return len(points)
+
+
+async def _emit_doc_summary_point(
+    *,
+    chunks_texts: list[str],
+    filename: str,
+    doc_id: int,
+    payload_base: Mapping[str, int | str],
+    collection: str,
+    vector_store: VectorStore,
+    embedder: Embedder,
+    pipeline_version: str,
+    now_ns: int,
+) -> None:
+    """Summarize a doc, embed the summary, and upsert one Qdrant point.
+
+    Also UPDATEs ``kb_documents.doc_summary`` so the text is queryable
+    from Postgres (no Qdrant round-trip needed for UI previews).
+
+    Fail-open at every boundary: caller wraps in try/except and logs.
+    The chunk-level ingest has already succeeded so any failure here
+    leaves the system in a consistent state (document indexed at the
+    chunk tier; summary tier simply absent until the backfill script
+    fills it in later).
+    """
+    import logging as _log
+    import uuid as _uuid
+    log = _log.getLogger("orgchat.ingest")
+
+    from .doc_summarizer import summarize_document
+
+    chat_url = os.environ.get("OPENAI_API_BASE_URL")
+    if not chat_url:
+        log.debug("RAG_DOC_SUMMARIES=1 but OPENAI_API_BASE_URL unset — skipping")
+        return
+    chat_model = os.environ.get("SUMMARY_MODEL",
+                                os.environ.get("CHAT_MODEL", "orgchat-chat"))
+    api_key = os.environ.get("OPENAI_API_KEY")
+
+    summary = await summarize_document(
+        chunks=chunks_texts,
+        filename=filename,
+        chat_url=chat_url,
+        chat_model=chat_model,
+        api_key=api_key,
+        timeout=float(os.environ.get("RAG_DOC_SUMMARY_TIMEOUT", "30.0")),
+    )
+    if not summary:
+        log.debug("empty summary for doc_id=%s — skipping summary point", doc_id)
+        return
+
+    # Embed the summary as a single-element batch.
+    [summary_vec] = await embedder.embed([summary])
+
+    summary_payload: dict = dict(payload_base)
+    summary_payload["chunk_index"] = -1
+    summary_payload["text"] = summary
+    summary_payload["uploaded_at"] = now_ns
+    summary_payload["deleted"] = False
+    summary_payload["model_version"] = pipeline_version
+    summary_payload["level"] = "doc"
+    summary_payload["kind"] = "doc_summary"
+    summary_payload["filename"] = filename
+    # Keep the structural fields present so payload shape is homogenous
+    # with chunk points.
+    summary_payload.setdefault("page", None)
+    summary_payload.setdefault("heading_path", [])
+    summary_payload.setdefault("sheet", None)
+
+    point_id = str(_uuid.uuid5(_POINT_NS, f"doc:{doc_id}:doc_summary"))
+    point = {"id": point_id, "vector": summary_vec, "payload": summary_payload}
+
+    await vector_store.upsert(collection, [point])
+
+    # Mirror into Postgres. Import lazily — ingest.py doesn't currently
+    # depend on the chat_rag_bridge module registry, so we reach into its
+    # configured sessionmaker (set by ext.app.build_ext_routers at
+    # startup). If unset (unlikely in prod, possible in tests), skip the
+    # mirror silently — Qdrant is the retrieval source of truth.
+    try:
+        from .chat_rag_bridge import _sessionmaker as _sm
+        if _sm is not None:
+            from sqlalchemy import text as _sql_text
+            async with _sm() as s:
+                await s.execute(
+                    _sql_text(
+                        "UPDATE kb_documents SET doc_summary = :s WHERE id = :d"
+                    ),
+                    {"s": summary, "d": doc_id},
+                )
+                await s.commit()
+    except Exception as e:  # noqa: BLE001 — best-effort mirror
+        log.warning("kb_documents.doc_summary mirror failed doc_id=%s: %s", doc_id, e)

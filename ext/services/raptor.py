@@ -34,6 +34,8 @@ from typing import Optional, Sequence
 
 import httpx
 
+from .obs import inject_context_into_headers, span
+
 
 @dataclass
 class RaptorNode:
@@ -104,6 +106,7 @@ async def _summarize_cluster(
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+    headers = inject_context_into_headers(headers)
     url = f"{chat_url.rstrip('/')}/chat/completions"
     try:
         async with httpx.AsyncClient(timeout=timeout_s, transport=transport) as client:
@@ -196,6 +199,39 @@ async def build_tree(
     matches the chat endpoint's typical batch capacity without choking
     other concurrent ingests.
     """
+    # Wrap the entire tree-build in a span so operators can attribute
+    # ingest latency to RAPTOR vs. plain chunking.
+    with span(
+        "raptor.build_tree",
+        n_leaves=len(leaves),
+        max_levels=max_levels,
+        model=chat_model,
+    ):
+        return await _build_tree_impl(
+            leaves,
+            chat_url=chat_url,
+            chat_model=chat_model,
+            api_key=api_key,
+            embedder=embedder,
+            max_levels=max_levels,
+            cluster_min=cluster_min,
+            concurrency=concurrency,
+            transport=transport,
+        )
+
+
+async def _build_tree_impl(
+    leaves: Sequence[dict],
+    *,
+    chat_url: str,
+    chat_model: str,
+    api_key: Optional[str] = None,
+    embedder,
+    max_levels: int = 3,
+    cluster_min: int = 5,
+    concurrency: int = 4,
+    transport: Optional[httpx.AsyncBaseTransport] = None,
+) -> list[RaptorNode]:
     nodes: list[RaptorNode] = []
 
     # --- Level 0: leaves ----------------------------------------------------
