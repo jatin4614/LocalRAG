@@ -74,6 +74,7 @@ async def engine(pg):
               id BIGSERIAL PRIMARY KEY,
               user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
               title TEXT,
+              meta JSONB,
               created_at TIMESTAMPTZ NOT NULL DEFAULT now()
             );
         """)
@@ -133,9 +134,9 @@ async def engine(pg):
             -- Upstream's chat table is singular and uses TEXT ids
             -- (chat_id from upstream is a UUID-string). Wrap the
             -- legacy plural ``chats`` table so the rag bridge's
-            -- ``SELECT user_id FROM chat WHERE id = :cid`` works.
+            -- ``SELECT user_id, meta FROM chat WHERE id = :cid`` works.
             CREATE VIEW chat AS
-              SELECT id::text AS id, user_id::text AS user_id, title, created_at
+              SELECT id::text AS id, user_id::text AS user_id, title, meta, created_at
               FROM chats;
         ''')
     yield eng

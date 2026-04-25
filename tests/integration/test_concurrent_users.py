@@ -61,7 +61,7 @@ async def test_concurrent_private_uploads_stay_isolated(client):
     for uid, cid in users_chats:
         h = {"X-User-Id": str(uid), "X-User-Role": "user"}
         r = await client.post("/api/rag/retrieve", headers=h, json={
-            "chat_id": cid, "query": "secret token",
+            "chat_id": str(cid), "query": "secret token",
             "selected_kb_config": [],
         })
         assert r.status_code == 200
