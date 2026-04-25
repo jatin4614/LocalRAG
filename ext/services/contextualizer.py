@@ -32,6 +32,8 @@ from typing import Iterable, Optional
 
 import httpx
 
+from .retry_policy import with_transient_retry
+
 
 log = logging.getLogger("orgchat.contextualize")
 
@@ -74,6 +76,29 @@ def is_enabled() -> bool:
     without reimporting the module.
     """
     return os.environ.get("RAG_CONTEXTUALIZE_KBS", "0") == "1"
+
+
+@with_transient_retry(attempts=2, base_sec=0.5)
+async def _contextualize_call(
+    url: str,
+    body: dict,
+    headers: dict,
+    timeout_s: float,
+    transport: Optional[httpx.AsyncBaseTransport],
+) -> dict:
+    """POST to the chat-completion endpoint and return parsed JSON.
+
+    Wrapped with the shared transient-error retry policy. ``attempts=2``
+    keeps the per-chunk worst-case bounded — a 1000-chunk doc with three
+    retries of a 500 ms timeout each would add 1500 ms × 1000 = 25 min
+    of pure wait time, which would dwarf the actual ingest. Fail-open in
+    the caller ensures a per-chunk failure just degrades to raw chunk
+    text, never crashes ingest.
+    """
+    async with httpx.AsyncClient(timeout=timeout_s, transport=transport) as client:
+        r = await client.post(url, json=body, headers=headers)
+        r.raise_for_status()
+        return r.json()
 
 
 async def contextualize_chunk(
@@ -124,13 +149,10 @@ async def contextualize_chunk(
 
     url = f"{chat_url.rstrip('/')}/chat/completions"
     try:
-        async with httpx.AsyncClient(timeout=timeout_s, transport=transport) as client:
-            r = await client.post(url, json=body, headers=headers)
-            r.raise_for_status()
-            data = r.json()
+        data = await _contextualize_call(url, body, headers, timeout_s, transport)
         context = (data["choices"][0]["message"]["content"] or "").strip()
     except Exception as e:  # noqa: BLE001 — fail-open by design
-        log.debug("contextualize failed, keeping raw chunk: %s", e)
+        log.debug("contextualize failed after retries, keeping raw chunk: %s", e)
         return chunk_text
 
     # Empty / oversized → fall open. An empty reply means the model

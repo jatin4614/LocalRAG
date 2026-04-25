@@ -32,6 +32,7 @@ from typing import Optional
 import httpx
 
 from .obs import inject_context_into_headers, span
+from .retry_policy import with_transient_retry
 
 log = logging.getLogger("orgchat.hyde")
 
@@ -41,6 +42,28 @@ _PROMPT = """You are an expert writing a concise excerpt from a document that wo
 Question: {query}
 
 Excerpt:"""
+
+
+@with_transient_retry(attempts=2, base_sec=0.5)
+async def _hyde_call(
+    url: str,
+    body: dict,
+    headers: dict,
+    timeout_s: float,
+    transport: Optional[httpx.AsyncBaseTransport],
+) -> dict:
+    """POST to the chat-completion endpoint and return parsed JSON.
+
+    Wrapped with the shared transient-error retry policy. ``attempts=2`` is
+    lower than the embedder (3) because HyDE adds an extra chat call to
+    every retrieval — three retries of a 500 ms timeout would put a 1.5 s
+    extra latency tax on every miss, which is worse than just falling
+    open to the raw-query embedding baseline.
+    """
+    async with httpx.AsyncClient(timeout=timeout_s, transport=transport) as client:
+        r = await client.post(url, json=body, headers=headers)
+        r.raise_for_status()
+        return r.json()
 
 
 async def _generate_one(
@@ -77,13 +100,10 @@ async def _generate_one(
 
     url = f"{chat_url.rstrip('/')}/chat/completions"
     try:
-        async with httpx.AsyncClient(timeout=timeout_s, transport=transport) as client:
-            r = await client.post(url, json=body, headers=headers)
-            r.raise_for_status()
-            data = r.json()
+        data = await _hyde_call(url, body, headers, timeout_s, transport)
         text = (data["choices"][0]["message"]["content"] or "").strip()
     except Exception as e:  # noqa: BLE001 — fail-open by design
-        log.debug("hyde generation failed: %s", e)
+        log.debug("hyde generation failed after retries: %s", e)
         return None
 
     if not text or len(text) > 2000:

@@ -9,6 +9,7 @@ from typing import Optional, Protocol
 import httpx
 
 from .obs import inject_context_into_headers, span
+from .retry_policy import with_transient_retry
 
 
 class Embedder(Protocol):
@@ -61,6 +62,24 @@ class TEIEmbedder:
     async def aclose(self) -> None:
         await self._client.aclose()
 
+    @with_transient_retry(attempts=3, base_sec=0.5)
+    async def _embed_batch(self, batch: list[str]) -> list[list[float]]:
+        """POST one TEI batch (≤ ``_max_batch`` inputs).
+
+        Wrapped with the shared transient-error retry policy so a single
+        TEI hiccup (GC pause, brief 5xx, network blip) doesn't degrade
+        every concurrent request. The decorator is a no-op pass-through
+        when ``RAG_TENACITY_RETRY=0``.
+        """
+        headers = inject_context_into_headers({})
+        r = await self._client.post(
+            "/embed",
+            json={"inputs": batch},
+            headers=headers or None,
+        )
+        r.raise_for_status()
+        return r.json()
+
     async def embed(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
@@ -77,12 +96,5 @@ class TEIEmbedder:
         ):
             for i in range(0, len(texts), self._max_batch):
                 batch = texts[i : i + self._max_batch]
-                headers = inject_context_into_headers({})
-                r = await self._client.post(
-                    "/embed",
-                    json={"inputs": batch},
-                    headers=headers or None,
-                )
-                r.raise_for_status()
-                out.extend(r.json())
+                out.extend(await self._embed_batch(batch))
             return out
