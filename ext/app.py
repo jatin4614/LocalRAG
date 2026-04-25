@@ -1,8 +1,11 @@
 """FastAPI application entry point for the KB management + retrieval + RAG API."""
 from __future__ import annotations
 
+import asyncio
 import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import AsyncIterator
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
@@ -17,6 +20,58 @@ from .services.obs import init_observability
 from .services.vector_store import VectorStore
 
 _logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def _rbac_subscriber_lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """FastAPI lifespan that runs the RBAC pub/sub subscriber.
+
+    Phase 1.5 follow-up: ``subscribe_invalidations`` must run in the
+    background of every replica so RBAC revocations published by another
+    replica's ``kb_admin`` mutation propagate within milliseconds (instead
+    of waiting up to ``RAG_RBAC_CACHE_TTL_SECS`` for the TTL safety net).
+
+    Single-replica today, but flipping a second worker on without this
+    wired would leak revoked KB grants for up to 30 seconds — the kind
+    of silent regression the TTL is supposed to bound, not the primary
+    invalidation channel.
+
+    Fail-open: any exception starting / running the subscriber is logged
+    and the app still serves traffic. The TTL safety net keeps the cache
+    correct even if pub/sub never delivers.
+    """
+    task: asyncio.Task | None = None
+    try:
+        from .services import chat_rag_bridge
+        from .services.rbac_cache import subscribe_invalidations
+
+        try:
+            redis_handle = chat_rag_bridge._redis_client()
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning(
+                "rbac subscriber: failed to obtain redis handle (%s) — "
+                "skipping. TTL safety net (%ss) still applies.",
+                exc,
+                __import__("os").environ.get("RAG_RBAC_CACHE_TTL_SECS", "30"),
+            )
+        else:
+            task = asyncio.create_task(
+                subscribe_invalidations(redis_handle),
+                name="rbac-cache-subscriber",
+            )
+            _logger.info("rbac subscriber: started (channel=rbac:invalidate)")
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning("rbac subscriber: startup failed (%s) — continuing", exc)
+
+    try:
+        yield
+    finally:
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 def _mount_metrics(app: FastAPI) -> None:
@@ -50,7 +105,7 @@ def build_app() -> FastAPI:
     upload.configure(sessionmaker=SessionLocal, vector_store=vs, embedder=emb)
     rag.configure(sessionmaker=SessionLocal, vector_store=vs, embedder=emb)
 
-    app = FastAPI(title="orgchat-kb", version="0.4.0")
+    app = FastAPI(title="orgchat-kb", version="0.4.0", lifespan=_rbac_subscriber_lifespan)
 
     # Observability bootstrap — fail-open no-op when OBS_ENABLED != true.
     init_observability(app)
@@ -167,6 +222,36 @@ def build_ext_routers():
     # Configure RAG bridge for middleware injection
     from .services import chat_rag_bridge
     chat_rag_bridge.configure(vector_store=vs, embedder=emb, sessionmaker=SessionLocal)
+
+    # Phase 1.5 follow-up — start the RBAC pub/sub subscriber on the
+    # upstream-mounted path. We don't own upstream's lifespan, so we
+    # attach a startup event handler to one of our routers; FastAPI
+    # propagates router-level event handlers to the parent app at
+    # ``include_router`` time. Single replica today, but the day a second
+    # worker comes up, RBAC revocations would otherwise leak for up to
+    # ``RAG_RBAC_CACHE_TTL_SECS`` (default 30s). Fail-open: any failure
+    # logs and the TTL safety net still applies.
+    from .services.rbac_cache import subscribe_invalidations as _sub_inv
+
+    async def _start_rbac_subscriber() -> None:
+        try:
+            redis_handle = chat_rag_bridge._redis_client()
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning(
+                "rbac subscriber (upstream): redis handle failed (%s) — "
+                "TTL safety net still applies.",
+                exc,
+            )
+            return
+        # Detach as a background task so the startup hook returns
+        # immediately. The event loop owns the task lifetime.
+        import asyncio as _asyncio
+        _asyncio.create_task(_sub_inv(redis_handle), name="rbac-cache-subscriber")
+        _logger.info(
+            "rbac subscriber (upstream): started (channel=rbac:invalidate)"
+        )
+
+    rag.router.add_event_handler("startup", _start_rbac_subscriber)
 
     # Vision preprocessor — converts attached images into text context
     # before RAG runs. Runs against vllm-vision on the internal network.
