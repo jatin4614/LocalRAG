@@ -38,6 +38,12 @@ class KBAvailable(BaseModel):
     description: Optional[str]
 
 
+class SubtagInfo(BaseModel):
+    id: int
+    name: str
+    description: Optional[str]
+
+
 @router.get("/api/kb/available", response_model=list[KBAvailable])
 async def available_kbs(
     user: CurrentUser = Depends(get_current_user),
@@ -46,6 +52,19 @@ async def available_kbs(
     allowed = await get_allowed_kb_ids(session, user_id=user.id)
     kbs = await kb_service.list_kbs(session, kb_ids=allowed)
     return [KBAvailable(id=k.id, name=k.name, description=k.description) for k in kbs]
+
+
+@router.get("/api/kb/{kb_id}/subtags", response_model=list[SubtagInfo])
+async def list_kb_subtags(
+    kb_id: int,
+    user: CurrentUser = Depends(get_current_user),
+    session: AsyncSession = Depends(_get_session),
+):
+    allowed = await get_allowed_kb_ids(session, user_id=user.id)
+    if kb_id not in allowed:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="kb not found")
+    subs = await kb_service.list_subtags(session, kb_id=kb_id)
+    return [SubtagInfo(id=s.id, name=s.name, description=s.description) for s in subs]
 
 
 class ChatKBConfig(BaseModel):
@@ -78,6 +97,46 @@ async def set_chat_kb_config(
             if entry.kb_id not in allowed:
                 raise HTTPException(status.HTTP_403_FORBIDDEN,
                                     detail=f"no access to kb_id={entry.kb_id}")
+
+        # Guard 1: every submitted subtag_id must belong to the kb_id it is grouped under.
+        all_sids = [sid for entry in parsed for sid in entry.subtag_ids]
+        if all_sids:
+            sub_rows = (await session.execute(
+                text('SELECT id, kb_id FROM kb_subtags WHERE id = ANY(:sids)'),
+                {"sids": all_sids},
+            )).all()
+            sid_to_kb = {int(r[0]): int(r[1]) for r in sub_rows}
+            for entry in parsed:
+                for sid in entry.subtag_ids:
+                    if sid_to_kb.get(sid) != entry.kb_id:
+                        raise HTTPException(
+                            status.HTTP_400_BAD_REQUEST,
+                            detail=f"subtag_id={sid} does not belong to kb_id={entry.kb_id}",
+                        )
+
+    # Guard 2: kb_config is locked once the chat has any user message (design §2.4).
+    # Upstream stores messages as a dict at chat.chat['history']['messages'], keyed by
+    # message_id; each message carries a 'role'. We count role=='user' entries.
+    chat_blob = (await session.execute(
+        text('SELECT chat FROM chat WHERE id = :cid'),
+        {"cid": chat_id},
+    )).scalar()
+    if chat_blob:
+        if isinstance(chat_blob, str):
+            try:
+                chat_blob = json.loads(chat_blob)
+            except (ValueError, TypeError):
+                chat_blob = {}
+        messages_map = (chat_blob or {}).get("history", {}).get("messages", {}) or {}
+        has_user_message = any(
+            isinstance(m, dict) and m.get("role") == "user"
+            for m in messages_map.values()
+        )
+        if has_user_message:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail="chat already has messages; kb_config is locked",
+            )
 
     # Store in chat.meta JSON column
     current_meta = row[1] if row[1] else {}

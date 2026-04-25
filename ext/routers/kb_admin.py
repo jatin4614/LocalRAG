@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from typing import Any, AsyncGenerator, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
@@ -397,3 +398,178 @@ async def reembed_document(
     # For now: return an error directing the admin to re-upload.
     raise HTTPException(status.HTTP_501_NOT_IMPLEMENTED,
                         detail="Re-embed requires re-upload (original files not stored on disk in this version)")
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — KB health endpoint
+# ---------------------------------------------------------------------------
+
+def compute_drift_pct(expected: int, observed: int) -> float:
+    """Return absolute-value drift between expected and observed counts.
+
+    ``drift_pct = |observed - expected| / expected * 100``. When ``expected``
+    is 0 (empty KB) the drift is defined as 0 regardless of observed —
+    we would never want alarms on newly-created KBs whose chunks are still
+    ingesting, and a freshly-emptied KB (expected==0, observed==0) is also
+    clean.
+
+    Pure function. Must be import-safe (no DB / Qdrant access).
+    """
+    if expected <= 0:
+        return 0.0
+    diff = abs(int(observed) - int(expected))
+    return (diff / float(expected)) * 100.0
+
+
+class FailedDoc(BaseModel):
+    doc_id: int
+    error_message: Optional[str]
+
+
+class KBHealthOut(BaseModel):
+    kb_id: int
+    postgres_doc_count: int
+    qdrant_point_count: int
+    expected_chunks_from_rows: int
+    drift_pct: float
+    pipeline_version_distribution: dict[str, int]
+    oldest_chunk_uploaded_at: Optional[str]
+    newest_chunk_uploaded_at: Optional[str]
+    failed_docs: list[FailedDoc]
+
+
+@router.get("/{kb_id}/health", response_model=KBHealthOut)
+async def kb_health(
+    kb_id: int,
+    user: CurrentUser = Depends(require_admin),
+    session: AsyncSession = Depends(_get_session),
+) -> KBHealthOut:
+    """Phase 4 — operational health snapshot for one KB.
+
+    Joins Postgres truth (``kb_documents`` live rows) against Qdrant
+    observation (``collection.count``) so the operator can spot orphan
+    chunks (reingest left stale v2 points) or missing chunks (ingest failed
+    silently). Also emits ``rag_kb_drift_pct{kb_id=...}`` as a side-effect
+    so Prometheus scrapes record the latest value — this avoids a background
+    task whose lifecycle would be awkward to manage inside FastAPI's event
+    loop, and keeps the metric lazy (only refreshed when someone checks).
+
+    Admin-only. Fail-open on Qdrant — if the collection is missing the
+    endpoint still returns Postgres truth plus ``qdrant_point_count=0``.
+    """
+    # 1) Postgres truth
+    kb = await kb_service.get_kb(session, kb_id=kb_id)
+    if kb is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="kb not found")
+
+    rows = (await session.execute(
+        select(KBDocument).where(
+            KBDocument.kb_id == kb_id,
+            KBDocument.deleted_at.is_(None),
+        )
+    )).scalars().all()
+
+    postgres_doc_count = len(rows)
+    expected_chunks = sum(int(r.chunk_count or 0) for r in rows)
+
+    failed = [
+        FailedDoc(doc_id=r.id, error_message=r.error_message)
+        for r in rows if r.ingest_status == "failed"
+    ]
+
+    # 2) Qdrant observation. Fail-open — a missing / unreachable Qdrant
+    #    returns zeros, not a 500. Surfacing the zero via drift % lets
+    #    operators see the problem on their dashboard instead of just an
+    #    opaque API failure.
+    collection = f"kb_{kb_id}"
+    qdrant_point_count = 0
+    pipeline_version_distribution: dict[str, int] = {}
+    oldest_uploaded_at: Optional[str] = None
+    newest_uploaded_at: Optional[str] = None
+
+    if _VS is not None:
+        try:
+            info = await _VS._client.count(collection_name=collection, exact=True)
+            qdrant_point_count = int(getattr(info, "count", 0) or 0)
+        except Exception as e:
+            log.info("kb_health: qdrant count failed for %s: %s", collection, e)
+
+        # Scroll a sample for pipeline_version distribution and uploaded_at
+        # bounds. Hard-capped at 2000 points per call — enough to make the
+        # distribution representative on KBs up to a few tens of thousands
+        # of points without hammering Qdrant. Health is an operator tool,
+        # not a per-request hot path.
+        try:
+            seen_versions: Counter[str] = Counter()
+            oldest: Optional[str] = None
+            newest: Optional[str] = None
+            offset = None
+            pulled = 0
+            LIMIT_PER_PAGE = 1024
+            MAX_PULL = 2048  # two pages — reasonable upper bound for a health check
+            while pulled < MAX_PULL:
+                page, offset = await _VS._client.scroll(
+                    collection_name=collection,
+                    limit=LIMIT_PER_PAGE,
+                    offset=offset,
+                    with_payload=[
+                        "pipeline_version",
+                        "uploaded_at",
+                    ],
+                    with_vectors=False,
+                )
+                if not page:
+                    break
+                for pt in page:
+                    payload = pt.payload or {}
+                    pv = payload.get("pipeline_version") or "unknown"
+                    seen_versions[pv] += 1
+                    ts = payload.get("uploaded_at")
+                    if ts:
+                        ts_str = str(ts)
+                        if oldest is None or ts_str < oldest:
+                            oldest = ts_str
+                        if newest is None or ts_str > newest:
+                            newest = ts_str
+                pulled += len(page)
+                if offset is None:
+                    break
+            pipeline_version_distribution = dict(seen_versions)
+            oldest_uploaded_at = oldest
+            newest_uploaded_at = newest
+        except Exception as e:
+            log.info("kb_health: qdrant scroll failed for %s: %s", collection, e)
+
+    # Fall back to Postgres' uploaded_at timestamps if Qdrant didn't
+    # surface any — keeps the endpoint informative for pre-1a data that
+    # never stamped uploaded_at into Qdrant payloads.
+    if oldest_uploaded_at is None and rows:
+        try:
+            timestamps = [r.uploaded_at for r in rows if r.uploaded_at is not None]
+            if timestamps:
+                oldest_uploaded_at = min(timestamps).isoformat()
+                newest_uploaded_at = max(timestamps).isoformat()
+        except Exception:
+            pass
+
+    drift = compute_drift_pct(expected_chunks, qdrant_point_count)
+
+    # 3) Emit the drift gauge as a side-effect. Fail-open: any metric
+    #    issue must not break the endpoint.
+    try:
+        from ..services.metrics import rag_kb_drift_pct
+        rag_kb_drift_pct.labels(kb_id=str(kb_id)).set(drift)
+    except Exception:
+        pass
+
+    return KBHealthOut(
+        kb_id=kb_id,
+        postgres_doc_count=postgres_doc_count,
+        qdrant_point_count=qdrant_point_count,
+        expected_chunks_from_rows=expected_chunks,
+        drift_pct=drift,
+        pipeline_version_distribution=pipeline_version_distribution,
+        oldest_chunk_uploaded_at=oldest_uploaded_at,
+        newest_chunk_uploaded_at=newest_uploaded_at,
+        failed_docs=failed,
+    )

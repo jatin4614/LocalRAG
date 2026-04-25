@@ -12,6 +12,7 @@ from ..db.models import validate_selected_kb_config
 from ..services.auth import CurrentUser, get_current_user
 from ..services.budget import budget_chunks
 from ..services.embedder import Embedder
+from ..services.obs import span
 from ..services.rbac import get_allowed_kb_ids
 from ..services.reranker import rerank
 from ..services.retriever import retrieve
@@ -74,32 +75,49 @@ async def rag_retrieve(
     if _VS is None or _EMB is None:
         raise RuntimeError("rag router not fully configured")
 
-    row = (await session.execute(
-        text('SELECT user_id FROM chat WHERE id = :cid'),
-        {"cid": body.chat_id},
-    )).first()
-    if row is None or str(row[0]) != str(user.id):
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="chat not found")
-
-    try:
-        parsed = validate_selected_kb_config(body.selected_kb_config) or []
-    except ValueError as e:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
-
-    allowed = set(await get_allowed_kb_ids(session, user_id=user.id))
-    for entry in parsed:
-        if entry.kb_id not in allowed:
-            raise HTTPException(status.HTTP_403_FORBIDDEN,
-                                detail=f"no access to kb_id={entry.kb_id}")
-
-    raw = await retrieve(
-        query=body.query,
-        selected_kbs=[{"kb_id": e.kb_id, "subtag_ids": e.subtag_ids} for e in parsed],
-        chat_id=body.chat_id,
-        vector_store=_VS, embedder=_EMB,
+    _kb_ids_attr = ",".join(
+        str(e.get("kb_id")) for e in (body.selected_kb_config or [])
+        if isinstance(e, dict) and e.get("kb_id") is not None
     )
-    reranked = rerank(raw, top_k=body.top_k)
-    budgeted = budget_chunks(reranked, max_tokens=body.max_tokens)
+    with span(
+        "chat.request",
+        user_id=str(user.id),
+        chat_id=str(body.chat_id),
+        kb_ids=_kb_ids_attr,
+        model="",
+        stream=False,
+    ):
+        row = (await session.execute(
+            text('SELECT user_id FROM chat WHERE id = :cid'),
+            {"cid": body.chat_id},
+        )).first()
+        if row is None or str(row[0]) != str(user.id):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="chat not found")
+
+        try:
+            parsed = validate_selected_kb_config(body.selected_kb_config) or []
+        except ValueError as e:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
+        allowed = set(await get_allowed_kb_ids(session, user_id=user.id))
+        for entry in parsed:
+            if entry.kb_id not in allowed:
+                try:
+                    from ..services.metrics import rbac_denied_total
+                    rbac_denied_total.labels(route="/api/rag/retrieve").inc()
+                except Exception:
+                    pass
+                raise HTTPException(status.HTTP_403_FORBIDDEN,
+                                    detail=f"no access to kb_id={entry.kb_id}")
+
+        raw = await retrieve(
+            query=body.query,
+            selected_kbs=[{"kb_id": e.kb_id, "subtag_ids": e.subtag_ids} for e in parsed],
+            chat_id=body.chat_id,
+            vector_store=_VS, embedder=_EMB,
+        )
+        reranked = rerank(raw, top_k=body.top_k)
+        budgeted = budget_chunks(reranked, max_tokens=body.max_tokens)
 
     return RetrieveResponse(hits=[
         HitOut(

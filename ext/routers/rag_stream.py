@@ -42,6 +42,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+from time import perf_counter
 from typing import AsyncIterator, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -49,6 +51,7 @@ from fastapi.responses import StreamingResponse
 
 from ..services import chat_rag_bridge
 from ..services.auth import CurrentUser, get_current_user
+from ..services.obs import span
 
 log = logging.getLogger("orgchat.rag_stream")
 
@@ -88,6 +91,11 @@ async def stream_retrieval(
     # Ownership + kb_config lookup in one trip — reuse the bridge's helper
     # so the access rules match the completion path exactly.
     kb_config = await chat_rag_bridge.get_kb_config_for_chat(chat_id, user.id)
+    _kb_ids_attr = ",".join(
+        str(e.get("kb_id")) for e in (kb_config or [])
+        if isinstance(e, dict) and e.get("kb_id") is not None
+    )
+    _model = os.environ.get("CHAT_MODEL", "orgchat-chat")
     # get_kb_config_for_chat returns None on unknown chat OR on lookup
     # failure. Treat either as "no KB config" — retrieval still runs over
     # the private-chat namespace if the user owns the chat, so we don't
@@ -95,6 +103,16 @@ async def stream_retrieval(
     # the user_id filter on the meta lookup.)
 
     async def event_stream() -> AsyncIterator[bytes]:
+     # Root SSE span wraps the whole event loop so retrieval child spans
+     # (emitted from chat_rag_bridge) nest correctly under this request.
+     with span(
+         "chat.sse_stream",
+         user_id=str(user.id),
+         chat_id=str(chat_id),
+         kb_ids=_kb_ids_attr,
+         model=_model,
+         stream=True,
+     ):
         # Queue used to ferry progress events from the bridge coroutine
         # (which may run in the same task) to the SSE generator (which
         # yields bytes). Asyncio Queue is the right primitive — it
@@ -123,6 +141,10 @@ async def stream_retrieval(
 
         task = asyncio.create_task(drain())
 
+        _t_start = perf_counter()
+        _first_recorded = False
+        _last_event_t: Optional[float] = None
+
         try:
             # Initial comment keeps the connection open through proxy
             # buffers (Caddy default buffer is empty-until-flush-on-EOL).
@@ -142,6 +164,18 @@ async def stream_retrieval(
                 if event is None:
                     yield _sse("done", {})
                     break
+                # Record TTFT on first real event, TPOT between subsequent events.
+                _now = perf_counter()
+                try:
+                    from ..services.metrics import llm_ttft_seconds, llm_tpot_seconds
+                    if not _first_recorded:
+                        llm_ttft_seconds.labels(model=_model).observe(_now - _t_start)
+                        _first_recorded = True
+                    elif _last_event_t is not None:
+                        llm_tpot_seconds.labels(model=_model).observe(_now - _last_event_t)
+                except Exception:
+                    pass
+                _last_event_t = _now
                 # "hits" and "done" events get their own SSE event name so
                 # clients can switch on addEventListener; everything else
                 # is a "stage" event.
