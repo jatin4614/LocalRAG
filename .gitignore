@@ -15,6 +15,15 @@ __pycache__/
 .env
 .env.local
 compose/.env
+compose/.env.*
+
+# Backups & local notes
+compose/*.pre-*
+compose/*.gemma4-attempt
+Dockerfile.openwebui.pre-*
+backups/
+debugger.md
+upgrade_issue.md
 
 # Runtime / volumes
 volumes/
