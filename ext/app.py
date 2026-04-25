@@ -11,6 +11,8 @@ from .config import clear_settings_cache, get_settings
 from .db.session import make_engine, make_sessionmaker
 from .routers import kb_admin, kb_retrieval, rag, rag_stream, upload
 from .services.embedder import TEIEmbedder
+from .services.logging_setup import configure_json_logging
+from .services.obs import init_observability
 from .services.vector_store import VectorStore
 
 _logger = logging.getLogger(__name__)
@@ -33,6 +35,7 @@ def _mount_metrics(app: FastAPI) -> None:
 
 
 def build_app() -> FastAPI:
+    configure_json_logging()
     clear_settings_cache()
     settings = get_settings()
     engine = make_engine(settings.async_database_url)
@@ -47,6 +50,9 @@ def build_app() -> FastAPI:
     rag.configure(sessionmaker=SessionLocal, vector_store=vs, embedder=emb)
 
     app = FastAPI(title="orgchat-kb", version="0.4.0")
+
+    # Observability bootstrap — fail-open no-op when OBS_ENABLED != true.
+    init_observability(app)
 
     @app.get("/healthz")
     async def healthz():
@@ -82,6 +88,23 @@ def build_ext_routers():
     from .services import auth as auth_svc
     from .services.embedder import TEIEmbedder
     from .services.vector_store import VectorStore
+
+    configure_json_logging()
+    # Mounted into upstream — we don't own the top-level FastAPI app, so
+    # init without an app (OTel SDK still exports; per-request enrichment
+    # happens via upstream's middleware stack when it calls us).
+    init_observability(None)
+
+    # Prom `/metrics` collides with upstream Svelte SPA catch-all — expose
+    # on a dedicated in-container port (9464) for Prometheus scrape.
+    try:
+        import os as _os
+        from prometheus_client import start_http_server as _start
+        _port = int(_os.environ.get("PROM_METRICS_PORT", "9464"))
+        _start(_port)
+        _logger.info("prometheus_client metrics server listening on :%d", _port)
+    except Exception as _e:  # pragma: no cover - defensive
+        _logger.warning("prometheus metrics port disabled: %s", _e)
 
     clear_settings_cache()
     settings = get_settings()
