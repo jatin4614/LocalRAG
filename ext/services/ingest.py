@@ -32,6 +32,19 @@ def _hybrid_enabled() -> bool:
     return os.environ.get("RAG_HYBRID", "1") != "0"
 
 
+def _colbert_enabled() -> bool:
+    """Read RAG_COLBERT at call time so tests / operators can toggle it.
+
+    Default OFF — ColBERT model isn't part of the default fastembed
+    cache hydration (Appendix A.2) and produces large multi-vector
+    payloads (~10kB / chunk for typical 60-token chunks). When OFF, the
+    embedder.colbert_embed function is never imported, so the default
+    ingest path stays byte-identical to pre-Task-3.4 behaviour.
+    Same gating semantics as RAG_HYBRID: any non-"0" value enables.
+    """
+    return os.environ.get("RAG_COLBERT", "0") == "1"
+
+
 def _contextualize_enabled() -> bool:
     """Read RAG_CONTEXTUALIZE_KBS at call time.
 
@@ -301,6 +314,29 @@ async def ingest_bytes(
                     # fastembed missing or failed — silently skip sparse arm.
                     sparse_vectors = [None] * len(paired)
 
+    # P3.4: ColBERT multi-vectors. Same two-gate pattern as sparse:
+    # ``RAG_COLBERT=1`` AND the target collection was created with the
+    # ``colbert`` named slot. When either is false we leave a list of
+    # Nones and the upsert path skips the colbert arm — leaving dense
+    # (and sparse, if applicable) byte-identical to pre-Task-3.4.
+    # Failures (model missing, fastembed not installed) silently fall
+    # through to dense+sparse only — never block ingest.
+    colbert_vectors: list[list[list[float]] | None] = [None] * len(paired)
+    if _colbert_enabled():
+        refresh_cb = getattr(vector_store, "_refresh_colbert_cache", None)
+        has_colbert = getattr(vector_store, "_collection_has_colbert", None)
+        if refresh_cb is not None and has_colbert is not None:
+            try:
+                await refresh_cb(collection)
+            except Exception:
+                pass  # fall through — has_colbert below will be False
+            if has_colbert(collection):
+                try:
+                    from .embedder import colbert_embed
+                    colbert_vectors = list(colbert_embed(texts))  # type: ignore[assignment]
+                except Exception:
+                    colbert_vectors = [None] * len(paired)
+
     now = time.time_ns()
     pv = current_version(context_augmented=context_augmented)
 
@@ -445,6 +481,15 @@ async def ingest_bytes(
                 sv = sparse_vectors[nidx]
                 if sv is not None:
                     point["sparse_vector"] = sv
+            # P3.4: only leaves (level 0, indexed by source chunk) get
+            # ColBERT vectors. RAPTOR summary nodes (level >= 1) are LLM
+            # paraphrases — token-level late interaction over a paraphrase
+            # is not meaningful, and skipping them keeps payload bloat
+            # bounded by the leaf count.
+            if node.level == 0 and nidx < len(colbert_vectors):
+                cv = colbert_vectors[nidx]
+                if cv is not None:
+                    point["colbert_vector"] = cv
             points.append(point)
     else:
         for gidx, ((chunk, block), vec) in enumerate(zip(paired, vectors)):
@@ -486,6 +531,15 @@ async def ingest_bytes(
             sv = sparse_vectors[gidx]
             if sv is not None:
                 point["sparse_vector"] = sv
+            # P3.4 ColBERT multi-vector — attached only when both the
+            # opt-in env flag is on AND the collection has the slot
+            # (the embed list is all-Nones otherwise; the upsert path
+            # also gates again on collection support so a stray
+            # colbert_vector field on a non-colbert collection is a
+            # no-op rather than a Qdrant error).
+            cv = colbert_vectors[gidx]
+            if cv is not None:
+                point["colbert_vector"] = cv
             points.append(point)
     await vector_store.upsert(collection, points)
 
