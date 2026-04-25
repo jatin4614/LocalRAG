@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections import Counter
 from typing import Any, AsyncGenerator, Optional
 
@@ -12,12 +13,67 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
 from sqlalchemy import select
 
 from ..services import kb_service
-from ..db.models import KBDocument, KnowledgeBase
+from ..db.models import KBAccess, KBDocument, KnowledgeBase
 from ..services.auth import CurrentUser, require_admin
 from ..services.kb_config import VALID_KEYS, validate_config
+from ..services.rbac import users_affected_by_grant
+from ..services.rbac_cache import get_shared_cache
 from ..services.vector_store import VectorStore
 
 log = logging.getLogger("orgchat.kb_admin")
+
+# Phase 1.5 — process-wide redis handle for the RBAC cache invalidation
+# pub/sub. Lazy-init on first grant mutation so unit tests that never
+# touch /access don't open a redis connection.
+_rbac_redis = None
+
+
+def _redis_client():
+    """Return the shared async redis handle for RBAC cache invalidation.
+
+    Uses ``RAG_RBAC_CACHE_REDIS_URL`` (default ``redis://localhost:6379/3``)
+    so it's isolated from the application redis on DB 0.
+    """
+    global _rbac_redis
+    if _rbac_redis is None:
+        import redis.asyncio as _redis
+        url = os.environ.get(
+            "RAG_RBAC_CACHE_REDIS_URL", "redis://localhost:6379/3"
+        )
+        _rbac_redis = _redis.from_url(url)
+    return _rbac_redis
+
+
+async def _invalidate_rbac_cache_for_grant(
+    session: AsyncSession, grant: KBAccess
+) -> None:
+    """Drop cached ``allowed_kb_ids`` for every user this grant changes.
+
+    Phase 1.5 — invariant: any ``kb_access`` mutation MUST trigger a
+    cache invalidation so users see the new permission within
+    ``RAG_RBAC_CACHE_TTL_SECS`` (default 30s) at worst, and immediately
+    on the publishing replica. The TTL is the safety net for dropped
+    pub/sub messages; this call is the fast path.
+
+    Fail-open: any redis error is logged at WARNING level. The grant
+    mutation itself MUST NOT roll back -- DB truth must always win, and
+    the worst case (cache write failure) is a stale entry for one TTL
+    window.
+    """
+    try:
+        affected = await users_affected_by_grant(session, grant)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("rbac cache: users_affected_by_grant failed: %s", exc)
+        return
+    if not affected:
+        return
+    try:
+        cache = get_shared_cache(redis=_redis_client())
+        await cache.invalidate(user_ids=affected)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "rbac cache: invalidate failed for users %s: %s", affected, exc
+        )
 
 router = APIRouter(prefix="/api/kb", tags=["kb-admin"])
 
@@ -304,6 +360,12 @@ async def grant_access(
     except Exception as e:
         await session.rollback()
         raise HTTPException(status.HTTP_409_CONFLICT, detail=str(e)) from e
+    # Phase 1.5 — invalidate cached allowed_kb_ids for every user this
+    # grant affects (direct user grant -> 1 user; group grant -> all
+    # current group members). Fail-open: a cache miss falls through to
+    # the DB on the next request, and the TTL safety net catches any
+    # dropped pub/sub message.
+    await _invalidate_rbac_cache_for_grant(session, g)
     return AccessOut(id=g.id, kb_id=g.kb_id, user_id=g.user_id, group_id=g.group_id, access_type=g.access_type)
 
 
@@ -323,10 +385,21 @@ async def revoke_access(
     user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(_get_session),
 ) -> Response:
+    # Phase 1.5 — fetch the grant row BEFORE deletion so we know which
+    # users to invalidate. If we read after the delete, the row is gone
+    # and we can't reconstruct user/group_id.
+    grant = (await session.execute(
+        select(KBAccess).where(KBAccess.id == grant_id, KBAccess.kb_id == kb_id)
+    )).scalar_one_or_none()
     ok = await kb_service.revoke_access(session, grant_id=grant_id)
     if not ok:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="grant not found")
     await session.commit()
+    # Invalidate cached allowed_kb_ids for users who lost access. Done
+    # AFTER commit so a rolled-back delete doesn't leave stale-evicted
+    # cache entries.
+    if grant is not None:
+        await _invalidate_rbac_cache_for_grant(session, grant)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

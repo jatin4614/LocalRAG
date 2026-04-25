@@ -1,7 +1,7 @@
 """RBAC: resolve which KB ids a user is allowed to read."""
 from __future__ import annotations
 
-from typing import List
+from typing import Any, List
 
 from sqlalchemy import or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -63,3 +63,43 @@ async def get_allowed_kb_ids(session: AsyncSession, *, user_id: str) -> List[int
         except Exception:
             pass
         return allowed
+
+
+async def users_affected_by_grant(
+    session: AsyncSession, grant: Any
+) -> List[str]:
+    """Return user ids whose ``allowed_kb_ids`` could change due to ``grant``.
+
+    Used by the RBAC cache (Phase 1.5) to publish targeted invalidation
+    after a ``kb_access`` mutation. We MUST NOT under-report -- a missed
+    user keeps a stale cache entry until TTL expiry, which can leak a
+    revoked KB for up to ``RAG_RBAC_CACHE_TTL_SECS`` seconds.
+
+    Two grant shapes:
+
+    * Direct user grant (``grant.user_id`` is set, ``grant.group_id`` is
+      None) -> exactly one user is affected.
+    * Group grant (``grant.group_id`` is set, ``grant.user_id`` is None)
+      -> every current member of the group is affected. We resolve
+      membership against upstream's ``group_member`` table (the same one
+      :func:`get_allowed_kb_ids` reads, so the cache invariant holds).
+    """
+    user_id = getattr(grant, "user_id", None)
+    if user_id is not None:
+        return [str(user_id)]
+    group_id = getattr(grant, "group_id", None)
+    if group_id is None:
+        # Defensive: a malformed grant with neither id should never reach
+        # us (KBAccess.__init__ enforces XOR), but if it does we return
+        # an empty list rather than raising -- cache invalidation is
+        # best-effort and the TTL safety net catches the gap.
+        return []
+    rows = (
+        await session.execute(
+            text(
+                'SELECT user_id FROM group_member WHERE group_id = :gid'
+            ),
+            {"gid": group_id},
+        )
+    ).scalars().all()
+    return [str(r) for r in rows]

@@ -311,6 +311,12 @@ services:
       AUTH_MODE: ${AUTH_MODE:-jwt}
       RAG_VECTOR_SIZE: ${RAG_VECTOR_SIZE:-1024}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      # Phase 1.5 — Redis-backed RBAC cache. DB 3 is reserved so the cache
+      # is isolated from the application redis (DB 0) and the celery
+      # broker. TTL=0 disables the cache (operator escape hatch); default
+      # 30s balances admin-grant freshness against DB load reduction.
+      RAG_RBAC_CACHE_REDIS_URL: ${RAG_RBAC_CACHE_REDIS_URL:-redis://redis:6379/3}
+      RAG_RBAC_CACHE_TTL_SECS: ${RAG_RBAC_CACHE_TTL_SECS:-30}
       SESSION_SECRET: ${SESSION_SECRET}
     volumes:
       - ../volumes/uploads:/app/backend/data/uploads

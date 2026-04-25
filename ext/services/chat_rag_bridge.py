@@ -128,6 +128,29 @@ _vector_store = None
 _embedder = None
 _sessionmaker = None
 
+# Phase 1.5 — process-wide redis handle for the RBAC cache. Lazy-init via
+# _redis_client() so unit tests that never touch RBAC don't pay the cost
+# of opening a connection to a redis that isn't running.
+_rbac_redis = None
+
+
+def _redis_client():
+    """Return the shared async redis handle used by the RBAC cache.
+
+    Creates the handle on first call from ``RAG_RBAC_CACHE_REDIS_URL``
+    (default ``redis://localhost:6379/3`` so it's isolated from the
+    application redis on DB 0). Subsequent calls return the same
+    handle.
+    """
+    global _rbac_redis
+    if _rbac_redis is None:
+        import redis.asyncio as _redis
+        url = _os.environ.get(
+            "RAG_RBAC_CACHE_REDIS_URL", "redis://localhost:6379/3"
+        )
+        _rbac_redis = _redis.from_url(url)
+    return _rbac_redis
+
 
 def configure(*, vector_store, embedder, sessionmaker) -> None:
     global _vector_store, _embedder, _sessionmaker
@@ -361,12 +384,39 @@ async def _retrieve_kb_sources_inner(
                 request_id_var.get(), user_id_var.get(),
                 len(kb_config or []), bool(chat_id))
 
-    # RBAC check — only if kb_config is non-empty
+    # RBAC check — only if kb_config is non-empty.
+    #
+    # Phase 1.5 — cache-first lookup. The cache is keyed on
+    # ``rbac:user:{user_id}`` (per-user namespace -> zero collision risk)
+    # with TTL = ``RAG_RBAC_CACHE_TTL_SECS`` (default 30s). Cache miss
+    # falls through to the DB. Any redis failure (connection refused,
+    # timeout, corrupt value) returns ``None`` from the cache layer so
+    # we still hit the DB -- the DB query is the source of truth and
+    # the cache is purely an accelerator. A sacred CLAUDE.md §2 invariant
+    # is that the DB miss MUST always run on cache absence so isolation
+    # is never weakened by cache outage.
     selected_kbs = []
     if kb_config:
         from .rbac import get_allowed_kb_ids
-        async with _sessionmaker() as s:
-            allowed = set(await get_allowed_kb_ids(s, user_id=user_id))
+        from .rbac_cache import get_shared_cache
+        allowed: set[int] | None = None
+        try:
+            cache = get_shared_cache(redis=_redis_client())
+            allowed = await cache.get(user_id=user_id)
+        except Exception as _cache_exc:  # noqa: BLE001
+            # Fail-open on cache errors: log and fall through to DB.
+            logger.debug("rbac cache get failed: %s", _cache_exc)
+            allowed = None
+        if allowed is None:
+            async with _sessionmaker() as s:
+                allowed = set(await get_allowed_kb_ids(s, user_id=user_id))
+            try:
+                cache = get_shared_cache(redis=_redis_client())
+                await cache.set(user_id=user_id, allowed_kb_ids=allowed)
+            except Exception as _cache_exc:  # noqa: BLE001
+                # Cache write failure is non-fatal: next request just
+                # re-fetches from the DB.
+                logger.debug("rbac cache set failed: %s", _cache_exc)
         selected_kbs = [cfg for cfg in kb_config if cfg.get("kb_id") in allowed]
         if not selected_kbs and not chat_id:
             return []
