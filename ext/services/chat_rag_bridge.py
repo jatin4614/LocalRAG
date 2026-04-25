@@ -10,7 +10,7 @@ import json as _json
 import logging
 import os as _os
 import time
-from typing import Any, Awaitable, Callable, List, Optional
+from typing import Any, Awaitable, Callable, List, Mapping, Optional
 
 from . import flags
 from .kb_config import config_to_env_overrides, merge_configs
@@ -85,6 +85,62 @@ def classify_intent(query: str) -> str:
         if pat in q:
             return "global"
     return "specific"
+
+
+# -----------------------------------------------------------------------
+# Phase 2.2 — intent-conditional MMR / context-expand defaults.
+#
+# Different intent classes need different pipeline shapes:
+#   * specific / specific_date — one chunk is the answer; want adjacent
+#     chunks for context (RAG_CONTEXT_EXPAND=1), MMR would dilute the
+#     single best hit (RAG_MMR=0).
+#   * global — broad aggregation across docs; diversity matters
+#     (RAG_MMR=1), context expansion just inflates already-broad
+#     summaries (RAG_CONTEXT_EXPAND=0).
+#   * metadata — answered by the catalog preamble alone; both off.
+#
+# Reconciled with the 4-class ``query_intent.classify_with_reason``
+# (``specific_date`` is mapped like ``specific``). The simple 3-class
+# ``classify_intent`` above never emits ``specific_date`` — the entry
+# is defensive so swapping classifiers later (Plan B Task 4) is a
+# zero-touch change.
+# -----------------------------------------------------------------------
+_INTENT_FLAG_POLICY: dict[str, dict[str, str]] = {
+    "specific":      {"RAG_MMR": "0", "RAG_CONTEXT_EXPAND": "1"},
+    "specific_date": {"RAG_MMR": "0", "RAG_CONTEXT_EXPAND": "1"},
+    "global":        {"RAG_MMR": "1", "RAG_CONTEXT_EXPAND": "0"},
+    "metadata":      {"RAG_MMR": "0", "RAG_CONTEXT_EXPAND": "0"},
+}
+
+
+def resolve_intent_flags(
+    *,
+    intent: str,
+    per_kb_overrides: Mapping[str, str],
+) -> dict[str, str]:
+    """Return the merged ``{RAG_*: "0"|"1"}`` overlay for ``intent``.
+
+    Policy:
+      * Look up ``intent`` in ``_INTENT_FLAG_POLICY``. Unknown intents
+        (e.g. typo, future label not yet plumbed) fall back to the
+        ``specific`` defaults — the safest catch-all because (a) it's
+        the largest bucket on real corpora and (b) "fetch a chunk + its
+        neighbours" is the most generally-useful pipeline shape.
+      * Per-KB explicit overrides ALWAYS win. An admin who stamped
+        ``rag_config.mmr = false`` did so deliberately; we don't
+        second-guess. Implementation: per-KB dict is layered on top of
+        the intent defaults via ``{**intent, **per_kb}``.
+
+    Pure function — no side effects, no I/O. Inputs are not mutated.
+    Returns a fresh dict so the caller can safely merge / mutate.
+    """
+    intent_defaults = _INTENT_FLAG_POLICY.get(intent, _INTENT_FLAG_POLICY["specific"])
+    # Fresh dict — never mutate the policy table or the caller's overrides.
+    merged: dict[str, str] = dict(intent_defaults)
+    if per_kb_overrides:
+        for k, v in per_kb_overrides.items():
+            merged[str(k)] = str(v)
+    return merged
 
 
 def _log_rag_query(
@@ -433,7 +489,22 @@ async def _retrieve_kb_sources_inner(
     merged_cfg = merge_configs(kb_rag_configs)
     overrides = config_to_env_overrides(merged_cfg)
 
-    with flags.with_overrides(overrides):
+    # Phase 2.2 — intent-conditional defaults for MMR / context_expand.
+    # Layer the intent's preferred shape UNDER the per-KB overrides so an
+    # admin's explicit ``rag_config`` value always wins. The classifier is
+    # the simple regex-based one (matching what's plumbed today); when the
+    # 4-class classifier from ``query_intent`` is wired (Plan B Task 4) the
+    # ``specific_date`` policy entry will start firing automatically with
+    # no code change here.
+    _intent_label_for_flags = classify_intent(query)
+    _intent_flag_overrides = resolve_intent_flags(
+        intent=_intent_label_for_flags, per_kb_overrides=overrides,
+    )
+    # ``resolve_intent_flags`` already applied the per-KB overrides on top
+    # of the intent defaults, so its return value IS the effective overlay.
+    merged_overrides = _intent_flag_overrides
+
+    with flags.with_overrides(merged_overrides):
         return await _run_pipeline(
             query=query,
             selected_kbs=selected_kbs,
