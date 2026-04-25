@@ -1,4 +1,4 @@
-"""Contextual chunk augmentation via chat model (P2.7).
+"""Contextual chunk augmentation via chat model (P2.7 + Plan A 3.1).
 
 For each chunk, call the chat endpoint with a "situate this chunk in the
 document" prompt. The short LLM-generated context is prepended to the
@@ -10,9 +10,11 @@ Design choices:
   returns the original chunk unchanged. A bad context pass is never worse
   than no context pass, so we never crash ingest over it.
 - **Per-chunk, not batched.** Anthropic's pattern is one call per chunk.
-  vLLM's prefix cache will reuse the shared ``{doc_title}``/preamble
-  tokens across calls for the same document, so batching them into a
-  single request would only obscure the per-chunk failure mode.
+  vLLM's prefix cache will reuse the shared system + doc-header messages
+  across calls for the same document (see ``build_contextualize_prompt``
+  below — the FINAL message is the only chunk-specific payload), so
+  batching them into a single request would only obscure the per-chunk
+  failure mode without buying KV-cache reuse we don't already get.
 - **Bounded concurrency.** ``contextualize_batch`` fans out via
   ``asyncio.gather`` under a semaphore (default 8) so we don't hammer
   the chat endpoint with one request per chunk on a 1000-chunk doc.
@@ -28,7 +30,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 
 import httpx
 
@@ -37,22 +39,6 @@ from .retry_policy import with_transient_retry
 
 
 log = logging.getLogger("orgchat.contextualize")
-
-
-# Adapted from Anthropic's Contextual Retrieval blog post. The trailing
-# instruction ("Answer ONLY ...") is load-bearing: without it Qwen2.5
-# sometimes prepends "Sure! Here's the context: ..." which we'd rather
-# avoid even though we strip common echo prefixes below.
-_PROMPT = """<document>
-{doc_title}
-</document>
-
-Here is the chunk we want to situate within the whole document:
-<chunk>
-{chunk_text}
-</chunk>
-
-Please give a short, succinct context to situate this chunk within the overall document, so that retrieval of this chunk works better. Answer ONLY with the succinct context - no preamble, no quotes, no apologies. Under 50 words."""
 
 
 # Common echo prefixes Qwen2.5 sometimes emits despite the "no preamble"
@@ -77,6 +63,100 @@ def is_enabled() -> bool:
     without reimporting the module.
     """
     return os.environ.get("RAG_CONTEXTUALIZE_KBS", "0") == "1"
+
+
+def build_contextualize_prompt(
+    *,
+    document_text: str,
+    chunk_text: str,
+    document_metadata: dict[str, Any],
+) -> list[dict[str, str]]:
+    """Build a cache-friendly chat-completions message list for contextualization.
+
+    The returned list has TWO parts:
+
+    1. The system message and the doc-header user message together carry the
+       DOCUMENT-level context — both are byte-identical for all chunks of the
+       same document, so vllm-chat's automatic-prefix-caching detects the
+       shared prefix and reuses the KV cache across chunks. On a 1000-chunk
+       document this turns 1000 cold-prompt evals into one cold + 999 cached.
+    2. The FINAL user message is the chunk-specific payload — only this one
+       differs between sibling chunks of the same doc.
+
+    Output target: a 50-100 token context prefix that carries the
+    *temporal* (document date) and *cross-document* (related titles) anchors
+    Anthropic's Contextual Retrieval blog post identifies as the load-bearing
+    signal — that's what moves the numbers from generic to the advertised
+    49% retrieval-failure reduction on inter-related corpora.
+
+    Optional metadata fields (``subtag_name``, ``document_date``,
+    ``related_doc_titles``) collapse to empty strings when missing rather
+    than leaking ``"None"`` / ``"[]"`` Python repr noise into the prompt
+    body — that noise would burn cache tokens without informing the model.
+
+    Args:
+        document_text: full document text. Caller is responsible for any
+            length clipping appropriate to the model's context window.
+        chunk_text: the specific chunk this prompt should produce a prefix
+            for. Caller is responsible for any per-chunk length clipping.
+        document_metadata: dict carrying ``filename``, ``kb_name``,
+            ``subtag_name``, ``document_date``, ``related_doc_titles``.
+            All fields are optional; missing or falsy values degrade
+            gracefully with no Python-repr leakage.
+
+    Returns:
+        A 3-message list ``[{role: "system"}, {role: "user", doc-header},
+        {role: "user", chunk}]`` ready to pass as ``messages`` in an
+        OpenAI-compatible chat-completions request.
+    """
+    filename = document_metadata.get("filename") or "unknown"
+    kb_name = document_metadata.get("kb_name") or "unknown"
+    subtag_name = document_metadata.get("subtag_name") or ""
+    document_date = document_metadata.get("document_date") or ""
+    related = document_metadata.get("related_doc_titles") or []
+
+    # Build the document-level header (stable across chunks → cacheable).
+    # Empty-string conditional substitution avoids "None" / "[]" leaks per
+    # the optional-fields contract — a missing date line is no line at all.
+    subtag_line = f" > {subtag_name}" if subtag_name else ""
+    date_line = f"Document date: {document_date}\n" if document_date else ""
+    related_line = (
+        f"Related documents: {', '.join(related)}\n" if related else ""
+    )
+
+    system_prompt = (
+        "You are a retrieval context generator. Given a full document and one "
+        "chunk of that document, write a 50-100 token context prefix that will "
+        "be prepended to the chunk before it is embedded and indexed for search.\n\n"
+        "The prefix MUST include:\n"
+        "- The document's filename or title\n"
+        "- The document's date or time period (if known)\n"
+        "- The knowledge-base section (KB name and subtag)\n"
+        "- Any relationships to prior documents (if listed)\n"
+        "- A one-clause summary of what THIS chunk is about within the document\n\n"
+        "Output ONLY the prefix text — no explanations, no JSON, no meta-commentary. "
+        "Keep it under 100 tokens. Write in the document's language."
+    )
+
+    doc_header_msg = (
+        f"Document: {filename}\n"
+        f"Knowledge base: {kb_name}{subtag_line}\n"
+        f"{date_line}"
+        f"{related_line}"
+        f"\nFull document text:\n"
+        f"---\n{document_text}\n---"
+    )
+
+    chunk_msg = (
+        f"Chunk text:\n---\n{chunk_text}\n---\n\n"
+        f"Write the context prefix now."
+    )
+
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": doc_header_msg},
+        {"role": "user", "content": chunk_msg},
+    ]
 
 
 @with_transient_retry(attempts=2, base_sec=0.5)
@@ -143,17 +223,22 @@ async def contextualize_chunk(
     if not chunk_text:
         return chunk_text
 
+    # Use the cache-friendly builder. The legacy entry point only carries
+    # ``doc_title`` (no full doc text, no rich metadata) — Phase 3.2 will
+    # introduce ``contextualize_chunks_with_prefix`` which threads through
+    # the full document text plus the KB / subtag / date / related-titles
+    # bundle. For now the builder still gives us byte-identical doc-level
+    # messages across sibling chunks — vllm-chat's prefix cache reuses
+    # them — and the prompt is the same shape the new caller will use.
+    clipped = chunk_text[:_MAX_CHUNK_CHARS]
+    messages = build_contextualize_prompt(
+        document_text=clipped,
+        chunk_text=clipped,
+        document_metadata={"filename": doc_title or "Untitled"},
+    )
     body = {
         "model": chat_model,
-        "messages": [
-            {
-                "role": "user",
-                "content": _PROMPT.format(
-                    doc_title=(doc_title or "Untitled"),
-                    chunk_text=chunk_text[:_MAX_CHUNK_CHARS],
-                ),
-            }
-        ],
+        "messages": messages,
         "temperature": 0.0,
         "max_tokens": 96,
     }
@@ -238,6 +323,7 @@ async def contextualize_batch(
 
 
 __all__ = [
+    "build_contextualize_prompt",
     "contextualize_chunk",
     "contextualize_batch",
     "is_enabled",
