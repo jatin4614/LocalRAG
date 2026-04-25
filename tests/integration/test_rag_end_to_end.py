@@ -24,9 +24,10 @@ async def seed(engine):
         await s.execute(text("INSERT INTO users (id,email,password_hash,role) VALUES (9,'a@x','h','admin'),(1,'u@x','h','user')"))
         await s.execute(text("INSERT INTO groups (id,name) VALUES (1,'eng')"))
         await s.execute(text("INSERT INTO user_groups (user_id, group_id) VALUES (1,1)"))
-        await s.execute(text("INSERT INTO knowledge_bases (id,name,admin_id) VALUES (10,'Eng',9)"))
+        # admin_id is VARCHAR(255); group_id is TEXT post-migration drift
+        await s.execute(text("INSERT INTO knowledge_bases (id,name,admin_id) VALUES (10,'Eng','9')"))
         await s.execute(text("INSERT INTO kb_subtags (id,kb_id,name) VALUES (100,10,'Docs')"))
-        await s.execute(text("INSERT INTO kb_access (kb_id, group_id, access_type) VALUES (10,1,'read')"))
+        await s.execute(text("INSERT INTO kb_access (kb_id, group_id, access_type) VALUES (10,'1','read')"))
         await s.execute(text("INSERT INTO chats (id,user_id) VALUES (500,1)"))
         await s.commit()
 
@@ -57,7 +58,7 @@ async def test_upload_and_retrieve_roundtrip(client):
     assert n >= 1
 
     r = await client.post("/api/rag/retrieve", headers=ALICE, json={
-        "chat_id": 500,
+        "chat_id": "500",
         "query": "quick brown fox",
         "selected_kb_config": [{"kb_id": 10, "subtag_ids": [100]}],
     })
