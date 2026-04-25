@@ -413,6 +413,28 @@ async def _run_pipeline(
     _intent_label = classify_intent(query)
     _kb_ids_for_log = [cfg.get("kb_id") for cfg in selected_kbs or []]
 
+    # Phase 1.3 — Qdrant preflight. Fails fast (returning empty sources) if
+    # Qdrant is fully down, before we fan out N parallel KB searches that
+    # would all time out individually. ``health_check()`` is cached 5s so N
+    # concurrent chat turns share one probe. ``getattr`` guard so unit tests
+    # that wire an ``object()`` stub as ``_vector_store`` (no health_check
+    # attribute) are unaffected — preflight is purely defensive against
+    # network outages, not a contract on the VectorStore interface.
+    _hc = getattr(_vector_store, "health_check", None)
+    if callable(_hc):
+        try:
+            if not await _hc():
+                logger.warning(
+                    "rag: qdrant preflight failed; returning empty sources"
+                )
+                return []
+        except Exception as _hc_exc:
+            # Probe itself raised — log but DO NOT short-circuit. Falling
+            # through lets downstream code surface the real Qdrant error
+            # with full context (collection name, filter shape) rather
+            # than the opaque preflight failure.
+            logger.warning("rag: qdrant preflight raised %s; continuing", _hc_exc)
+
     # Tier 2 — intent routing (gated by RAG_INTENT_ROUTING, default OFF).
     # When OFF, _intent/_intent_reason are fixed values and every branch
     # below collapses to the pre-Tier-2 ``specific`` path, making the

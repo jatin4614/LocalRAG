@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import os
+import time as _time
 import uuid
 from dataclasses import dataclass
 from typing import Iterable, List, Optional
 
+import httpx
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http import models as qm
 
+from .circuit_breaker import CircuitOpenError, breaker_for
 from .metrics import qdrant_search_latency_seconds, qdrant_upsert_latency_seconds
 from .obs import span
 from time import perf_counter as _perf_counter
@@ -176,6 +179,10 @@ class VectorStore:
         # under high concurrency don't starve or time out. ``pool_size`` maps
         # to httpx's max_connections; ``timeout`` is the per-request deadline
         # (the default 5s is fine for reads but tight for big upsert batches).
+        # Phase 1.3: ``_url`` is also retained so ``health_check()`` can probe
+        # the Qdrant root endpoint via a fresh httpx client (the qdrant-client
+        # itself doesn't expose a cheap "is the server up?" call).
+        self._url = url
         self._client = AsyncQdrantClient(
             url=url,
             timeout=30.0,
@@ -190,6 +197,30 @@ class VectorStore:
 
     async def close(self) -> None:
         await self._client.close()
+
+    async def health_check(self) -> bool:
+        """Lightweight Qdrant health probe. Result cached 5s.
+
+        Phase 1.3 — used by ``chat_rag_bridge._run_pipeline`` as a pre-flight
+        check before fanning out N parallel KB searches. The Qdrant root
+        endpoint returns ``{"title":...,"version":...}`` in <5ms when the
+        server is up; on connection error / timeout we report False without
+        raising so callers can decide whether to short-circuit retrieval.
+
+        The 5s cache means N concurrent requests share one probe — important
+        because ``health_check()`` runs on every chat turn.
+        """
+        now = _time.monotonic()
+        if hasattr(self, "_health_cache") and now - self._health_cache[0] < 5.0:
+            return self._health_cache[1]
+        try:
+            async with httpx.AsyncClient(timeout=2.0) as c:
+                r = await c.get(f"{self._url}/")
+                ok = r.status_code == 200
+        except Exception:
+            ok = False
+        self._health_cache = (now, ok)
+        return ok
 
     async def list_collections(self) -> list[str]:
         cols = (await self._client.get_collections()).collections
@@ -587,10 +618,21 @@ class VectorStore:
         }
         if self._sparse_cache.get(name):
             kwargs["using"] = _DENSE_NAME
+        # Phase 1.3: per-collection circuit breaker. If Qdrant has been
+        # failing for this collection, raise CircuitOpenError immediately
+        # instead of issuing yet another doomed RPC. Only transport errors
+        # (timeout / connect / read) trip the breaker — application errors
+        # (bad filter, unknown collection) propagate normally without
+        # affecting breaker state.
+        cb = breaker_for(f"qdrant:{name}")
+        cb.raise_if_open()
         with span("qdrant.client.search", collection=name, limit=limit, mode="dense"):
             _t = _perf_counter()
             try:
                 response = await self._client.query_points(**kwargs)
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError):
+                cb.record_failure()
+                raise
             finally:
                 try:
                     qdrant_search_latency_seconds.labels(collection=name).observe(
@@ -598,6 +640,7 @@ class VectorStore:
                     )
                 except Exception:
                     pass
+            cb.record_success()
         return [Hit(id=r.id, score=r.score, payload=r.payload or {}) for r in response.points]
 
     async def hybrid_search(
@@ -663,6 +706,10 @@ class VectorStore:
                 limit=limit * 2,
             ),
         ]
+        # Phase 1.3: per-collection circuit breaker — hybrid path mirrors the
+        # dense ``search`` path. Same trip rules: only transport errors count.
+        cb = breaker_for(f"qdrant:{name}")
+        cb.raise_if_open()
         with span("qdrant.client.search", collection=name, limit=limit, mode="hybrid"):
             _t = _perf_counter()
             try:
@@ -674,6 +721,9 @@ class VectorStore:
                     query_filter=flt,
                     with_payload=_PAYLOAD_FIELDS,
                 )
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError):
+                cb.record_failure()
+                raise
             finally:
                 try:
                     qdrant_search_latency_seconds.labels(collection=name).observe(
@@ -681,6 +731,7 @@ class VectorStore:
                     )
                 except Exception:
                     pass
+            cb.record_success()
         return [Hit(id=r.id, score=r.score, payload=r.payload or {}) for r in response.points]
 
     async def delete_by_doc(self, collection: str, doc_id: int | str) -> int:
