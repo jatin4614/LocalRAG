@@ -120,23 +120,52 @@ def resolve_intent_flags(
 ) -> dict[str, str]:
     """Return the merged ``{RAG_*: "0"|"1"}`` overlay for ``intent``.
 
-    Policy:
-      * Look up ``intent`` in ``_INTENT_FLAG_POLICY``. Unknown intents
-        (e.g. typo, future label not yet plumbed) fall back to the
-        ``specific`` defaults — the safest catch-all because (a) it's
-        the largest bucket on real corpora and (b) "fetch a chunk + its
-        neighbours" is the most generally-useful pipeline shape.
-      * Per-KB explicit overrides ALWAYS win. An admin who stamped
-        ``rag_config.mmr = false`` did so deliberately; we don't
-        second-guess. Implementation: per-KB dict is layered on top of
-        the intent defaults via ``{**intent, **per_kb}``.
+    Precedence (default mode = ``intent``):
+      1. ``_INTENT_FLAG_POLICY[intent]``      — base
+      2. per-KB ``rag_config`` overrides      — wins over base
+      3. ``flags.with_overrides`` overlay     — applied by caller around
+         the returned dict; the returned keys SHADOW process env at lookup.
 
-    Pure function — no side effects, no I/O. Inputs are not mutated.
-    Returns a fresh dict so the caller can safely merge / mutate.
+    With ``RAG_INTENT_OVERLAY_MODE=env``, the precedence inverts for the
+    flag-keys we'd otherwise stamp: if the operator set ``RAG_MMR=1`` in
+    their env, we DROP ``RAG_MMR`` from the overlay so the env value
+    shows through ``flags.get`` unshadowed. Per-KB ``rag_config`` still
+    wins over both — it's an explicit per-collection statement.
+
+    Why the toggle exists (B3 design call, 2026-04-25):
+      * ``intent`` (default) — operator picks per-intent policy ONCE; the
+        intent classifier picks the right shape per query without
+        re-deploying. Production-safe defaults baked in. Per-KB
+        ``rag_config`` is the right escape hatch for collection-level
+        customisation.
+      * ``env``               — operator escape hatch. If retrieval is
+        misbehaving and we need to force MMR or expand on globally
+        without restarting the intent classifier or touching
+        ``rag_config``, env vars become a debug knob. Costs: blast
+        radius (env stays set forever), defeats the per-intent shaping.
+
+    Per Plan A B3 memory note: A/B both modes against real production
+    queries before locking the default. Until then, ``intent`` is the
+    safer default and matches the current behaviour Phase 2.2 shipped.
+
+    Unknown intents (typo, future label) fall back to the ``specific``
+    defaults — the largest bucket on real corpora, generally-useful
+    pipeline shape.
+
+    Pure function — no side effects (env reads are deterministic given
+    a process snapshot). Inputs are not mutated. Returns a fresh dict.
     """
     intent_defaults = _INTENT_FLAG_POLICY.get(intent, _INTENT_FLAG_POLICY["specific"])
-    # Fresh dict — never mutate the policy table or the caller's overrides.
     merged: dict[str, str] = dict(intent_defaults)
+
+    # B3 mode toggle: when env should win, drop overlay keys that env has set.
+    overlay_mode = _os.environ.get("RAG_INTENT_OVERLAY_MODE", "intent").lower()
+    if overlay_mode == "env":
+        for key in list(merged.keys()):
+            if _os.environ.get(key) is not None:
+                del merged[key]
+
+    # Per-KB explicit overrides ALWAYS win, in either mode.
     if per_kb_overrides:
         for k, v in per_kb_overrides.items():
             merged[str(k)] = str(v)

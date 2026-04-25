@@ -22,6 +22,7 @@ All env flags read by the retrieval pipeline. Filled in by each phase of Plan A/
 | `RAG_CIRCUIT_BREAKER_ENABLED` | `1` | Phase 1.3 | Yes | Per-KB circuit breaker. `0` falls through to raw client. | Never in production; enable for debug only. |
 | `RAG_TENACITY_RETRY` | `1` | Phase 1.4 | Yes | Exponential backoff retry on TEI / reranker / HyDE. `0` reverts to single-shot fail-open. | Debug retry-storm only. |
 | `RAG_COLBERT` | `0` → `1` after Phase 3.5 | Phase 3.5 | Yes | Enables ColBERT third RRF head. | If ColBERT model fails to load. |
+| `RAG_INTENT_OVERLAY_MODE` | `intent` | B3 design call (2026-04-25) | Yes | `intent` (default) — intent classifier shadows env for `RAG_MMR`/`RAG_CONTEXT_EXPAND`; `env` — operator env vars override intent defaults. Per-KB `rag_config` always wins in either mode. | Set to `env` for runtime debugging when you need to force MMR/expand on globally without re-deploying or touching `rag_config`. **A/B both modes against real production queries before locking the default** — see `~/.claude/projects/-home-vogic-LocalRAG/memory/intent_overlay_ab.md`. |
 
 ## Kill-list status
 
