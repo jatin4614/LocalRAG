@@ -38,8 +38,43 @@ def _contextualize_enabled() -> bool:
     Default OFF. When OFF, the contextualizer module is not imported here,
     so the default ingest path stays byte-identical to the pre-P2.7
     behaviour (no chat-model calls, no httpx churn, no extra imports).
+
+    Retained for legacy callers; new code should use ``should_contextualize``
+    so per-KB ``rag_config`` opt-in/out is honoured.
     """
     return os.environ.get("RAG_CONTEXTUALIZE_KBS", "0") == "1"
+
+
+def should_contextualize(*, env_flag: str | None, kb_rag_config: dict | None) -> bool:
+    """Decide whether to contextualize for a given ingest based on the
+    per-KB rag_config first (explicit opt-in/out), falling back to global env.
+
+    Precedence: per-KB value wins (True OR False — both are explicit
+    operator decisions; we don't want a global ``"1"`` to override a KB
+    that opted out, nor a global ``"0"`` to suppress a KB that opted in).
+    Missing per-KB key → fall back to the global env flag.
+
+    Args:
+        env_flag: raw value of ``RAG_CONTEXTUALIZE_KBS`` (or any other env
+            string). ``None`` / ``""`` / ``"0"`` all mean disabled; only
+            the literal string ``"1"`` enables. This matches the
+            convention used by ``_contextualize_enabled`` and the rest of
+            the RAG_* env reads in this module.
+        kb_rag_config: the merged per-KB rag_config dict (post
+            ``kb_config.merge_configs`` for multi-KB ingest, or a single
+            KB's raw config). Looks for the literal key ``"contextualize"``;
+            ignores ``contextualize_on_ingest`` (a separate, future-
+            facing key kept in the kb_config schema for retrieval-time
+            tracking but not consulted here — that key is for the request
+            overlay path, this helper is the ingest-time gate).
+
+    Returns:
+        ``True`` to run the chunk-context augmentation pass, ``False``
+        to skip it (default-off path stays byte-identical).
+    """
+    if kb_rag_config and "contextualize" in kb_rag_config:
+        return bool(kb_rag_config["contextualize"])
+    return (env_flag or "0") == "1"
 
 
 def _raptor_enabled() -> bool:
@@ -197,8 +232,18 @@ async def ingest_bytes(
     embedder: Embedder,
     chunk_tokens: int = 800,
     overlap_tokens: int = 100,
+    kb_rag_config: dict | None = None,
 ) -> int:
-    """Full ingest: returns number of chunks upserted."""
+    """Full ingest: returns number of chunks upserted.
+
+    ``kb_rag_config`` is the per-KB ``rag_config`` JSONB dict (or ``None``
+    for callers that don't have one — chat-private uploads, repair
+    scripts, tests). Currently consulted only for the ingest-time
+    ``contextualize`` opt-in (Phase 3.3); future ingest-time keys
+    (e.g. raptor opt-in, doc_summaries opt-in per-KB) will read from the
+    same dict. Default ``None`` preserves byte-identical behaviour for
+    callers that don't opt in.
+    """
     blocks = extract(data, mime_type, filename)
     if not blocks:
         return 0
@@ -222,7 +267,10 @@ async def ingest_bytes(
     # with the raw chunk body. Fail-open at both chunk and batch level so
     # a chat endpoint hiccup doesn't crash ingest.
     context_augmented = False
-    if _contextualize_enabled():
+    if should_contextualize(
+        env_flag=os.environ.get("RAG_CONTEXTUALIZE_KBS"),
+        kb_rag_config=kb_rag_config,
+    ):
         context_augmented = await _maybe_contextualize_chunks(
             paired, doc_title=filename
         )

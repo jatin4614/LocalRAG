@@ -64,6 +64,12 @@ VALID_BOOL_KEYS = frozenset({
     "spotlight",
     "semcache",
     "contextualize_on_ingest",
+    # Phase 3.3: short-form per-KB ingest gate consumed directly by
+    # ``ingest.should_contextualize``. We keep ``contextualize_on_ingest``
+    # accepted (legacy) but the new code path reads ``contextualize`` —
+    # explicit ``True``/``False`` here overrides ``RAG_CONTEXTUALIZE_KBS``
+    # in either direction (e.g. global ON, KB OFF → skip).
+    "contextualize",
     # P3.3: HyDE (Hypothetical Document Embeddings) — per-KB override so a
     # year-long, abstract-query-heavy KB can opt in without flipping the
     # global RAG_HYDE process flag.
@@ -100,6 +106,12 @@ VALID_KEYS = VALID_BOOL_KEYS | VALID_INT_KEYS | VALID_FLOAT_KEYS
 # for future ingest runs) but they do not influence a live chat request.
 INGEST_ONLY_KEYS = frozenset({
     "contextualize_on_ingest",
+    # Phase 3.3 short-form alias — ingest-only, consumed by
+    # ``ingest.should_contextualize``. Stripping it from the overlay
+    # keeps the request hot path free of an env var that wouldn't
+    # influence retrieval anyway and avoids confusing operators reading
+    # the overlay in logs.
+    "contextualize",
     "chunk_tokens",
     "overlap_tokens",
     # doc_summaries affects what ingest emits (per-doc summary points),
