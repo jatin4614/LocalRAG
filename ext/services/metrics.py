@@ -48,6 +48,9 @@ except Exception:  # pragma: no cover - exercised only when dep missing
         def inc(self, *_args, **_kwargs) -> None:
             return None
 
+        def dec(self, *_args, **_kwargs) -> None:
+            return None
+
         def observe(self, *_args, **_kwargs) -> None:
             return None
 
@@ -106,6 +109,146 @@ ingest_chunks_total = Counter(
     f"{_NS}_ingest_chunks_total",
     "Chunks upserted into Qdrant",
     labelnames=("collection", "path"),
+)
+
+# -----------------------------------------------------------------------
+# OTel-companion metrics (also scraped by Prometheus). Declared here so
+# both the chat/retrieval code path and the ingest code path can import
+# the same exporter instances (no duplicate registrations).
+# -----------------------------------------------------------------------
+
+# Token accounting. Prompt tokens carry a ``kb`` label (comma-joined
+# kb_ids used for the request, "none" if none) so operators can
+# attribute spend across KB selections; completion tokens are per-model.
+tokens_prompt_total = Counter(
+    f"{_NS}_tokens_prompt_total",
+    "Prompt tokens consumed",
+    labelnames=("model", "kb"),
+)
+
+tokens_completion_total = Counter(
+    f"{_NS}_tokens_completion_total",
+    "Completion tokens generated",
+    labelnames=("model",),
+)
+
+# LLM streaming timing. TTFT: wall time between send and first streamed
+# token; TPOT: per-token time across the streamed tail.
+llm_ttft_seconds = Histogram(
+    f"{_NS}_llm_ttft_seconds",
+    "Time to first token",
+    labelnames=("model",),
+    buckets=(0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10),
+)
+
+llm_tpot_seconds = Histogram(
+    f"{_NS}_llm_tpot_seconds",
+    "Time per output token",
+    labelnames=("model",),
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5),
+)
+
+# RBAC denials (403). Label by route so dashboards can attribute which
+# endpoint is rejecting access (e.g. /api/rag/retrieve vs KB admin).
+rbac_denied_total = Counter(
+    f"{_NS}_rbac_denied_total",
+    "RBAC access denials",
+    labelnames=("route",),
+)
+
+# Active sessions gauge — incremented on chat-request entry, decremented
+# on exit (try/finally in ``chat_rag_bridge``). Useful for capacity
+# planning and spotting leaks.
+active_sessions = Gauge(
+    f"{_NS}_active_sessions",
+    "Current active chat sessions",
+)
+
+# Qdrant call latencies. Shared between chat/retrieval and ingest paths.
+qdrant_search_latency_seconds = Histogram(
+    f"{_NS}_qdrant_search_latency_seconds",
+    "Qdrant search latency",
+    labelnames=("collection",),
+)
+
+qdrant_upsert_latency_seconds = Histogram(
+    f"{_NS}_qdrant_upsert_latency_seconds",
+    "Qdrant upsert latency",
+)
+
+# -----------------------------------------------------------------------
+# Ingest-path metrics (appended). Owned by the ingest/upload code path.
+# -----------------------------------------------------------------------
+upload_bytes_total = Counter(
+    f"{_NS}_upload_bytes_total",
+    "Bytes uploaded for ingest",
+    labelnames=("kb",),
+)
+
+ingest_duration_seconds = Histogram(
+    f"{_NS}_ingest_duration_seconds",
+    "Per-stage ingest duration",
+    labelnames=("stage",),
+    buckets=(0.05, 0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 300),
+)
+
+ingest_failures_total = Counter(
+    f"{_NS}_ingest_failures_total",
+    "Ingest failures by stage",
+    labelnames=("stage", "reason"),
+)
+
+ingest_queue_depth = Gauge(
+    f"{_NS}_ingest_queue_depth",
+    "Celery ingest queue depth (observed)",
+)
+
+ingest_document_bytes = Histogram(
+    f"{_NS}_ingest_document_bytes",
+    "Size of documents ingested",
+    labelnames=("kb", "format"),
+    buckets=(1024, 10 * 1024, 100 * 1024, 1024 * 1024, 10 * 1024 * 1024, 100 * 1024 * 1024),
+)
+
+chunk_count = Histogram(
+    f"{_NS}_ingest_chunks_per_doc",
+    "Chunks produced per document",
+    labelnames=("kb",),
+    buckets=(1, 5, 10, 25, 50, 100, 250, 500, 1000),
+)
+
+# -----------------------------------------------------------------------
+# Phase 4 observability: KB health drift + scheduled eval gauges.
+#
+# ``rag_kb_drift_pct`` — per-KB percentage divergence between the
+# expected chunk count (sum of ``kb_documents.chunk_count`` for live rows)
+# and the observed Qdrant point count. Emitted by the
+# ``GET /api/kb/{kb_id}/health`` handler as a side-effect, NOT a
+# background task — keeps the metric lazy and avoids threading surprises.
+#
+# ``rag_eval_*`` — top-line scores from the weekly scheduled eval task
+# (``ext.workers.scheduled_eval``). Last-value-wins gauges; each Monday
+# (or whenever the beat fires) they're overwritten with the fresh run.
+# -----------------------------------------------------------------------
+rag_kb_drift_pct = Gauge(
+    f"{_NS}_kb_drift_pct",
+    "Percentage difference between expected chunks and Qdrant points for a KB",
+    labelnames=("kb_id",),
+)
+
+rag_eval_chunk_recall = Gauge(
+    f"{_NS}_eval_chunk_recall",
+    "chunk_recall@10 from the most recent scheduled eval run",
+)
+
+rag_eval_faithfulness = Gauge(
+    f"{_NS}_eval_faithfulness",
+    "Faithfulness score from the most recent scheduled eval run",
+)
+
+rag_eval_p95_latency = Gauge(
+    f"{_NS}_eval_p95_latency_ms",
+    "p95 retrieval latency (ms) from the most recent scheduled eval run",
 )
 
 
