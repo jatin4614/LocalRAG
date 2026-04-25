@@ -1,0 +1,17 @@
+# Extends vllm/vllm-openai:latest to upgrade transformers for Gemma 4 support.
+#
+# vllm/vllm-openai:latest (0.19.0) ships transformers 4.57.6, which doesn't
+# recognize the `gemma4` model architecture. QuantTrio/gemma-4-31B-it-AWQ
+# requires transformers >= 5.5.0.
+#
+# This is a fallback path; preferred is vllm/vllm-openai:nightly which has
+# native Gemma 4 support as of 2026-04-20. If the nightly image works
+# cleanly, delete this Dockerfile.
+FROM vllm/vllm-openai:latest
+
+RUN pip install --no-cache-dir --upgrade \
+    'transformers>=5.5.0,<6' \
+    'huggingface_hub>=1.5.0'
+
+# Sanity — fail build if import breaks something in vllm
+RUN python3 -c "import vllm, transformers; print(f'vllm={vllm.__version__} transformers={transformers.__version__}')"

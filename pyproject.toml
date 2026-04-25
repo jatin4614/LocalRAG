@@ -61,6 +61,23 @@ hybrid = [
 rerank = [
   "sentence-transformers>=3.0",
 ]
+# OpenTelemetry observability extra. Install when running with OBS_ENABLED=true
+# so traces/logs/metrics ship via OTLP to the collector. Absence of these
+# packages is fully handled by ext/services/obs.py (fail-open no-op).
+observability = [
+  "opentelemetry-api>=1.27",
+  "opentelemetry-sdk>=1.27",
+  "opentelemetry-exporter-otlp>=1.27",
+  "opentelemetry-instrumentation-fastapi>=0.48b0",
+  "opentelemetry-instrumentation-sqlalchemy>=0.48b0",
+  "opentelemetry-instrumentation-redis>=0.48b0",
+  "opentelemetry-instrumentation-httpx>=0.48b0",
+  "opentelemetry-instrumentation-requests>=0.48b0",
+  "opentelemetry-instrumentation-psycopg2>=0.48b0",
+  "opentelemetry-instrumentation-celery>=0.48b0",
+  "opentelemetry-instrumentation-logging>=0.48b0",
+  "python-json-logger>=2.0",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

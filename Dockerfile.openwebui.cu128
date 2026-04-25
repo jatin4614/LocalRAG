@@ -1,5 +1,9 @@
 # Custom build: upstream Open WebUI + our KB extension
-# Extends upstream's multi-stage pattern.
+# CU128 VARIANT — torch cu128 / 2.7+ for Blackwell (sm_120) GPU support.
+# Difference from the production Dockerfile.openwebui:
+#   - torch pulled from --index-url https://download.pytorch.org/whl/cu128
+#   - torch pinned to >=2.7 (first release with Blackwell sm_120 kernels)
+#   - sentence-transformers >=3.3 and transformers >=4.49 (torch 2.7 compat)
 
 ######## Frontend build ########
 FROM node:22-alpine3.20 AS build
@@ -35,26 +39,24 @@ COPY upstream/backend/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir uv && \
     uv pip install --system --no-cache-dir -r requirements.txt
 
-# Pin torch to cu121 — host GPU driver is 12.2, default upstream torch ships
-# cu130 wheels which silently fall back to CPU (cuda.is_available()=False).
-# cu121 is ABI-compatible with 12.x drivers and correctly detects the Ada GPU.
-# Required by sentence-transformers (reranker) and any torch-using path we
-# add. Installed BEFORE the rest so ucccp doesn't upgrade it transitively.
-RUN uv pip install --system --no-cache-dir --index-url https://download.pytorch.org/whl/cu121 \
-    'torch>=2.3,<2.6'
+# Torch cu128 / 2.7+ — adds sm_120 (Blackwell RTX 50X0, RTX PRO 6000 Blackwell)
+# kernel support. Host driver NVRM 580.126.09 (CUDA 12.9 capable) is forward
+# compatible. Install BEFORE the rest so no transitive upgrade/downgrade.
+RUN uv pip install --system --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 \
+    'torch>=2.7'
 
 # Our extra Python deps (not in upstream)
-# Runtime deps added by the RAG upgrade:
-#   fastembed            — P1.1 hybrid BM25 (~150 MB onnxruntime + ~10 MB bm25 model on first call)
-#   prometheus-client    — P2.5 /metrics endpoint
-#   scikit-learn         — P3.4 RAPTOR clustering (loaded lazily only when RAG_RAPTOR=1)
-#   sentence-transformers — P1.2 cross-encoder reranker (default PyPI wheels; torch pinned above)
-#   transformers         — P1.5 Qwen/Gemma tokenizer for token budgeting
+# Versions bumped for torch 2.7 compatibility:
+#   sentence-transformers >=3.3 (torch 2.7 compat)
+#   transformers          >=4.49 (torch 2.7 compat)
+#   fastembed             — unchanged (CPU-only, no torch dep)
+#   prometheus-client     — unchanged
+#   scikit-learn          — unchanged (RAPTOR)
 RUN uv pip install --system --no-cache-dir \
     pyjwt pypdf tiktoken qdrant-client httpx pydantic-settings asyncpg \
     'sqlalchemy[asyncio]' argon2-cffi python-docx openpyxl \
     fastembed prometheus-client scikit-learn \
-    'sentence-transformers>=3.0' 'transformers>=4.45'
+    'sentence-transformers>=3.3' 'transformers>=4.49'
 
 # Observability — OTel SDK + auto-instrumentors. All imports are lazy in
 # ext/services/obs.py so unsetting OBS_ENABLED makes the whole stack dormant.

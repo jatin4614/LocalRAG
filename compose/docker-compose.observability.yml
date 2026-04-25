@@ -1,0 +1,25 @@
+# Observability overlay — additive to compose/docker-compose.yml.
+# Usage (alongside the base compose):
+#   docker compose -f compose/docker-compose.yml -f compose/docker-compose.observability.yml up -d --build open-webui
+#
+# Rollback (disables instrumentation without removing deps):
+#   Set OBS_ENABLED=false in the env for open-webui and restart only that service.
+#
+# This file is idempotent and non-destructive — it only ADDS env vars and
+# attaches the observability network. No other service is modified.
+
+services:
+  open-webui:
+    environment:
+      OBS_ENABLED: "true"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://orgchat-obs-otelcol:4317"
+      OTEL_EXPORTER_OTLP_PROTOCOL: "grpc"
+      OTEL_SERVICE_NAME: "orgchat-ext"
+      OTEL_RESOURCE_ATTRIBUTES: "service.namespace=orgchat,deployment.environment=prod"
+    networks:
+      - default
+      - orgchat-obs-net
+
+networks:
+  orgchat-obs-net:
+    external: true

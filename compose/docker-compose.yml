@@ -90,7 +90,10 @@ services:
   #
   # Don't forget to set RAG_BUDGET_TOKENIZER to match (gemma-3 / qwen / llama).
   vllm-chat:
-    image: vllm/vllm-openai:latest
+    # nightly: vllm 0.19.2rc1 + transformers 5.5.4 (required for Gemma 4
+    # 'gemma4' model_type — stable 0.19 latest has transformers 4.57 which
+    # doesn't recognize the architecture). Pulled 2026-04-20.
+    image: vllm/vllm-openai:nightly
     container_name: orgchat-vllm-chat
     restart: unless-stopped
     ipc: host
@@ -107,31 +110,50 @@ services:
       - "orgchat-chat"
       - "--max-model-len"
       - "32768"
-      # Dropped 0.45 → 0.35 to free ~3 GB VRAM for bge-reranker-v2-m3
-      # loaded inside open-webui (P1.2). 0.35 × 32GB = 11.2 GB is plenty for
-      # Qwen2.5-14B-AWQ (~8GB weights + KV cache on fp8).
+      # GPU 0 (RTX 6000 Ada 48 GB). TEI (Phase 1) and open-webui reranker
+      # (Phase 3) are on GPU 1 (Blackwell). Remaining GPU 0 tenant: ~7.3 GB
+      # of frams-recognition-worker-* (separate project).
+      # 0.70 × 48 = 33.6 GB for vllm: weights (~20 GB) + FP8 KV cache (~13 GB)
+      # → ~28k token budget. Leaves ~5 GB headroom on GPU 0 beyond frams +
+      # vllm + overhead — safer margin against transient spikes.
       - "--gpu-memory-utilization"
-      - "0.35"
+      - "0.70"
+      # Cap concurrent sequences at 32 (8 users × burst of 4 outstanding).
+      # Prevents KV fragmentation and keeps prefix-cache hit rate high.
+      - "--max-num-seqs"
+      - "32"
       - "--enable-prefix-caching"
       - "--enable-chunked-prefill"
       - "--kv-cache-dtype"
       - "fp8"
+      # Gemma 4 has a built-in thinking/reasoning mode. Without these parsers,
+      # vLLM emits raw reasoning tokens as content="" (finish_reason=length).
+      # Per QuantTrio/gemma-4-31B-it-AWQ README.
+      - "--reasoning-parser"
+      - "gemma4"
+      - "--tool-call-parser"
+      - "gemma4"
+      - "--enable-auto-tool-choice"
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8000/v1/models || exit 1"]
       interval: 20s
       timeout: 5s
       retries: 15
-      start_period: 180s
+      # Gemma 4 31B AWQ first load: ~60-120 s mmap from volumes/models.
+      start_period: 300s
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              device_ids: ["0"]
               capabilities: [gpu]
 
   tei:
-    image: ghcr.io/huggingface/text-embeddings-inference:1.5
+    # Blackwell-specific build (sm_120) — the generic :1.9 tag is Ampere 8.0
+    # only. HF publishes arch-segregated tags; :120-1.9 is RTX 50X0 /
+    # RTX PRO 6000 Blackwell. Added to TEI v1.9.0 (Feb 2026, PR #735).
+    image: ghcr.io/huggingface/text-embeddings-inference:120-1.9
     container_name: orgchat-tei
     restart: unless-stopped
     command:
@@ -149,49 +171,21 @@ services:
       timeout: 5s
       retries: 10
       start_period: 60s
+    # Pinned to GPU 1 (RTX PRO 4000 Blackwell 24 GB) — frees 1.6 GB on GPU 0
+    # for vllm-chat KV cache. bge-m3 on Blackwell is ~1.6 GB VRAM.
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              device_ids: ["1"]
               capabilities: [gpu]
 
-  vllm-vision:
-    image: vllm/vllm-openai:latest
-    container_name: orgchat-vllm-vision
-    restart: unless-stopped
-    ipc: host
-    volumes:
-      - ../volumes/models:/root/.cache/huggingface/hub
-    environment:
-      HF_HUB_OFFLINE: "1"
-      TRANSFORMERS_OFFLINE: "1"
-    command:
-      - "--model"
-      - "${VISION_MODEL}"
-      - "--served-model-name"
-      - "orgchat-vision"
-      - "--max-model-len"
-      - "2048"
-      - "--gpu-memory-utilization"
-      - "0.14"
-      - "--enforce-eager"
-      - "--dtype"
-      - "half"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8000/v1/models || exit 1"]
-      interval: 20s
-      timeout: 5s
-      retries: 15
-      start_period: 240s
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+  # vllm-vision — REMOVED 2026-04-20 (Gemma 4 swap).
+  # Gemma 4 31B AWQ served by vllm-chat is multimodal (text + image + video),
+  # so we consolidate. The vision facade env var VISION_API_BASE_URL in .env
+  # now points at vllm-chat:8000; model-manager's VISION_URL likewise.
+  # Qwen2-VL-2B weights remain on disk (volumes/models) for easy rollback.
 
   whisper:
     build:
@@ -212,6 +206,10 @@ services:
       timeout: 5s
       retries: 10
       start_period: 30s
+    # Stays on CPU (int8, base.en) for now — faster-whisper needs CUDA+cuDNN
+    # libs which the current python:3.11-slim base lacks. To move to GPU 1:
+    # rebuild whisper image on nvidia/cuda:12.1-cudnn8-runtime and flip
+    # WHISPER_DEVICE=cuda, WHISPER_COMPUTE_TYPE=float16 in compose/.env.
 
   tts:
     build:
@@ -233,13 +231,13 @@ services:
     container_name: orgchat-model-manager
     restart: unless-stopped
     environment:
-      VISION_URL: http://vllm-vision:8000
+      # Vision consolidated into vllm-chat (Gemma 4 31B is multimodal).
+      VISION_URL: http://vllm-chat:8000
       WHISPER_URL: http://whisper:9000
       MODEL_UNLOAD_IDLE_SECS: ${MODEL_UNLOAD_IDLE_SECS:-300}
       MODEL_MANAGER_POLL_SECS: "15"
     # No host port — accessed via Docker network only
     depends_on:
-      - vllm-vision
       - whisper
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8080/healthz || exit 1"]
@@ -249,9 +247,13 @@ services:
       start_period: 10s
 
   open-webui:
+    # Phase 3: cu128 variant built on torch 2.7+ with Blackwell (sm_120) kernels.
+    # Rollback to cu121 build by reverting to Dockerfile.openwebui and
+    # `docker tag orgchat-open-webui:pre-cu128 orgchat-open-webui:latest`.
+    image: orgchat-open-webui:cu128-test
     build:
       context: ..
-      dockerfile: Dockerfile.openwebui
+      dockerfile: Dockerfile.openwebui.cu128
     container_name: orgchat-open-webui
     restart: unless-stopped
     ports:
@@ -296,6 +298,11 @@ services:
       CHUNK_OVERLAP: ${CHUNK_OVERLAP:-100}
       RAG_FILE_MAX_SIZE: ${RAG_FILE_MAX_SIZE:-26214400}
       RAG_FILE_MAX_COUNT: ${RAG_FILE_MAX_COUNT:-10}
+      # Auto-inject current date/time as a pseudo-source on every retrieval so
+      # the chat model can answer "what day is it?" without hallucinating from
+      # its training cutoff. Toggle with RAG_INJECT_DATETIME=0 to disable.
+      RAG_INJECT_DATETIME: ${RAG_INJECT_DATETIME:-1}
+      RAG_TZ: ${RAG_TZ:-UTC}
       VECTOR_DB: ${VECTOR_DB:-qdrant}
       DATABASE_URL: ${DATABASE_URL}
       QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
@@ -307,6 +314,7 @@ services:
       SESSION_SECRET: ${SESSION_SECRET}
     volumes:
       - ../volumes/uploads:/app/backend/data/uploads
+      - ../volumes/hf-cache:/root/.cache/huggingface
       - ingest_blobs:/var/ingest
     depends_on:
       postgres:
@@ -325,17 +333,16 @@ services:
       timeout: 10s
       retries: 5
       start_period: 120s
-    # GPU reservation for in-process cross-encoder reranker (P1.2,
-    # bge-reranker-v2-m3 ~1.5 GB). CPU rerank was ~11 s/query; GPU brings
-    # cold to ~40 ms + <1 ms cache-warm. Shares the GPU with vllm-chat +
-    # vllm-vision + TEI; we dropped vllm-chat to 0.35 utilization to leave
-    # ~3 GB VRAM for the reranker + HyDE/embedder bursts.
+    # Phase 3: moved to GPU 1 (Blackwell 24 GB) alongside TEI. Frees ~7 GB on
+    # GPU 0 for vllm-chat KV cache (util bumped 0.75 → 0.90 in Phase 3.10).
+    # Requires cu128 image (torch 2.7+) — see image: orgchat-open-webui:cu128-test
+    # above. Rollback to GPU 0: set device_ids: ["0"] + revert image to pre-cu128.
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              device_ids: ["1"]
               capabilities: [gpu]
 
   # Celery worker for asynchronous ingest. Only used when RAG_SYNC_INGEST=0 on
