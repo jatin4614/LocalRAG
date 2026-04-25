@@ -36,3 +36,153 @@ Phase 1.1 crashes on startup if this happens with an explicit tokenizer. If you 
 1. `docker exec orgchat-open-webui ls /models/hf_cache/hub/` — Gemma tokenizer present?
 2. `docker exec orgchat-open-webui env | grep HF_HOME` — cache path correct?
 3. `docker exec orgchat-open-webui env | grep RAG_BUDGET_TOKENIZER` — flag set as expected?
+
+## Circuit breaker opened for a KB
+
+Symptom: retrieval for one KB suddenly returns empty / 503 while other KBs work, and logs contain
+`circuit 'qdrant:kb_X' is open`.
+
+1. Confirm the breaker fired. `docker logs orgchat-open-webui 2>&1 | grep -E "breaker.*qdrant|CircuitOpenError"`
+   shows `closed → open` transitions and the failure count.
+2. Check Qdrant collection health for the affected KB:
+   `curl -s http://qdrant:6333/collections/kb_X | jq '.result.status'`
+   — `green` is healthy, `yellow`/`red` means the underlying issue is the collection itself
+   (segment corruption, replica lag, etc.). Restore from backup if red.
+3. After 30s of quiet, the breaker auto half-opens and probes. To force-close immediately
+   (e.g. you've fixed the upstream and don't want to wait): `docker compose restart open-webui`
+   — the in-process registry is wiped on restart.
+4. Tune cooldown: shorter `RAG_CB_COOLDOWN_SEC` (e.g. `10`) recovers faster when transient
+   issues are common; longer (`120`) avoids retry-storms during sustained outages. Default 30s.
+5. Kill switch (debug only): `RAG_CIRCUIT_BREAKER_ENABLED=0` falls through to the raw client.
+   Never leave this off in production — it removes blast-radius protection.
+
+## RBAC pubsub not delivering
+
+Symptom: admin grants/revokes a KB to a user but the user keeps seeing the old result for up to
+the full TTL (default 30s). Pub/sub should invalidate within ~100ms.
+
+1. Subscribe to the channel from inside the network: `redis-cli -n 3 PSUBSCRIBE 'rbac:*'`.
+2. Mutate a grant via the admin UI (or `POST /api/kb/{kb_id}/access`). Expect a message of the
+   form `rbac:user:{user_id}` within ~100ms.
+3. If nothing arrives, check open-webui publish path: `docker logs orgchat-open-webui 2>&1 | grep -i "rbac"`.
+   Common causes: `RAG_RBAC_CACHE_REDIS_URL` mismatch between writer and reader, or the cache
+   was disabled via `RAG_RBAC_CACHE_TTL_SECS=0` (no cache → no pubsub channel).
+4. Safety net: even with broken pubsub, the cache TTL (`RAG_RBAC_CACHE_TTL_SECS`, default 30s)
+   guarantees eventual consistency — the user sees the new grant after at most 30s. To accelerate
+   while debugging, drop TTL to `5` or `0`.
+5. Cross-check the Redis DB: pubsub uses the same DB as the cache (`/3` by default). If you
+   point them at different DBs you'll get silent delivery failures.
+
+## LLM metrics all zero
+
+Symptom: Grafana panels for token usage / TTFT / TPOT show no data, or `tokenizer_fallback_total`
+never increments despite known fallbacks.
+
+1. Confirm the metrics endpoint is reachable. From inside the network:
+   `docker exec orgchat-open-webui curl -s localhost:9464/metrics | grep -E "^rag_(tokens_prompt|tokens_completion|llm_ttft|llm_tpot|tokenizer_fallback)_"`
+   should return populated counters/histograms. (Port 9464 is the in-container scrape port; not
+   exposed on the host — Prometheus scrapes via the docker network.)
+2. If the names are missing entirely, the Prometheus client server didn't start. Check
+   `docker logs orgchat-open-webui 2>&1 | grep "prometheus_client metrics server"` — should log
+   `listening on :9464` at boot. If absent, prometheus-client failed to import.
+3. If the names exist but values are stuck at 0, the call sites aren't wrapped. The Phase 1.6
+   wrappers live in `ext/services/contextualizer.py`, `ext/services/hyde.py`, and
+   `ext/services/query_rewriter.py` — confirm they import `record_llm_call` from
+   `ext/services/llm_telemetry.py` and that those code paths are actually being hit (check
+   feature flags: `RAG_HYDE`, `RAG_DISABLE_REWRITE`, `RAG_CONTEXTUALIZE_KBS`).
+4. Verify the Prometheus scrape: `curl -s http://prometheus:9090/api/v1/targets | jq '.data.activeTargets[] | select(.labels.job=="open-webui")'`
+   — `health` should be `up`.
+
+## Tokenizer preflight crashed at startup
+
+Symptom: `open-webui` container exits with `RuntimeError: tokenizer preflight failed` (or
+similar) on boot. Phase 1.1 deliberately crashes here rather than silently fall back to cl100k.
+
+1. Identify the requested alias: `docker logs orgchat-open-webui 2>&1 | grep RAG_BUDGET_TOKENIZER`.
+   Default is `gemma-4`.
+2. Check the HF cache for the matching tokenizer. Container path is
+   `/root/.cache/huggingface` (mounted from `volumes/hf-cache/` on the host). For the default:
+   `docker exec orgchat-open-webui ls /root/.cache/huggingface/hub/models--google--gemma-4-31B-it/`
+   — must contain a `snapshots/<commit>/tokenizer.json` (or `tokenizer.model`).
+3. If missing, either pre-populate the cache (`HF_HUB_OFFLINE=0` + first boot will download,
+   assuming the user is logged in to HF for gated repos) or set
+   `RAG_BUDGET_TOKENIZER=cl100k` in `compose/.env` and restart — this accepts the drift
+   and unblocks startup.
+4. Gated-repo gotcha: `google/gemma-*` requires a `huggingface-cli login` token in the cache
+   even when offline, because the tokenizer config validates the access. If the cache was
+   populated by a different user, copy the token file too.
+
+## Reranker preload failed at startup
+
+Non-fatal — the system falls open to the heuristic ranker, but quality drops noticeably.
+Symptom: `reranker_loaded` gauge is `0` and `docker logs orgchat-open-webui 2>&1 | grep -i "reranker"`
+shows a load error at boot.
+
+1. Confirm GPU 1 has VRAM. `nvidia-smi` — the bge-reranker-v2-m3 needs ~2.75 GB. TEI
+   (~3 GB) and (later) the Qwen3-4B query understanding model also live on GPU 1.
+2. Confirm the model is in the cache:
+   `docker exec orgchat-open-webui ls /root/.cache/huggingface/hub/ | grep -i bge-reranker`.
+   If absent, set `HF_HUB_OFFLINE=0` for one boot to download, then re-enable offline mode.
+3. Check `RAG_RERANK_MODEL` — defaults to `BAAI/bge-reranker-v2-m3`. If overridden to a
+   different repo, that repo must also be in the cache.
+4. Workaround while diagnosing: `RAG_RERANK=0` disables the cross-encoder entirely
+   (heuristic-only) and silences the load attempt. Don't leave this off in production —
+   recall@5 typically drops by 5-10 points without the reranker.
+
+## GPU alert firing — VRAM > 95%
+
+1. `nvidia-smi` to identify which GPU and which process. Two GPUs in the rig:
+   - **GPU 0 (RTX 6000 Ada, 48 GB):** `vllm-chat` (~33 GB at `gpu-memory-utilization=0.70`)
+     plus the external `frams-recognition-worker-*` processes (~7.3 GB). Headroom is tight.
+   - **GPU 1 (Blackwell):** TEI (~3 GB) + open-webui's in-process reranker (~2.75 GB) +
+     (post Plan B Phase 4) Qwen3-4B query understanding (~8 GB).
+2. Transient spike on GPU 0: usually a long generation under burst load. Wait — vllm will
+   evict KV blocks. If it persists, check `rag_llm_tpot_seconds` for stalls.
+3. Permanent capacity issue on GPU 0: lower `--gpu-memory-utilization` on `vllm-chat` in
+   `compose/docker-compose.yml` (current default `0.70`). Each 0.05 step is ~2.4 GB freed
+   but proportionally fewer concurrent sequences.
+4. GPU 1 contention: temporarily set `RAG_RERANK=0` to free ~2.75 GB while you investigate
+   TEI memory growth or the Qwen3-4B startup. Reranker fallback is heuristic — quality
+   drops but service stays up.
+5. Long-term: if GPU 1 is saturated, the next escalation is to move TEI to a sidecar GPU
+   or downsize to `BAAI/bge-small-en-v1.5` (1024 → 384 dims, requires re-embed of all KBs
+   via `scripts/reembed_all.py`).
+
+## Daily eval cron showing zero recall
+
+Symptom: `daily_eval_cron.sh` runs but `retrieval_ndcg_daily` reports 0 / `recall@5 = 0`.
+Almost always a missing/placeholder dataset, not a regression.
+
+1. Inspect the daily subset: `wc -l /home/vogic/LocalRAG-plan-a/tests/eval/golden_daily_subset.jsonl`
+   and `head -3 /home/vogic/LocalRAG-plan-a/tests/eval/golden_daily_subset.jsonl`. If the file
+   is empty, has 1-2 placeholder rows, or every record's `relevant_doc_ids` is empty,
+   the cron has nothing to score against.
+2. Check whether the human-labeled golden exists: `wc -l tests/eval/golden_human.jsonl`.
+   The Task 0.3 follow-up calls for the operator to hand-label this; if it's still a
+   placeholder, that's the root cause. (Note: `golden_starter.jsonl` from the plan was
+   renamed/folded into `golden_human.jsonl` in this repo.)
+3. Confirm the cron is scoring the right collection by reading the latest JSON in
+   `tests/eval/results/` — `kb_id` and `total_queries` should match expectations.
+4. Until the operator delivers a real labeled subset, treat the alert as "data
+   pending" rather than a quality regression. Document the date the labels are due.
+
+## Schema reconciliation: how to migrate kb_*
+
+Use this when a KB collection's payload schema is drifting (added a new field, changed
+a tokenizer, switched embedder dimensions). The reconcile script in Phase 1.7 builds a
+shadow `_v2` collection, alias-swaps it in, and keeps the source for rollback.
+
+1. Run the migration in shadow mode (writes to `kb_X_v2`, leaves `kb_X` serving):
+   `cd /home/vogic/LocalRAG-plan-a && python scripts/reconcile_qdrant_schema.py --collection kb_X --target kb_X_v2`
+2. Verify counts after the script reports done:
+   `curl -s http://qdrant:6333/collections/kb_X | jq '.result.points_count'` and
+   `curl -s http://qdrant:6333/collections/kb_X_v2 | jq '.result.points_count'`. They
+   should match within ~1 (allow for in-flight writes).
+3. Spot-check payload shape on a sample point from each collection:
+   `curl -s -X POST http://qdrant:6333/collections/kb_X_v2/points/scroll -H 'Content-Type: application/json' -d '{"limit":1,"with_payload":true}' | jq '.result.points[0].payload | keys'`.
+4. Alias swap: point the read alias at `kb_X_v2`. The script supports `--commit` to do this
+   atomically — re-run with `--commit` to flip the alias once verified.
+5. Keep `kb_X` (the source) in place for **14 days** as a rollback target. After the
+   bake period, drop it: `curl -X DELETE http://qdrant:6333/collections/kb_X`.
+6. If anything goes wrong post-swap, alias-swap back to the source and investigate before
+   re-running the reconciler.
