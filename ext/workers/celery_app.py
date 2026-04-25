@@ -19,7 +19,13 @@ app = Celery(
     "orgchat_ingest",
     broker=broker,
     backend=backend,
-    include=["ext.workers.ingest_worker", "ext.workers.blob_gc_task"],
+    include=[
+        "ext.workers.ingest_worker",
+        "ext.workers.blob_gc_task",
+        # Phase 4: weekly golden-set eval. The module registers its own
+        # beat_schedule entry; inert unless celery beat is running.
+        "ext.workers.scheduled_eval",
+    ],
 )
 
 app.conf.update(
