@@ -68,6 +68,12 @@ VALID_BOOL_KEYS = frozenset({
     # year-long, abstract-query-heavy KB can opt in without flipping the
     # global RAG_HYDE process flag.
     "hyde",
+    # Tier 1/2 (doc-summary index + intent router). ``doc_summaries`` is
+    # ingest-only (it controls whether ingest emits a per-doc summary
+    # point); the other two are request-scope flags read by the bridge.
+    "doc_summaries",
+    "intent_routing",
+    "intent_llm",
 })
 VALID_INT_KEYS = frozenset({
     "rerank_top_k",
@@ -76,6 +82,12 @@ VALID_INT_KEYS = frozenset({
     # improves retrieval quality on abstract queries at the cost of N
     # extra chat calls (parallel, so wall-time cost is roughly constant).
     "hyde_n",
+    # Phase 1a / per-KB chunking. Ingest-only (not propagated to the flag
+    # overlay) — see INGEST_ONLY_KEYS below. Corpora differ wildly: daily
+    # fact-heavy reports want ~200-300 tokens, whitepapers ~600-800.
+    # Bounds enforced in validate_config.
+    "chunk_tokens",
+    "overlap_tokens",
 })
 VALID_FLOAT_KEYS = frozenset({
     "mmr_lambda",
@@ -86,7 +98,15 @@ VALID_KEYS = VALID_BOOL_KEYS | VALID_INT_KEYS | VALID_FLOAT_KEYS
 # underlying flag is read by the ingest process, not the retrieval hot
 # path. We still accept them in rag_config (so admin UIs can stamp them
 # for future ingest runs) but they do not influence a live chat request.
-INGEST_ONLY_KEYS = frozenset({"contextualize_on_ingest"})
+INGEST_ONLY_KEYS = frozenset({
+    "contextualize_on_ingest",
+    "chunk_tokens",
+    "overlap_tokens",
+    # doc_summaries affects what ingest emits (per-doc summary points),
+    # not request-time routing — strip it from the flag overlay so it
+    # doesn't leak into the retrieval hot path.
+    "doc_summaries",
+})
 
 # Mapping from JSON config key -> RAG_* env var name. Values are stringified
 # at overlay time because ``flags.get`` / ``os.environ.get`` return strings.
@@ -102,6 +122,9 @@ _KEY_TO_ENV: dict[str, str] = {
     "contextualize_on_ingest": "RAG_CONTEXTUALIZE_KBS",
     "hyde": "RAG_HYDE",
     "hyde_n": "RAG_HYDE_N",
+    "doc_summaries": "RAG_DOC_SUMMARIES",
+    "intent_routing": "RAG_INTENT_ROUTING",
+    "intent_llm": "RAG_INTENT_LLM",
 }
 
 
@@ -130,9 +153,23 @@ def validate_config(raw: Mapping[str, Any]) -> dict[str, Any]:
             # else: drop
         elif key in VALID_INT_KEYS:
             try:
-                out[key] = int(value)
+                coerced = int(value)
             except (TypeError, ValueError):
                 continue
+            # Per-KB chunk-size bounds. 100 floor avoids over-fragmentation;
+            # 2000 ceiling keeps chunks below typical embedder max_seq_len.
+            # overlap_tokens must be strictly less than chunk_tokens and
+            # non-negative. Values outside bounds are dropped silently so
+            # the KB inherits process defaults rather than ingesting at a
+            # corrupt size.
+            if key == "chunk_tokens" and not (100 <= coerced <= 2000):
+                continue
+            if key == "overlap_tokens":
+                # Cross-field check is handled at apply time (ingest reads
+                # both); at validate time we only reject absurd values.
+                if coerced < 0 or coerced > 1000:
+                    continue
+            out[key] = coerced
         elif key in VALID_FLOAT_KEYS:
             try:
                 out[key] = float(value)
@@ -202,6 +239,58 @@ def config_to_env_overrides(merged: Mapping[str, Any]) -> dict[str, str]:
     return out
 
 
+def resolve_chunk_params(
+    raw_config: Mapping[str, Any] | None,
+    *,
+    env_chunk_size: int | None = None,
+    env_chunk_overlap: int | None = None,
+) -> tuple[int, int]:
+    """Resolve ``(chunk_tokens, overlap_tokens)`` for a KB ingest call.
+
+    Priority, highest wins:
+
+    1. ``raw_config`` values (after ``validate_config`` cleans them), if the
+       KB explicitly stamped ``chunk_tokens`` / ``overlap_tokens``.
+    2. Process env defaults ``CHUNK_SIZE`` / ``CHUNK_OVERLAP``.
+    3. Hard defaults ``800`` / ``100`` (matches the ``ingest_bytes``
+       signature defaults so behaviour is unchanged for KBs without the
+       keys and no env override).
+
+    The two args are resolved independently — a KB that sets only
+    ``chunk_tokens`` inherits the env overlap, and vice versa.
+
+    Fail-closed: overlap that would exceed ``chunk_tokens // 2`` (the
+    chunker's hard contract) is clipped down to ``chunk_tokens // 4`` so
+    the call is still valid. A caller should have run ``validate_config``
+    already so we never hit that path in practice — this is a safety net
+    against hand-edited JSONB.
+    """
+    import os as _os
+
+    cfg: Mapping[str, Any] = validate_config(raw_config) if raw_config else {}
+
+    if env_chunk_size is None:
+        try:
+            env_chunk_size = int(_os.environ.get("CHUNK_SIZE", "800"))
+        except (TypeError, ValueError):
+            env_chunk_size = 800
+    if env_chunk_overlap is None:
+        try:
+            env_chunk_overlap = int(_os.environ.get("CHUNK_OVERLAP", "100"))
+        except (TypeError, ValueError):
+            env_chunk_overlap = 100
+
+    chunk_tokens = int(cfg.get("chunk_tokens") or env_chunk_size)
+    overlap_tokens = int(cfg.get("overlap_tokens") or env_chunk_overlap)
+
+    # Safety clip — chunker raises if overlap >= chunk_tokens. Clip down
+    # rather than raise so one bad row doesn't block a whole reingest.
+    if overlap_tokens >= chunk_tokens:
+        overlap_tokens = max(0, chunk_tokens // 4)
+
+    return chunk_tokens, overlap_tokens
+
+
 def with_overrides(overrides: Mapping[str, str]):
     """Re-export of ``ext.services.flags.with_overrides`` for callers that
     only need the KB-config surface.
@@ -219,5 +308,6 @@ __all__ = [
     "merge_configs",
     "config_to_env_overrides",
     "validate_config",
+    "resolve_chunk_params",
     "with_overrides",
 ]
