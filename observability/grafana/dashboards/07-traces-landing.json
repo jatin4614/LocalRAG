@@ -1,0 +1,72 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "graphTooltip": 0,
+  "id": null,
+  "panels": [
+    {
+      "title": "How to jump from metrics to traces",
+      "type": "text",
+      "id": 1,
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "## Exemplar cheat-sheet\n\n- Most histogram panels in the **Pipeline**, **LLM**, and **Ingest** dashboards have `exemplar: true` on their queries.\n- Exemplars appear as small diamond markers alongside the latency lines.\n- **Click a diamond** to open a tooltip that includes the `trace_id`; click the **View in Jaeger** link to jump straight to the matching trace.\n- Loki log panels have a derived field on `trace_id` \u2014 click it in a log line to pivot into Jaeger.\n- The panel below is a live Jaeger search scoped to `service.namespace=\"orgchat\"`; use it to find slow or errored traces by operation."
+      }
+    },
+    {
+      "title": "Jaeger \u2014 OrgChat traces",
+      "type": "traces",
+      "datasource": {
+        "type": "jaeger",
+        "uid": "jaeger"
+      },
+      "id": 2,
+      "gridPos": {
+        "h": 20,
+        "w": 24,
+        "x": 0,
+        "y": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "search",
+          "service": "orgchat",
+          "tags": "service.namespace=orgchat",
+          "limit": 50,
+          "datasource": {
+            "type": "jaeger",
+            "uid": "jaeger"
+          },
+          "legendFormat": "{{__name__}}",
+          "format": "time_series"
+        }
+      ],
+      "options": {}
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": [
+    "orgchat",
+    "traces"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "title": "OrgChat \u2014 Traces Landing",
+  "uid": "orgchat-traces"
+}

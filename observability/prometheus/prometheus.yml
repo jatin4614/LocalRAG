@@ -1,0 +1,86 @@
+# Prometheus scrape config for OrgChat observability stack.
+# Design doc: docs/superpowers/specs/2026-04-21-orgchat-observability-design.md
+#
+# Target resolution: we attach to docker network `orgchat-net`, so all orgchat-*
+# containers are reachable by DNS name. We scrape ONLY our own orgchat stack;
+# the FRAMS stack runs in parallel on its own Prometheus instance.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 30s
+  external_labels:
+    stack: orgchat
+
+# Alerting/rules placeholders — enable when alertmanager is added.
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ["alertmanager:9093"]
+# rule_files:
+#   - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: node
+    static_configs:
+      - targets: ["node-exporter:9100"]
+
+  - job_name: cadvisor
+    static_configs:
+      - targets: ["cadvisor:8080"]
+    # Drop FRAMS-project containers but keep everything else (cadvisor emits
+    # many metrics without a compose label — must not `keep` them or we lose
+    # all data). Per-dashboard PromQL filters scope to orgchat-*|kairos-*.
+    metric_relabel_configs:
+      - source_labels: [container_label_com_docker_compose_project]
+        regex: "frams"
+        action: drop
+
+  - job_name: dcgm
+    static_configs:
+      - targets: ["dcgm-exporter:9400"]
+
+  - job_name: postgres
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
+
+  - job_name: redis
+    static_configs:
+      - targets: ["redis-exporter:9121"]
+
+  - job_name: orgchat-openwebui
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["orgchat-open-webui:9464"]
+
+  - job_name: vllm-chat
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["orgchat-vllm-chat:8000"]
+
+  - job_name: tei
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["orgchat-tei:80"]
+
+  - job_name: qdrant
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["orgchat-qdrant:6333"]
+
+  - job_name: model-manager
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["orgchat-model-manager:8080"]
+
+  - job_name: otelcol
+    static_configs:
+      - targets: ["otelcol:8888"]
+
+  - job_name: jaeger
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["jaeger:14269"]
