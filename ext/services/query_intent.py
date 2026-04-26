@@ -32,6 +32,8 @@ query, comparison verb, question-word with no entity). The legacy
 from __future__ import annotations
 
 import enum
+import json as _json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -40,6 +42,12 @@ from typing import Literal, Optional, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .query_understanding import QueryUnderstanding
+
+
+# Shadow-mode A/B logger. Plan B Phase 4.8 wires every QU call (regex AND
+# LLM) into a JSON line on this logger when ``RAG_QU_SHADOW_MODE=1``.
+# The operator analyzer (``scripts/analyze_shadow_log.py``) ingests these.
+_shadow_log = logging.getLogger("orgchat.qu_shadow")
 
 
 Intent = Literal["metadata", "global", "specific_date", "specific"]
@@ -441,7 +449,7 @@ async def _invoke_qu(
 async def classify_with_qu(
     query: str, history: list[dict] | None = None,
 ) -> HybridClassification:
-    """Hybrid regex+LLM classifier (Plan B Phase 4).
+    """Hybrid regex+LLM classifier (Plan B Phase 4) with optional shadow mode.
 
     Always runs regex first. Escalates to the QU LLM only when:
       * ``RAG_QU_ENABLED=1``, AND
@@ -453,9 +461,15 @@ async def classify_with_qu(
     bridge can rely on this never raising — it's safe to call on every
     query.
 
+    **Shadow mode (Plan B Phase 4.8):** when ``RAG_QU_SHADOW_MODE=1``,
+    the LLM runs on EVERY query (not just escalated ones), both decisions
+    are emitted as a JSON line on the ``orgchat.qu_shadow`` logger, but
+    production routing remains regex-only. Use this to quantify the LLM-
+    vs-regex agreement distribution for ≥ 7 days before promoting
+    LLM-as-default.
+
     Increments :data:`ext.services.metrics.rag_qu_invocations` exactly
-    once per call (with the source that ultimately won) and
-    :data:`rag_qu_escalations` once per LLM escalation.
+    once per call and :data:`rag_qu_escalations` once per LLM escalation.
     """
     # Local import keeps the metrics dep out of import-time fast paths.
     from .metrics import rag_qu_escalations, rag_qu_invocations
@@ -475,7 +489,9 @@ async def classify_with_qu(
         regex_reason=regex_reason,
     )
 
-    if os.environ.get("RAG_QU_ENABLED", "0") != "1":
+    qu_enabled = os.environ.get("RAG_QU_ENABLED", "0") == "1"
+    shadow_mode = os.environ.get("RAG_QU_SHADOW_MODE", "0") == "1"
+    if not qu_enabled and not shadow_mode:
         try:
             rag_qu_invocations.labels(source="regex").inc()
         except Exception:
@@ -484,19 +500,40 @@ async def classify_with_qu(
 
     escalate, reason = should_escalate_to_llm(query, regex_label, history)
     result.escalation_reason = reason
-    if not escalate:
+
+    # In shadow mode, invoke the LLM on EVERY query. In normal mode, only
+    # on escalation.
+    if not shadow_mode and not escalate:
         try:
             rag_qu_invocations.labels(source="regex").inc()
         except Exception:
             pass
         return result
 
-    try:
-        rag_qu_escalations.labels(reason=reason.value).inc()
-    except Exception:
-        pass
+    if escalate and not shadow_mode:
+        try:
+            rag_qu_escalations.labels(reason=reason.value).inc()
+        except Exception:
+            pass
 
     qu = await _invoke_qu(query, history)
+
+    if shadow_mode:
+        _emit_shadow_log(
+            query=query,
+            regex_label=regex_label,
+            regex_reason=regex_reason,
+            qu=qu,
+            escalation=reason,
+        )
+        # Shadow mode: production routing stays regex-only regardless of
+        # the LLM's verdict.
+        try:
+            rag_qu_invocations.labels(source="regex").inc()
+        except Exception:
+            pass
+        return result
+
     if qu is None or qu.confidence < 0.5:
         try:
             rag_qu_invocations.labels(source="regex").inc()
@@ -519,6 +556,33 @@ async def classify_with_qu(
         regex_reason=regex_reason,
         cached=qu.cached,
     )
+
+
+def _emit_shadow_log(
+    *,
+    query: str,
+    regex_label: str,
+    regex_reason: str,
+    qu: Optional["QueryUnderstanding"],
+    escalation: EscalationReason,
+) -> None:
+    """Emit a single JSON line per QU shadow event (Plan B Phase 4.8).
+
+    Used by ``scripts/analyze_shadow_log.py`` to produce per-label
+    agreement reports during the 7-day shadow window.
+    """
+    payload = {
+        "query": query,
+        "regex_label": regex_label,
+        "regex_reason": regex_reason,
+        "llm_label": qu.intent if qu else None,
+        "llm_resolved_query": qu.resolved_query if qu else None,
+        "llm_temporal": qu.temporal_constraint if qu else None,
+        "llm_confidence": qu.confidence if qu else None,
+        "agree": (qu.intent == regex_label) if qu else None,
+        "escalation_reason": escalation.value,
+    }
+    _shadow_log.info(_json.dumps(payload, ensure_ascii=False))
 
 
 __all__ = [
