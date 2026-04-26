@@ -65,15 +65,17 @@ _GLOBAL_PATTERNS = (
 
 
 def classify_intent(query: str) -> str:
-    """Return one of ``metadata`` | ``global`` | ``specific``.
+    """DEPRECATED — synchronous regex fallback. Use :func:`_classify_with_qu`
+    for new call sites.
 
-    Lowercase substring match against small, curated keyword lists. Order
-    matters: metadata wins over global (e.g. "list all docs comparing
-    March" → metadata, because answering with a file list is strictly
-    more correct than answering with an aggregated comparison).
+    Returns one of ``metadata`` | ``global`` | ``specific``. Lowercase
+    substring match against small, curated keyword lists. Order matters:
+    metadata wins over global. Pure function — no side effects, no I/O.
 
-    Pure function — no side effects, no I/O. Must be safe to call on an
-    empty or ``None``-looking string.
+    Plan B Phase 4.6 added the async :func:`_classify_with_qu` which
+    consults the Qwen3-4B QU LLM on ambiguous queries. Existing sync
+    callers (logging hooks, debug endpoints) keep using this helper for
+    backward compatibility.
     """
     if not query:
         return "specific"
@@ -85,6 +87,127 @@ def classify_intent(query: str) -> str:
         if pat in q:
             return "global"
     return "specific"
+
+
+# -----------------------------------------------------------------------
+# Plan B Phase 4.6 — async hybrid classifier wrapper with Redis cache.
+# -----------------------------------------------------------------------
+def _extract_last_turn_id(history: Optional[List[dict]]) -> str:
+    """Return the most recent assistant turn's stable ID, or ``""`` if none.
+
+    The chat middleware passes history with optional ``id`` keys per turn.
+    When no ID is present we fall back to a short content hash so context
+    shifts still invalidate the QU cache (different assistant content →
+    different cache key → fresh LLM call).
+    """
+    if not history:
+        return ""
+    for msg in reversed(history):
+        if msg.get("role") == "assistant":
+            tid = msg.get("id")
+            if tid:
+                return str(tid)
+            content = msg.get("content") or ""
+            return _hash_short(content)
+    return ""
+
+
+def _hash_short(s: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
+
+
+# Lazily-initialized singleton — first call opens the redis connection,
+# subsequent calls return the same handle. Reset to None in tests via
+# ``monkeypatch.setattr(bridge, "_qu_cache_singleton", None)``.
+_qu_cache_singleton = None
+
+
+def _get_qu_cache():
+    """Return the process-wide :class:`QUCache` singleton, or ``None`` if
+    the cache is disabled (``RAG_QU_CACHE_ENABLED=0``) or redis cannot be
+    reached. Soft-fails so the bridge never raises on cache infra issues.
+    """
+    global _qu_cache_singleton
+    if _qu_cache_singleton is not None:
+        return _qu_cache_singleton
+    if _os.environ.get("RAG_QU_CACHE_ENABLED", "1") != "1":
+        return None
+    try:
+        import redis.asyncio as _redis
+
+        from .qu_cache import QUCache
+
+        url = _os.environ.get("REDIS_URL", "redis://redis:6379")
+        # Strip any /<db> suffix so we can override with the dedicated DB
+        if "/" in url.rsplit("@", 1)[-1].split("//", 1)[-1]:
+            base = url.rsplit("/", 1)[0]
+        else:
+            base = url
+        db = int(_os.environ.get("RAG_QU_REDIS_DB", "4"))
+        client = _redis.from_url(f"{base}/{db}", decode_responses=True)
+        _qu_cache_singleton = QUCache(redis_client=client)
+        return _qu_cache_singleton
+    except Exception as e:
+        logger.warning("QU cache init failed: %s — running without cache", e)
+        return None
+
+
+async def _classify_with_qu(
+    query: str,
+    history: Optional[List[dict]],
+    last_turn_id: str = "",
+):
+    """Hybrid regex+LLM classifier with cache.
+
+    Returns a :class:`ext.services.query_intent.HybridClassification`. The
+    bridge can rely on this never raising — failures (cache errors, LLM
+    timeouts) all soft-fall back to the regex result.
+
+    Cache is consulted when ``RAG_QU_ENABLED=1`` and ``RAG_QU_CACHE_ENABLED=1``.
+    Hits are stamped with ``cached=True`` for metric labelling. The cache
+    is only WRITTEN for ``source="llm"`` results — regex hits stay out of
+    the cache because they're already a regex.search() away.
+    """
+    from .query_intent import (
+        EscalationReason,
+        HybridClassification,
+        classify_with_qu as _qi_classify,
+    )
+
+    cache = _get_qu_cache()
+    if cache is not None:
+        cached = await cache.get(query, last_turn_id)
+        if cached is not None:
+            return HybridClassification(
+                intent=cached.intent,
+                resolved_query=cached.resolved_query,
+                temporal_constraint=cached.temporal_constraint,
+                entities=cached.entities,
+                confidence=cached.confidence,
+                source="llm",
+                escalation_reason=EscalationReason.NONE,
+                cached=True,
+            )
+
+    result = await _qi_classify(query=query, history=history)
+
+    if cache is not None and result.source == "llm":
+        from .query_understanding import QueryUnderstanding
+
+        qu = QueryUnderstanding(
+            intent=result.intent,
+            resolved_query=result.resolved_query,
+            temporal_constraint=result.temporal_constraint,
+            entities=result.entities,
+            confidence=result.confidence,
+            source="llm",
+            cached=False,
+        )
+        await cache.set(query, last_turn_id, qu)
+
+    return result
 
 
 # -----------------------------------------------------------------------
@@ -529,6 +652,7 @@ async def _retrieve_kb_sources_inner(
             selected_kbs=selected_kbs,
             user_id=user_id,
             chat_id=chat_id,
+            history=history,
             progress_cb=progress_cb,
         )
 
@@ -540,17 +664,35 @@ async def _run_pipeline(
     user_id: str,
     chat_id: Optional[str],
     progress_cb: Optional[Callable[[dict], Awaitable[None]]],
+    history: Optional[List[dict]] = None,
 ) -> List[dict]:
     """Inner pipeline — runs under a ``with_overrides`` scope.
 
     Separated from ``retrieve_kb_sources`` so the overlay is active for
     every lazy import and every flag read inside the hot path.
     """
-    # Phase 4 — intent classification for the structured log event at the
-    # tail of this function. Done here (entry of _run_pipeline) so failure
-    # modes (empty hits, LLM-side errors) still get an entry. Pure string
-    # match — sub-millisecond, no external call.
-    _intent_label = classify_intent(query)
+    # Plan B Phase 4.6 — hybrid regex+LLM intent classification. The async
+    # ``_classify_with_qu`` returns a HybridClassification carrying both the
+    # intent label and a resolved (standalone) form of the query. When
+    # ``RAG_QU_ENABLED=0`` (default until shadow A/B sign-off) the result
+    # is regex-only and ``resolved_query`` equals ``query`` — the pipeline
+    # is byte-identical to the pre-Plan-B path.
+    #
+    # We use ``resolved_query`` for retrieval / rerank because pronouns and
+    # relative time have been resolved against history (better dense recall),
+    # but keep the original ``query`` for response framing — the user's
+    # exact phrasing belongs in the answer's preamble.
+    _last_turn_id = _extract_last_turn_id(history)
+    _hybrid = await _classify_with_qu(
+        query=query, history=history, last_turn_id=_last_turn_id,
+    )
+    _intent_label = _hybrid.intent
+    _retrieval_query = (
+        _hybrid.resolved_query
+        if (_hybrid.source == "llm" and _hybrid.resolved_query
+            and _hybrid.resolved_query != query)
+        else query
+    )
     _kb_ids_for_log = [cfg.get("kb_id") for cfg in selected_kbs or []]
 
     # Phase 1.3 — Qdrant preflight. Fails fast (returning empty sources) if
@@ -743,7 +885,7 @@ async def _run_pipeline(
                         # embed.call span will nest under this embed.query span
                         # giving operators a clear query-embed timing.
                         raw_hits = await retrieve(
-                            query=query,
+                            query=_retrieval_query,
                             selected_kbs=selected_kbs,
                             chat_id=chat_id,  # NOW PASSED THROUGH
                             vector_store=_vector_store,
@@ -818,7 +960,7 @@ async def _run_pipeline(
                 })
             _tK = time.perf_counter()
             with time_stage("rerank"):
-                reranked = rerank_with_flag(query, raw_hits, top_k=_rerank_k, fallback_fn=rerank)
+                reranked = rerank_with_flag(_retrieval_query, raw_hits, top_k=_rerank_k, fallback_fn=rerank)
             if _rerank_on:
                 await _emit(progress_cb, {
                     "stage": "rerank", "status": "done",
@@ -838,7 +980,7 @@ async def _run_pipeline(
                     _tM = time.perf_counter()
                     with time_stage("mmr"):
                         reranked = await mmr_rerank_from_hits(
-                            query, reranked, _embedder,
+                            _retrieval_query, reranked, _embedder,
                             top_k=_final_k, lambda_=_mmr_lambda,
                         )
                     await _emit(progress_cb, {
