@@ -17,6 +17,10 @@ volumes:
   # RAG_SYNC_INGEST=1 to revert to the legacy in-process sync path
   # (in which case nothing writes to this volume).
   ingest_blobs:  { driver: local }
+  # Persists the celery-beat schedule file (last-run timestamps) across
+  # container restarts so the daily tier-storage cron does not re-fire after
+  # every redeploy. Only used by the celery-beat service.
+  celery_beat_state: { driver: local }
 
 services:
   postgres:
@@ -462,4 +466,35 @@ services:
       postgres:
         condition: service_healthy
       qdrant:
+        condition: service_healthy
+
+  # Plan B Phase 5.8 — Celery Beat scheduler. Fires the daily tier-storage
+  # cron at 03:00 local for each collection in RAG_TIER_COLLECTIONS. Single
+  # instance only — running multiple Beats causes duplicate task firings.
+  # The wall-clock-time schedule lives in
+  # ext/workers/scheduled_eval.py:beat_schedule.
+  celery-beat:
+    build:
+      context: ..
+      dockerfile: compose/Dockerfile.celery
+    container_name: orgchat-celery-beat
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/1}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/2}
+      RAG_TIER_COLLECTIONS: ${RAG_TIER_COLLECTIONS:-kb_1_v4}
+    volumes:
+      - celery_beat_state:/var/celery
+    command:
+      - celery
+      - -A
+      - ext.workers.celery_app
+      - beat
+      - --loglevel=info
+      - --schedule=/var/celery/celerybeat-schedule
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
