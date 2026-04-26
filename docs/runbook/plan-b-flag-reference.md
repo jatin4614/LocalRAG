@@ -17,21 +17,26 @@ flags are appended there in summary form.
 | `RAG_QU_REDIS_DB` | 4.5 | `4` | Redis DB number — must be unique vs DB 3 (RBAC) | No (set once) |
 | `RAG_QU_SHADOW_MODE` | 4.8 | `0` | Always run LLM, log both, route regex | Yes (restart) |
 
-## Phase 5 — Temporal sharding (NOT YET SHIPPED)
+## Phase 5 — Temporal sharding (code shipped; reshard pending operator)
 
-The following flags are reserved for Phase 5. They are listed here for
-completeness so operators reviewing this document don't add conflicting
-custom env vars.
+Phase 5 code (Tasks 5.1-5.10) is merged. Production reshard from
+`kb_1_v3` to `kb_1_v4` is an operator-scheduled off-peak action — see
+`docs/runbook/temporal-reshard-checklist.md`. Until that reshard runs,
+the sharded code paths are inert (no shard_key, no temporal levels).
 
-| Flag | Phase | Default | Description |
-|---|---|---|---|
-| `RAG_SHARDING_ENABLED` | 5.2 | `0` → `1` for new collections | Derive `shard_key="YYYY-MM"` at ingest |
-| `RAG_TEMPORAL_LEVELS` | 5.6 | `0` → `1` for sharded collections | Inject L3 / L2 levels for global / evolution intents |
-| `RAG_TIME_DECAY` | 5.7 | `0` | Apply `exp(-λΔt)` multiplier on current-state intent |
-| `RAG_TIME_DECAY_LAMBDA_DAYS` | 5.7 | `90` | Half-life for time-decay (days) |
-| `RAG_TIER_HOT_MONTHS` | 5.3 | `3` | Months kept in HNSW RAM tier |
-| `RAG_TIER_WARM_MONTHS` | 5.3 | `12` | Months kept in mmap SSD tier |
-| `RAG_TIER_COLD_QUANTIZATION` | 5.3 | `int8` | Cold tier scalar quantization |
+| Flag | Phase | Default | Description | Safe to toggle at runtime? |
+|---|---|---|---|---|
+| `RAG_SHARDING_ENABLED` | 5.2 | `0` → `1` for new collections | Derive `shard_key="YYYY-MM"` at ingest | Yes (restart open-webui) |
+| `RAG_TEMPORAL_LEVELS` | 5.6 | `0` → `1` for sharded collections | Inject L3 / L2 levels for global / evolution intents | Yes (restart) |
+| `RAG_TIME_DECAY` | 5.7 | `0` | Apply `exp(-λΔt)` multiplier on current-state intent | Yes (restart) |
+| `RAG_TIME_DECAY_LAMBDA_DAYS` | 5.7 | `90` | Half-life for time-decay (days) | Yes (restart) |
+| `RAG_TIER_HOT_MONTHS` | 5.3 | `3` | Months kept in HNSW RAM tier | Yes (restart Celery worker) |
+| `RAG_TIER_WARM_MONTHS` | 5.3 | `12` | Months kept in mmap SSD tier | Yes (restart Celery worker) |
+| `RAG_TIER_COLD_QUANTIZATION` | 5.3 | `int8` | Cold tier scalar quantization | No (set once per collection) |
+| `RAG_TIER_COLLECTIONS` | 5.8 | `kb_1_v4` | Comma-separated list of collections the daily tier cron manages | Yes (restart Celery beat) |
+| `RAG_TIER_CRON_TIMEOUT` | 5.8 | `1800` | Max seconds for the tier cron subprocess before SIGKILL | Yes (restart Celery worker) |
+| `RAG_RAPTOR` | Plan A | `0` | Legacy flat RAPTOR for non-sharded collections | Yes (restart). Plan B 5.10 audit decision: KEEP off; superseded by `RAG_RAPTOR_TEMPORAL` on sharded collections. Flat tree is retained as opt-in for any collection that did not undergo temporal resharding. |
+| `RAG_RAPTOR_TEMPORAL` | 5.5 | `1` (for sharded collections only) | Build temporal-then-semantic tree at ingest. Inert on non-sharded collections. Flag is documented here for forward compatibility — the actual gate is "collection has shard_key" (see `ext/services/temporal_raptor.py`). | Yes (restart) |
 
 ## Phase 6 — Async ingest + OCR (NOT YET SHIPPED)
 

@@ -1,0 +1,30 @@
+{"query":"how have OFC roadmap milestones changed across 2024-2026","intent":"evolution","kb_id":1,"expected_doc_ids":[],"notes":"3-year change query — should pull L3 + L4"}
+{"query":"compare Q1 2025 budget to Q1 2024","intent":"evolution","kb_id":1,"expected_doc_ids":[],"notes":"quarter-over-quarter — pulls L2 nodes"}
+{"query":"what shifted between January and June of 2026","intent":"evolution","kb_id":1,"expected_doc_ids":[],"notes":"intra-year evolution"}
+{"query":"trend in incident frequency 2024 vs 2025","intent":"evolution","kb_id":1,"expected_doc_ids":[]}
+{"query":"how did the team structure evolve last year","intent":"evolution","kb_id":1,"expected_doc_ids":[]}
+{"query":"compare Q4 2024 and Q4 2025 retention","intent":"evolution","kb_id":1,"expected_doc_ids":[]}
+{"query":"what have been the major architectural changes since 2024","intent":"evolution","kb_id":1,"expected_doc_ids":[]}
+{"query":"evolution of OFC scope from inception","intent":"evolution","kb_id":1,"expected_doc_ids":[]}
+{"query":"compare deployment cadence year over year","intent":"evolution","kb_id":1,"expected_doc_ids":[]}
+{"query":"how has the budget for the OFC roadmap shifted across the three years","intent":"evolution","kb_id":1,"expected_doc_ids":[]}
+{"query":"changes in the on-call rotation policy across 2024-2026","intent":"evolution","kb_id":1,"expected_doc_ids":[]}
+{"query":"what improved and what regressed between 2025-Q2 and 2025-Q3","intent":"evolution","kb_id":1,"expected_doc_ids":[]}
+{"query":"trend of customer-reported issues quarter over quarter","intent":"evolution","kb_id":1,"expected_doc_ids":[]}
+{"query":"how did SLO compliance change from 2024 to 2026","intent":"evolution","kb_id":1,"expected_doc_ids":[]}
+{"query":"compare OFC progress between 2024-Q1 and 2026-Q1","intent":"evolution","kb_id":1,"expected_doc_ids":[]}
+{"query":"what has been the trajectory of feature ship velocity","intent":"evolution","kb_id":1,"expected_doc_ids":[]}
+{"query":"how have priorities shifted across the past year","intent":"evolution","kb_id":1,"expected_doc_ids":[]}
+{"query":"compare 2024 retros to 2025 retros for recurring themes","intent":"evolution","kb_id":1,"expected_doc_ids":[]}
+{"query":"changes in postmortem volume across the corpus","intent":"evolution","kb_id":1,"expected_doc_ids":[]}
+{"query":"how has the architecture diagram diverged from initial proposals","intent":"evolution","kb_id":1,"expected_doc_ids":[]}
+{"query":"compare Q3 2025 to Q3 2024 OKR completion","intent":"evolution","kb_id":1,"expected_doc_ids":[]}
+{"query":"how has the team's vendor list changed","intent":"evolution","kb_id":1,"expected_doc_ids":[]}
+{"query":"3 year overview of major incidents","intent":"global","kb_id":1,"expected_doc_ids":[],"notes":"global → L4 meta"}
+{"query":"summarize the entire 2025","intent":"global","kb_id":1,"expected_doc_ids":[],"notes":"global → L3"}
+{"query":"give me an annual summary for 2024","intent":"global","kb_id":1,"expected_doc_ids":[]}
+{"query":"compare retention between 2024 and 2025","intent":"evolution","kb_id":1,"expected_doc_ids":[]}
+{"query":"how has the technical debt evolved","intent":"evolution","kb_id":1,"expected_doc_ids":[]}
+{"query":"compare quarterly check-ins for OFC","intent":"evolution","kb_id":1,"expected_doc_ids":[]}
+{"query":"changes in deployment process over the last 18 months","intent":"evolution","kb_id":1,"expected_doc_ids":[]}
+{"query":"what's the high-level 3-year story","intent":"global","kb_id":1,"expected_doc_ids":[],"notes":"L4 meta is the primary answer"}

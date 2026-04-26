@@ -230,3 +230,40 @@ Symptom: the `scripts/reingest_kb.py` driver pauses repeatedly because chat p95 
    (a) Schedule the re-ingest during off-peak hours (defer the run; this is by far the cleanest outcome — see `docs/runbook/reingest-procedure.md` for the off-hours runbook).
    (b) Raise the throttle ceiling, accepting that user-facing chat will degrade for the duration. Document the degraded window for the on-call.
    (c) Run contextualization in the background outside the re-ingest path — generate prefixes asynchronously, persist them, then have the re-ingest step skip the LLM call and read the cached prefix. Higher implementation cost but isolates re-ingest cost from chat latency.
+
+## Temporal reshard issues
+
+### Reshard stuck — Qdrant CPU at 100%
+
+Cause: the reshard does N (per-shard) upserts in a tight loop; very large source collections can saturate Qdrant.
+Fix: lower `--batch-size` from 256 to 64 in `scripts/reshard_kb_temporal.py`; resume (idempotent via UUID5 IDs, so already-written points are no-ops).
+
+### `kb_1_v4` retrieval slower than `kb_1_v3` after swap
+
+Cause: tier configuration not yet applied. Cold shards default to in-RAM until the cron runs.
+Fix: run `python scripts/tier_storage_cron.py --collection kb_1_v4` immediately. Or wait for the daily 03:00 run after Celery Beat is started.
+
+### `apply_tier_config` reports "shard not found"
+
+Cause: shard was never created (the source collection had a date that didn't classify into any month, falling to `ingest_default`).
+Fix: verify `shard_key_origin` distribution from the reshard log. If `ingest_default` is > 5%, the date extraction failed for too many docs — fix the underlying convention before resharding (filename-encoded dates are the most reliable signal — see `ext/services/temporal_shard.py:extract_shard_key`).
+
+### Temporal RAPTOR build is OOM'ing vllm-chat
+
+Cause: too many parallel summarize calls. Each L1/L2/L3/L4 node = 1 chat call.
+Fix: introduce a semaphore around `summarize` calls. Default concurrency 4; lower to 1 if needed. Monitor GPU 0 during build via `nvidia-smi -l 1`.
+
+### Evolution queries returning bad results despite L2/L3 injection
+
+Cause: L2 nodes don't actually contain change-vs-prior content because the prior summary was missing at build time (year-1 quarter-1 has no prior).
+Fix: rebuild the tree if you've added historical data after initial build. The first quarter in the corpus will always have "no prior comparison" — this is a known artefact of the temporal tree's design, not a bug.
+
+### Tier cron flapping (Phase 5.9 alert `ShardTierTransitionFlapping` firing)
+
+Cause: typically operator-side overrides being undone by the daily cron, OR boundary thresholds set so tightly that month rollover causes a back-and-forth (e.g. `RAG_TIER_HOT_MONTHS=3` + a shard right at the boundary that the operator pinned to `hot`).
+Fix:
+1. Inspect the cached tier vs the desired tier:
+   `redis-cli -n 5 GET 'tier:kb_1_v4:<shard_key>'` and compare to
+   `python -c "from ext.services.vector_store import classify_tier; print(classify_tier('<shard_key>'))"`.
+2. If pinning a shard, also write the override into Redis DB 5 (see `tiered-storage-runbook.md` "Pin a specific shard to hot").
+3. If the boundaries themselves are unstable, widen them (e.g. `RAG_TIER_HOT_MONTHS=4` with a 1-month buffer).
