@@ -421,6 +421,10 @@ services:
       RAG_OCR_ENABLED: ${RAG_OCR_ENABLED:-0}
       RAG_IMAGE_CAPTIONS: ${RAG_IMAGE_CAPTIONS:-0}
       RAG_STRUCTURED_CHUNKER: ${RAG_STRUCTURED_CHUNKER:-0}
+      # Plan B Phase 5 — kb_1 alias points to custom-sharded kb_1_v4.
+      # Ingest must derive a shard_key per document (filename-first, body
+      # fallback) so vector_store.upsert can pass shard_key_selector.
+      RAG_SHARDING_ENABLED: ${RAG_SHARDING_ENABLED:-0}
       SESSION_SECRET: ${SESSION_SECRET}
     volumes:
       - ../volumes/uploads:/app/backend/data/uploads
@@ -475,6 +479,8 @@ services:
       TEI_URL: ${TEI_URL:-http://tei:80}
       RAG_VECTOR_SIZE: ${RAG_VECTOR_SIZE:-1024}
       RAG_EMBEDDING_OPENAI_API_BASE_URL: ${RAG_EMBEDDING_OPENAI_API_BASE_URL:-http://tei:80/v1}
+      # Plan B Phase 5 — async ingest target may be custom-sharded.
+      RAG_SHARDING_ENABLED: ${RAG_SHARDING_ENABLED:-0}
     volumes:
       - ingest_blobs:/var/ingest
     command:

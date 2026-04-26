@@ -206,6 +206,31 @@ class VectorStore:
         # (Task 3.5) and ingest both consult ``_collection_has_colbert`` to
         # decide whether to compute / upsert the multi-vectors at all.
         self._colbert_cache: dict[str, bool] = {}
+        # Plan B Phase 5 — cache of "is this collection custom-sharded?"
+        # Used by ``upsert`` to require shard_key_selector for sharded
+        # targets (kb_1_v4 onward). Lazily populated.
+        self._sharding_cache: dict[str, bool] = {}
+
+    async def _is_custom_sharded(self, name: str) -> bool:
+        """Return True if the named collection uses ``sharding_method=custom``.
+
+        Result is cached. On any error (collection missing, transient API
+        failure), returns False so callers without an explicit shard_key
+        keep working on legacy single-shard collections.
+        """
+        if name in self._sharding_cache:
+            return self._sharding_cache[name]
+        try:
+            info = await self._client.get_collection(name)
+            method = getattr(info.config.params, "sharding_method", None)
+            is_custom = (
+                method is not None
+                and str(method).lower().endswith("custom")
+            )
+        except Exception:
+            is_custom = False
+        self._sharding_cache[name] = is_custom
+        return is_custom
 
     async def close(self) -> None:
         await self._client.close()
@@ -567,7 +592,13 @@ class VectorStore:
         self._named_vec_cache = cache
         return ok
 
-    async def upsert(self, name: str, points: Iterable[dict]) -> None:
+    async def upsert(
+        self,
+        name: str,
+        points: Iterable[dict],
+        *,
+        shard_key_selector: str | None = None,
+    ) -> None:
         """Upsert points. Each point may carry ``sparse_vector: (indices, values)``.
 
         When any point has a sparse_vector AND the collection supports sparse
@@ -581,6 +612,13 @@ class VectorStore:
         ``{colbert: [[...],...]}`` alongside dense (and sparse if hybrid).
         Colbert alone (no sparse) still triggers the named-vector path, since
         Qdrant requires the named shape for the multi-vector slot to exist.
+
+        Plan B Phase 5 followup: ``shard_key_selector`` routes the upsert to
+        a single shard on custom-sharded collections (``kb_1_v4`` and beyond).
+        Caller is responsible for batching by shard. If omitted and the target
+        is custom-sharded, the helper auto-derives shard_key from the points'
+        ``payload['shard_key']`` field (single-shard batch expected; raises
+        otherwise so caller bugs surface loudly).
         """
         points = list(points)
         # Decide encoding: sparse is only used if (a) any point carries it AND
@@ -604,6 +642,29 @@ class VectorStore:
             use_colbert = self._collection_has_colbert(name)
 
         n_points = len(points)
+
+        # Plan B Phase 5 followup — custom-sharded collections require
+        # shard_key_selector on every upsert. Auto-derive from the points'
+        # payload if the caller didn't pass one explicitly.
+        if shard_key_selector is None and await self._is_custom_sharded(name):
+            sk_set = {p.get("payload", {}).get("shard_key") for p in points}
+            if len(sk_set) == 1 and None not in sk_set:
+                shard_key_selector = next(iter(sk_set))
+            elif None in sk_set:
+                raise ValueError(
+                    f"upsert into custom-sharded {name!r}: every point's "
+                    f"payload must include a 'shard_key'; got {sk_set}"
+                )
+            else:
+                raise ValueError(
+                    f"upsert into custom-sharded {name!r}: mixed shard_keys "
+                    f"{sk_set} in one batch — split by shard before calling"
+                )
+        upsert_extra = (
+            {"shard_key_selector": shard_key_selector}
+            if shard_key_selector is not None else {}
+        )
+
         with span(
             "qdrant.upsert",
             collection=name,
@@ -622,7 +683,10 @@ class VectorStore:
                         )
                         for p in points
                     ]
-                    await self._client.upsert(collection_name=name, points=pts, wait=True)
+                    await self._client.upsert(
+                        collection_name=name, points=pts, wait=True,
+                        **upsert_extra,
+                    )
                     return
 
                 # Named-vector path — pack dense under _DENSE_NAME, sparse
@@ -651,7 +715,10 @@ class VectorStore:
                     pts.append(
                         qm.PointStruct(id=p["id"], vector=vec_map, payload=p.get("payload", {}))
                     )
-                await self._client.upsert(collection_name=name, points=pts, wait=True)
+                await self._client.upsert(
+                    collection_name=name, points=pts, wait=True,
+                    **upsert_extra,
+                )
             finally:
                 try:
                     qdrant_upsert_latency_seconds.observe(_perf_counter() - _t)
