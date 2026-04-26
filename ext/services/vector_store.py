@@ -218,6 +218,10 @@ class VectorStore:
         failure), returns False so callers without an explicit shard_key
         keep working on legacy single-shard collections.
         """
+        # Defensive: legacy unit-test stubs may not have ``_sharding_cache``;
+        # promote to an instance dict so subsequent calls hit the cache.
+        if not hasattr(self, "_sharding_cache"):
+            self._sharding_cache = {}
         if name in self._sharding_cache:
             return self._sharding_cache[name]
         try:
@@ -621,25 +625,30 @@ class VectorStore:
         otherwise so caller bugs surface loudly).
         """
         points = list(points)
-        # Decide encoding: sparse is only used if (a) any point carries it AND
-        # (b) the collection was created with sparse support.
-        has_sparse_points = any(p.get("sparse_vector") is not None for p in points)
-        use_sparse = False
-        if has_sparse_points:
-            # Make sure the cache is warm — caller usually called
-            # ensure_collection first, but fall back to a Qdrant lookup.
-            await self._refresh_sparse_cache(name)
-            use_sparse = self._collection_has_sparse(name)
+        # Always refresh both caches up front — we need to know the target
+        # schema to decide encoding. If the collection has any named vectors
+        # we must use the named-vector form even when individual points lack
+        # sparse/colbert (Qdrant rejects raw vector against named schema with
+        # "Wrong input: Not existing vector name error").
+        await self._refresh_sparse_cache(name)
+        await self._refresh_colbert_cache(name)
+        collection_has_sparse = self._collection_has_sparse(name)
+        collection_has_colbert = self._collection_has_colbert(name)
 
-        # Same gate for colbert: only emit when the point carries multi-vectors
-        # AND the collection actually has the slot. Either condition false →
-        # silently skip (no Qdrant error, ingest doesn't have to special-case
-        # collections that pre-date Task 3.4).
+        # Encoding decision:
+        #   * sparse vector slot is filled per-point only when the point
+        #     carries one AND the collection supports it
+        #   * same for colbert
+        #   * but if the collection has EITHER named slot, we must take the
+        #     named-vector path so dense lands under "dense" instead of as
+        #     an unnamed raw list
+        has_sparse_points = any(p.get("sparse_vector") is not None for p in points)
+        use_sparse = collection_has_sparse and has_sparse_points
         has_colbert_points = any(p.get("colbert_vector") is not None for p in points)
-        use_colbert = False
-        if has_colbert_points:
-            await self._refresh_colbert_cache(name)
-            use_colbert = self._collection_has_colbert(name)
+        use_colbert = collection_has_colbert and has_colbert_points
+        # Force named encoding whenever the target collection has any named
+        # slot, so the raw "vector=[..]" form doesn't trip the schema check.
+        force_named = collection_has_sparse or collection_has_colbert
 
         n_points = len(points)
 
@@ -675,8 +684,10 @@ class VectorStore:
         ):
             _t = _perf_counter()
             try:
-                if not use_sparse and not use_colbert:
+                if not use_sparse and not use_colbert and not force_named:
                     # Legacy path — byte-identical to pre-hybrid behavior.
+                    # Only safe when the target collection has NO named
+                    # vectors at all (pre-P2 collections).
                     pts = [
                         qm.PointStruct(
                             id=p["id"], vector=p["vector"], payload=p.get("payload", {})
