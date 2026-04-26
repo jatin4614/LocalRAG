@@ -1077,11 +1077,36 @@ class VectorStore:
                 name, len(shard_keys),
             )
 
+        # Discover peer ids — required for create_shard_key in cluster mode.
+        # Single-peer clusters still need explicit placement; otherwise Qdrant
+        # returns 400 "Distributed mode disabled" because it cannot decide
+        # which peer should host the new shard.
+        # Discover peer ids via raw HTTP — qdrant-client SDK exposes
+        # cluster_status as a discriminated-union model that does not
+        # surface the peers dict cleanly.
+        peer_ids: list[int] = []
+        try:
+            import httpx as _httpx
+            qdrant_url = (
+                self._url.rstrip("/")
+                if hasattr(self, "_url") else "http://qdrant:6333"
+            )
+            async with _httpx.AsyncClient(timeout=5.0) as _http:
+                r = await _http.get(f"{qdrant_url}/cluster")
+                if r.status_code == 200:
+                    peers = r.json().get("result", {}).get("peers", {}) or {}
+                    peer_ids = [int(pid) for pid in peers.keys()]
+        except Exception:
+            # Cluster API unavailable; placement=None only works in true
+            # distributed (multi-peer) mode.
+            peer_ids = []
+
         # Ensure shard keys (idempotent — Qdrant returns 200 even if exists)
         for sk in shard_keys:
             try:
                 await self._client.create_shard_key(
                     collection_name=name, shard_key=sk,
+                    placement=peer_ids or None,
                 )
             except Exception as e:
                 # 409 / "already exists" is fine

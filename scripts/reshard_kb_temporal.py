@@ -161,15 +161,25 @@ async def main() -> int:
         with_colbert=has_colbert,
     )
 
-    # Pass 3: upsert per shard
+    # Pass 3: upsert per shard, chunked to avoid 400s on large requests.
+    # ColBERT multi-vectors blow up the request body — keep batches small.
+    UPSERT_CHUNK = 64
     for sk in shard_keys:
         points = buckets[sk]
-        log.info("upserting shard_key=%s (%d points)", sk, len(points))
-        await qc.upsert(
-            collection_name=args.target,
-            points=points,
-            shard_key_selector=sk,
-        )
+        log.info("upserting shard_key=%s (%d points, chunk=%d)",
+                 sk, len(points), UPSERT_CHUNK)
+        for i in range(0, len(points), UPSERT_CHUNK):
+            chunk = points[i:i + UPSERT_CHUNK]
+            try:
+                await qc.upsert(
+                    collection_name=args.target,
+                    points=chunk,
+                    shard_key_selector=sk,
+                )
+            except Exception as e:
+                log.error("upsert chunk %d-%d failed: %s",
+                          i, i + len(chunk), repr(e)[:300])
+                raise
 
     # Verify counts
     src_count = (await qc.count(collection_name=args.source)).count

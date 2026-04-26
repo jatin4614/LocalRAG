@@ -78,7 +78,12 @@ async def _scroll_l0_chunks(
         )
         for r in records:
             payload = r.payload or {}
-            if "level" in payload and payload["level"] != 0:
+            # L1-L4 RAPTOR nodes carry an integer ``level`` payload (1..4).
+            # L0 chunks may carry ``level: "chunk"`` (Plan A canonical) or no
+            # ``level`` field at all. Skip RAPTOR nodes on re-runs so the
+            # tree is rebuilt from leaves only.
+            lvl = payload.get("level")
+            if isinstance(lvl, int) and lvl in (1, 2, 3, 4):
                 continue
             sk = payload.get("shard_key")
             text = payload.get("text") or payload.get("content")
@@ -166,10 +171,32 @@ async def _amain(args: argparse.Namespace) -> int:
         await qc.close(); await embedder.aclose(); await summarize.aclose()
         return 0
 
+    # Discover existing shard_keys on the target collection via raw HTTP
+    # (qdrant-client SDK exposes neither cluster_api nor collection_cluster_info
+    # cleanly in 1.17.x). RAPTOR's L3/L4 nodes anchor to "<year>-12" by design,
+    # but small/recent corpora may not have a 12-month shard yet — remap to
+    # the closest known shard_key.
+    available: list[str] = []
+    async with httpx.AsyncClient(timeout=10.0) as _http:
+        r = await _http.get(f"{args.qdrant_url}/collections/{args.collection}/cluster")
+        if r.status_code == 200:
+            shards = r.json().get("result", {}).get("local_shards", []) or []
+            available = sorted({s["shard_key"] for s in shards if s.get("shard_key")})
+
+    def _remap(sk: str) -> str:
+        if sk in available:
+            return sk
+        # Pick the latest shard_key not exceeding sk; fall back to overall latest.
+        candidates = [k for k in available if k <= sk]
+        return (candidates[-1] if candidates else available[-1]) if available else sk
+
     by_shard: dict[str, list[PointStruct]] = {}
     for n in nodes:
-        sk = n["payload"]["shard_key"]
-        by_shard.setdefault(sk, []).append(PointStruct(
+        target_sk = _remap(n["payload"]["shard_key"])
+        if target_sk != n["payload"]["shard_key"]:
+            log.info("remapping L%d node shard_key %s -> %s",
+                     n["payload"]["level"], n["payload"]["shard_key"], target_sk)
+        by_shard.setdefault(target_sk, []).append(PointStruct(
             id=_node_id(args.collection, n["payload"]),
             vector={"dense": n["embedding"]},
             payload={**n["payload"], "text": n["text"]},

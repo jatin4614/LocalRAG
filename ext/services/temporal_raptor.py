@@ -118,9 +118,24 @@ def build_meta_prompt(year_summaries: list[str]) -> str:
 3-year synthesis:"""
 
 
+_MONTH_PROMPT_MAX_CHUNKS = 30  # cap to fit Gemma 32K context budget
+
+
 def build_month_prompt(shard_key: str, chunk_texts: list[str]) -> str:
-    """Prompt for the monthly (L1) summary fallback path."""
-    joined = "\n\n".join(t[:2000] for t in chunk_texts)
+    """Prompt for the monthly (L1) summary fallback path.
+
+    Caps the number of chunks included to keep the prompt within the chat
+    model's context window. With 30 chunks × 2000 chars ≈ 60K chars ≈ 15K
+    tokens (Gemma-4-31B has 32K context), leaves headroom for the prompt
+    template and the 512-token reply. If a month has more chunks, sample
+    evenly across the time range so the summary still captures span.
+    """
+    if len(chunk_texts) > _MONTH_PROMPT_MAX_CHUNKS:
+        step = len(chunk_texts) / _MONTH_PROMPT_MAX_CHUNKS
+        sampled = [chunk_texts[int(i * step)] for i in range(_MONTH_PROMPT_MAX_CHUNKS)]
+    else:
+        sampled = chunk_texts
+    joined = "\n\n".join(t[:2000] for t in sampled)
     return f"""Summarize the following content from {shard_key} in 3-5 declarative sentences. Capture themes, named entities, and specific facts. Do NOT use phrases like 'the document says'.
 
 {joined}

@@ -57,6 +57,20 @@ services:
     image: qdrant/qdrant:latest
     container_name: orgchat-qdrant
     restart: unless-stopped
+    # Plan B Phase 5 — cluster (distributed) mode is required for custom
+    # sharding (kb_1_v4 onward). One-time enablement on 2026-04-26 required
+    # snapshotting all collections, wiping qdrant_data, restoring after
+    # restart (Qdrant cannot promote standalone storage to cluster format
+    # in-place). See docs/runbook/temporal-reshard-procedure.md.
+    environment:
+      QDRANT__CLUSTER__ENABLED: "true"
+    # First (and only) peer in a single-node cluster must advertise its
+    # P2P URI so consensus can initialize. Inside the orgchat compose
+    # network, the service is reachable as http://qdrant:6335.
+    command:
+      - "./entrypoint.sh"
+      - "--uri"
+      - "http://qdrant:6335"
     ports:
       - "6333:6333"
     volumes:
