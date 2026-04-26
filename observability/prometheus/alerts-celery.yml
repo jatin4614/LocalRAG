@@ -1,0 +1,27 @@
+groups:
+  - name: celery_soak
+    interval: 30s
+    rules:
+      - alert: CeleryDLQDepthHigh
+        expr: celery_dlq_depth > 10
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Celery DLQ depth {{ $value }} > 10"
+          description: "Workers are unable to process some tasks. Inspect logs."
+
+      - alert: CeleryWorkerDown
+        expr: up{job="celery-worker"} == 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "celery-worker container down"
+          description: "Async ingest will fail open with sync (if RAG_SYNC_INGEST=1) or hang (if RAG_SYNC_INGEST=0)."
+
+      - alert: CeleryUploadLatencyHigh
+        expr: histogram_quantile(0.95, rate(celery_upload_latency_seconds_bucket[5m])) > 30
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Celery upload p95 latency > 30s"
+          description: "Worker may be saturated or slow."
