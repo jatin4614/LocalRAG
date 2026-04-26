@@ -292,6 +292,48 @@ rag_eval_p95_latency = Gauge(
 )
 
 
+# -----------------------------------------------------------------------
+# Plan B Phase 4.7 — Query Understanding LLM metrics
+# -----------------------------------------------------------------------
+rag_qu_invocations = Counter(
+    f"{_NS}_qu_invocations_total",
+    "QU classifier invocations by source (regex / llm / cached)",
+    labelnames=("source",),
+)
+
+rag_qu_escalations = Counter(
+    f"{_NS}_qu_escalations_total",
+    "QU escalations from regex to LLM by predicate reason",
+    labelnames=("reason",),
+)
+
+rag_qu_latency = Histogram(
+    f"{_NS}_qu_latency_seconds",
+    "QU LLM call latency",
+    buckets=(0.05, 0.1, 0.2, 0.4, 0.6, 1.0, 2.0, 5.0),
+)
+
+rag_qu_schema_violations = Counter(
+    f"{_NS}_qu_schema_violations_total",
+    "QU LLM responses that failed schema validation",
+)
+
+rag_qu_cache_hits = Counter(
+    f"{_NS}_qu_cache_hits_total",
+    "QU cache hits",
+)
+
+rag_qu_cache_misses = Counter(
+    f"{_NS}_qu_cache_misses_total",
+    "QU cache misses",
+)
+
+rag_qu_cache_hit_ratio = Gauge(
+    f"{_NS}_qu_cache_hit_ratio",
+    "QU cache hit ratio (derived; recomputed every 30s by background task)",
+)
+
+
 @contextmanager
 def time_stage(stage: str) -> Iterator[None]:
     """Wrap a block to record its duration into ``stage_latency{stage="..."}``.
@@ -310,6 +352,79 @@ def time_stage(stage: str) -> Iterator[None]:
             pass
 
 
+# -----------------------------------------------------------------------
+# Plan B Phase 5.9 — per-shard metrics for temporally-sharded collections.
+#
+# The four metrics let operators answer:
+#   * how big is each shard?           -> rag_shard_point_count
+#   * is search fast on each shard?    -> rag_shard_search_latency_seconds
+#   * is upsert fast on each shard?    -> rag_shard_upsert_latency_seconds
+#   * which tier is each shard in?     -> rag_shard_tier (label-as-state)
+#
+# ``rag_shard_tier`` uses the label-as-state pattern: at any time exactly
+# one of {hot, warm, cold} is set to 1 for a (collection, shard_key)
+# pair, the others are 0. ``set_shard_tier`` enforces that invariant.
+# This makes Prometheus ``rate(rag_shard_tier[1d])`` a useful flap
+# detector (Phase 5.10 alert).
+# -----------------------------------------------------------------------
+RAG_SHARD_POINT_COUNT = Gauge(
+    f"{_NS}_shard_point_count",
+    "Number of points per shard, refreshed by tier cron",
+    labelnames=("collection", "shard_key"),
+)
+
+RAG_SHARD_SEARCH_LATENCY = Histogram(
+    f"{_NS}_shard_search_latency_seconds",
+    "Per-shard search latency (only emitted for shard-filtered searches)",
+    labelnames=("collection", "shard_key"),
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5),
+)
+
+RAG_SHARD_UPSERT_LATENCY = Histogram(
+    f"{_NS}_shard_upsert_latency_seconds",
+    "Per-shard upsert latency",
+    labelnames=("collection", "shard_key"),
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5),
+)
+
+RAG_SHARD_TIER = Gauge(
+    f"{_NS}_shard_tier",
+    "Current tier for each shard (1=current; 0=not). "
+    "Exactly one tier label is 1 per (collection, shard_key) at any time.",
+    labelnames=("collection", "shard_key", "tier"),
+)
+
+
+def set_shard_tier(*, collection: str, shard_key: str, tier: str) -> None:
+    """Update the tier gauge: set requested tier to 1, others to 0.
+
+    Fail-open — any prometheus_client error is swallowed so a metrics
+    misconfiguration cannot break the cron path.
+    """
+    for t in ("hot", "warm", "cold"):
+        try:
+            RAG_SHARD_TIER.labels(
+                collection=collection, shard_key=shard_key, tier=t,
+            ).set(1.0 if t == tier else 0.0)
+        except Exception:
+            pass
+
+
 def prom_available() -> bool:
     """Return True if prometheus_client was importable at module load."""
     return _PROM_AVAILABLE
+
+
+# ---------------------------------------------------------------------------
+# Plan B Phase 6.7 — image caption ingest skip counter.
+#
+# Incremented when ``ext.services.ingest.extract_images_as_chunks``
+# captions an image but the vision service raises (most often because
+# vllm-vision is on-demand and not yet warm). Operators monitor this
+# alongside ``rag_image_skip_total`` in Grafana to spot regressions in
+# image recall.
+# ---------------------------------------------------------------------------
+RAG_IMAGE_SKIP = Counter(
+    f"{_NS}_image_skip_total",
+    "Images that could not be captioned (e.g. vision unreachable).",
+)

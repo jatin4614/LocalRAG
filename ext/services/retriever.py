@@ -375,3 +375,213 @@ async def retrieve(
             _cache_put(qvec, list(selected_kbs), chat_id, trimmed)
 
     return trimmed
+
+
+# ----------------------------------------------------------------------
+# Plan B Phase 5.6 — temporal-aware level injection (single-collection helpers)
+# ----------------------------------------------------------------------
+# These helpers operate on ONE collection and use plain dict hits (not Hit
+# instances) so they're trivially testable. They live alongside the legacy
+# ``retrieve()`` fan-out fn but don't replace it — operators can opt in
+# per-call via the chat bridge (Phase 5.6 step 4 wiring).
+
+# Intent → level injection rules (Plan B Phase 5.6).
+_INTENT_LEVEL_INJECTION: dict[str, list[int]] = {
+    "global": [3, 4],       # yearly + 3-year meta
+    "evolution": [2, 3],    # quarterly + yearly
+    "specific_date": [],    # filter by shard_key, no level injection
+    "specific": [],
+    "metadata": [],
+}
+
+
+# Module-level VectorStore singleton for Phase 5.6 helpers. Initialized on
+# first call from real production code. Tests monkeypatch
+# ``_get_vector_store_singleton`` or pre-set the variable directly.
+_vs_singleton: Optional[VectorStore] = None
+
+
+def _get_vector_store_singleton() -> VectorStore:
+    """Return / lazily construct the module-level VectorStore.
+
+    Production callers (chat_rag_bridge) typically inject their own VS
+    instance via the legacy ``retrieve()`` fan-out — these helpers exist
+    for the temporal level-injection code path and unit tests that want
+    a no-network singleton.
+    """
+    global _vs_singleton
+    if _vs_singleton is None:
+        _vs_singleton = VectorStore(
+            url=os.environ.get("QDRANT_URL", "http://qdrant:6333"),
+            vector_size=int(os.environ.get("RAG_DENSE_DIM", "1024")),
+        )
+    return _vs_singleton
+
+
+async def _dense_search(
+    *,
+    collection: str,
+    query_vec: list[float],
+    top_k: int,
+    qdrant_filter=None,
+    **_kwargs,
+) -> list[dict]:
+    """Run a single dense search; return list of dict-shaped hits.
+
+    Tests monkeypatch this directly. Production wiring (Phase 5.6 step 4)
+    constructs a Hit-shaped result from the live ``VectorStore.search``
+    and adapts it to dicts for downstream merging.
+    """
+    vs = _get_vector_store_singleton()
+    hits = await vs.search(
+        collection,
+        query_vec,
+        limit=top_k,
+    )
+    return [
+        {"id": h.id, "score": h.score, "payload": dict(h.payload or {})}
+        for h in hits
+    ]
+
+
+async def _fetch_temporal_levels(
+    collection: str, levels: list[int], top_k: int = 1,
+) -> dict[int, list[dict]]:
+    """Fetch top_k summary nodes per level from a temporal collection.
+
+    Returns ``{level: [hit, ...]}``. Each hit is the same dict shape as
+    a normal retrieval result. Implements the Plan B Phase 5.6 contract
+    of "guarantee-include the L3 / L4 nodes when intent demands them".
+    """
+    from qdrant_client.http.models import (
+        FieldCondition, Filter, MatchValue,
+    )
+
+    vs = _get_vector_store_singleton()
+    out: dict[int, list[dict]] = {}
+    for level in levels:
+        f = Filter(must=[
+            FieldCondition(key="level", match=MatchValue(value=level)),
+        ])
+        try:
+            points, _ = await vs._client.scroll(
+                collection_name=collection,
+                limit=top_k,
+                scroll_filter=f,
+                with_payload=True,
+                with_vectors=False,
+            )
+        except Exception:
+            out[level] = []
+            continue
+        out[level] = [
+            {"id": str(p.id), "score": 1.0, "payload": p.payload or {}}
+            for p in points
+        ]
+    return out
+
+
+def _filter_by_temporal_constraint(constraint: Optional[dict]):
+    """Build a Qdrant filter that narrows to matching shard_keys.
+
+    Plan B Phase 5.6.
+    """
+    if not constraint:
+        return None
+    from qdrant_client.http.models import (
+        FieldCondition, Filter, MatchAny, MatchValue,
+    )
+    year = constraint.get("year")
+    month = constraint.get("month")
+    quarter = constraint.get("quarter")
+
+    if month and year:
+        sk = f"{year:04d}-{month:02d}"
+        return Filter(must=[
+            FieldCondition(key="shard_key", match=MatchValue(value=sk)),
+        ])
+    if quarter and year:
+        first_month = (quarter - 1) * 3 + 1
+        sks = [f"{year:04d}-{first_month + i:02d}" for i in range(3)]
+        return Filter(must=[
+            FieldCondition(key="shard_key", match=MatchAny(any=sks)),
+        ])
+    if year:
+        sks = [f"{year:04d}-{m:02d}" for m in range(1, 13)]
+        return Filter(must=[
+            FieldCondition(key="shard_key", match=MatchAny(any=sks)),
+        ])
+    return None
+
+
+async def retrieve_for_kb(
+    *,
+    collection: str,
+    query: str,
+    query_vec: list[float],
+    top_k: int,
+    intent_hint: str = "specific",
+    temporal_constraint: Optional[dict] = None,
+    **kwargs,
+) -> list[dict]:
+    """Single-collection retrieval with temporal-aware level injection.
+
+    Plan B Phase 5.6. Behavior:
+
+      * ``RAG_TEMPORAL_LEVELS=0`` (default): byte-equivalent to a plain
+        dense search — no shard_key filter, no level injection.
+      * ``intent_hint=global``: inject L3 + L4 summary nodes ahead of the
+        dense candidates so they survive top-K trimming.
+      * ``intent_hint=evolution``: inject L2 + L3 summary nodes.
+      * ``intent_hint=specific_date``: apply a shard_key filter derived
+        from ``temporal_constraint`` (no level injection).
+      * Other intents: pass-through dense search.
+
+    Plan B Phase 5.7 wires time-decay scoring on top of the returned
+    base hits.
+    """
+    temporal_enabled = os.environ.get("RAG_TEMPORAL_LEVELS", "0") == "1"
+
+    qdrant_filter = None
+    if temporal_enabled and intent_hint == "specific_date":
+        qdrant_filter = _filter_by_temporal_constraint(temporal_constraint)
+
+    base_hits = await _dense_search(
+        collection=collection,
+        query_vec=query_vec,
+        top_k=top_k,
+        qdrant_filter=qdrant_filter,
+        **kwargs,
+    )
+
+    if not temporal_enabled:
+        return base_hits
+
+    # Plan B Phase 5.7 — intent-conditional time-decay scoring.
+    if os.environ.get("RAG_TIME_DECAY", "0") == "1":
+        try:
+            from .time_decay import (
+                apply_time_decay_to_hits, should_apply_time_decay,
+            )
+            if should_apply_time_decay(
+                query=query,
+                intent=intent_hint,
+                temporal_constraint=temporal_constraint,
+            ):
+                apply_time_decay_to_hits(base_hits)
+        except Exception:  # noqa: BLE001 — fail-open, don't block retrieval
+            pass
+
+    levels_to_fetch = _INTENT_LEVEL_INJECTION.get(intent_hint, [])
+    if levels_to_fetch:
+        levels_hits = await _fetch_temporal_levels(
+            collection=collection,
+            levels=levels_to_fetch,
+            top_k=2,
+        )
+        injected: list[dict] = []
+        for level in sorted(levels_to_fetch):
+            injected.extend(levels_hits.get(level, []))
+        return injected + base_hits
+
+    return base_hits

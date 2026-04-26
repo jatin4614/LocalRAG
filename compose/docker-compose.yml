@@ -12,9 +12,15 @@ volumes:
   postgres_data: { driver: local }
   redis_data:    { driver: local }
   qdrant_data:   { driver: local }
-  # Shared between open-webui (producer) and celery-worker (consumer) when
-  # RAG_SYNC_INGEST=0. In the default sync path, nothing writes to it.
+  # Shared between open-webui (producer) and celery-worker (consumer).
+  # Default after Plan B Phase 6.2 is RAG_SYNC_INGEST=0 (async); set
+  # RAG_SYNC_INGEST=1 to revert to the legacy in-process sync path
+  # (in which case nothing writes to this volume).
   ingest_blobs:  { driver: local }
+  # Persists the celery-beat schedule file (last-run timestamps) across
+  # container restarts so the daily tier-storage cron does not re-fire after
+  # every redeploy. Only used by the celery-beat service.
+  celery_beat_state: { driver: local }
 
 services:
   postgres:
@@ -195,6 +201,60 @@ services:
               device_ids: ["1"]
               capabilities: [gpu]
 
+  # Plan B Phase 4.1 — Query Understanding LLM. Pinned to GPU 1 (RTX PRO 4000
+  # Blackwell, 24 GB) alongside TEI + open-webui reranker. GPU 0 is reserved
+  # for vllm-chat (Gemma-4-31B-AWQ at ~89% VRAM).
+  #
+  # Sizing: Qwen3-4B-Instruct-2507-AWQ-4bit ≈ 3.5 GB weights + KV cache cap
+  # 4-5 GB (--gpu-memory-utilization 0.45). Total resident with TEI +
+  # reranker ≈ 12 GB / 24 GB ≈ 50%.
+  #
+  # The bridge (ext/services/chat_rag_bridge.py) soft-fails when this service
+  # is unreachable — open-webui therefore does NOT depends_on vllm-qu.
+  vllm-qu:
+    image: vllm/vllm-openai:latest
+    container_name: orgchat-vllm-qu
+    restart: unless-stopped
+    ipc: host
+    environment:
+      HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-1}
+      TRANSFORMERS_OFFLINE: ${TRANSFORMERS_OFFLINE:-1}
+      VLLM_USE_V1: "1"
+    volumes:
+      - ../volumes/models:/root/.cache/huggingface/hub
+    ports:
+      - "8101:8000"
+    command:
+      # Quantization is auto-detected from the model's config.json
+      # (compressed-tensors AWQ-4bit). Passing --quantization explicitly
+      # makes vLLM error out on a mismatch with the cpatonn build.
+      - "--model"
+      - "cpatonn/Qwen3-4B-Instruct-2507-AWQ-4bit"
+      - "--served-model-name"
+      - "qwen3-4b-qu"
+      - "--dtype"
+      - "auto"
+      - "--max-model-len"
+      - "8192"
+      - "--gpu-memory-utilization"
+      - "0.45"
+      - "--enable-prefix-caching"
+      - "--port"
+      - "8000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/v1/models | grep -q qwen3-4b-qu || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]
+              capabilities: [gpu]
+
   # vllm-vision — REMOVED 2026-04-20 (Gemma 4 swap).
   # Gemma 4 31B AWQ served by vllm-chat is multimodal (text + image + video),
   # so we consolidate. The vision facade env var VISION_API_BASE_URL in .env
@@ -337,6 +397,30 @@ services:
       # 30s balances admin-grant freshness against DB load reduction.
       RAG_RBAC_CACHE_REDIS_URL: ${RAG_RBAC_CACHE_REDIS_URL:-redis://redis:6379/3}
       RAG_RBAC_CACHE_TTL_SECS: ${RAG_RBAC_CACHE_TTL_SECS:-30}
+      # Plan B Phase 4 — Query Understanding LLM. Hybrid regex+LLM router that
+      # escalates ambiguous queries (pronouns, relative time, multi-clause,
+      # comparison verbs) to the QU vLLM service on GPU 1. Soft-fails to
+      # regex-only when vllm-qu is unreachable. Redis DB 4 reserved for the
+      # QU result cache (DB 3 = RBAC, DB 0 = app, DB 1/2 = celery).
+      RAG_QU_URL: ${RAG_QU_URL:-http://vllm-qu:8000/v1}
+      RAG_QU_MODEL: ${RAG_QU_MODEL:-qwen3-4b-qu}
+      RAG_QU_ENABLED: ${RAG_QU_ENABLED:-0}
+      RAG_QU_LATENCY_BUDGET_MS: ${RAG_QU_LATENCY_BUDGET_MS:-600}
+      RAG_QU_CACHE_ENABLED: ${RAG_QU_CACHE_ENABLED:-1}
+      RAG_QU_CACHE_TTL_SECS: ${RAG_QU_CACHE_TTL_SECS:-300}
+      RAG_QU_REDIS_DB: ${RAG_QU_REDIS_DB:-4}
+      RAG_QU_SHADOW_MODE: ${RAG_QU_SHADOW_MODE:-0}
+      # Plan B Phase 6.2 — async ingest. Code default is "0" (async via
+      # celery-worker on the ingest queue). Operator override path:
+      # RAG_SYNC_INGEST=1 in compose/.env to revert to legacy in-process
+      # sync ingest (worker still runs but receives no tasks).
+      RAG_SYNC_INGEST: ${RAG_SYNC_INGEST:-0}
+      # Plan B Phase 6.3 — OCR fallback. Default off; flip per-KB via the
+      # ocr_policy JSONB column. Globally toggling here is the fast path
+      # for backfill jobs that need OCR across every KB.
+      RAG_OCR_ENABLED: ${RAG_OCR_ENABLED:-0}
+      RAG_IMAGE_CAPTIONS: ${RAG_IMAGE_CAPTIONS:-0}
+      RAG_STRUCTURED_CHUNKER: ${RAG_STRUCTURED_CHUNKER:-0}
       SESSION_SECRET: ${SESSION_SECRET}
     volumes:
       - ../volumes/uploads:/app/backend/data/uploads
@@ -371,9 +455,11 @@ services:
               device_ids: ["1"]
               capabilities: [gpu]
 
-  # Celery worker for asynchronous ingest. Only used when RAG_SYNC_INGEST=0 on
-  # the open-webui producer; in the default sync path this service can run but
-  # won't receive any tasks. See ext/workers/ingest_worker.py.
+  # Celery worker for asynchronous ingest. Default-up after Plan B Phase 6.2
+  # — RAG_SYNC_INGEST defaults to 0 so all uploads route through this worker
+  # via the shared ingest_blobs volume. Set RAG_SYNC_INGEST=1 on open-webui to
+  # revert to legacy in-process ingest (worker still runs, just no tasks).
+  # See ext/workers/ingest_worker.py.
   celery-worker:
     build:
       context: ..
@@ -405,4 +491,35 @@ services:
       postgres:
         condition: service_healthy
       qdrant:
+        condition: service_healthy
+
+  # Plan B Phase 5.8 — Celery Beat scheduler. Fires the daily tier-storage
+  # cron at 03:00 local for each collection in RAG_TIER_COLLECTIONS. Single
+  # instance only — running multiple Beats causes duplicate task firings.
+  # The wall-clock-time schedule lives in
+  # ext/workers/scheduled_eval.py:beat_schedule.
+  celery-beat:
+    build:
+      context: ..
+      dockerfile: compose/Dockerfile.celery
+    container_name: orgchat-celery-beat
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/1}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/2}
+      RAG_TIER_COLLECTIONS: ${RAG_TIER_COLLECTIONS:-kb_1_v4}
+    volumes:
+      - celery_beat_state:/var/celery
+    command:
+      - celery
+      - -A
+      - ext.workers.celery_app
+      - beat
+      - --loglevel=info
+      - --schedule=/var/celery/celerybeat-schedule
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
         condition: service_healthy

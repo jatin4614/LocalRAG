@@ -135,8 +135,8 @@ _KEY_TO_ENV: dict[str, str] = {
     "hyde": "RAG_HYDE",
     "hyde_n": "RAG_HYDE_N",
     "doc_summaries": "RAG_DOC_SUMMARIES",
-    "intent_routing": "RAG_INTENT_ROUTING",
-    "intent_llm": "RAG_INTENT_LLM",
+    # The QU LLM flags (RAG_QU_*) are cluster-wide and not exposed as
+    # per-KB rag_config keys.
 }
 
 
@@ -315,6 +315,44 @@ def with_overrides(overrides: Mapping[str, str]):
     return _with_overrides(overrides)
 
 
+_VALID_CHUNKING_STRATEGIES = ("window", "structured")
+
+
+def get_chunking_strategy(rag_config: dict | None) -> str:
+    """Return 'window' (default) or 'structured'.
+
+    Plan B Phase 6.6. Reads ``chunking_strategy`` from a KB's
+    ``rag_config`` JSONB blob (migration 010). Unknown values fall back
+    to ``"window"`` so a hand-edited row never silently switches the
+    chunker on an admin who didn't expect it.
+    """
+    if not rag_config:
+        return "window"
+    raw = (rag_config.get("chunking_strategy") or "window").lower().strip()
+    if raw not in _VALID_CHUNKING_STRATEGIES:
+        return "window"
+    return raw
+
+
+def get_ocr_policy(kb_id: int, db_session) -> dict | None:
+    """Return the per-KB OCR policy or None if disabled.
+
+    Plan B Phase 6.3. Reads from the ``ocr_policy`` column added in
+    migration 011. Returns None when the KB doesn't exist OR when the
+    policy explicitly disables OCR (``enabled=False``). Otherwise
+    returns the policy dict so the ingest path can pick a backend +
+    language.
+    """
+    from ..db.models import KnowledgeBase
+    kb = db_session.query(KnowledgeBase).filter_by(id=kb_id).first()
+    if not kb:
+        return None
+    policy = kb.ocr_policy or {}
+    if not policy.get("enabled", True):
+        return None
+    return policy
+
+
 __all__ = [
     "VALID_KEYS",
     "merge_configs",
@@ -322,4 +360,6 @@ __all__ = [
     "validate_config",
     "resolve_chunk_params",
     "with_overrides",
+    "get_ocr_policy",
+    "get_chunking_strategy",
 ]

@@ -1,4 +1,4 @@
-"""Query-intent classifier (Tier 2 router).
+"""Query-intent classifier (regex fast path + LLM hybrid router).
 
 Classifies the user's query into one of four labels that drive the
 retrieval pipeline:
@@ -19,15 +19,34 @@ retrieval pipeline:
     query; the current top-k chunk pipeline handles it well.
 
 The fast path is pure regex against a lowercased, stripped query —
-sub-millisecond, zero I/O. An optional LLM tiebreaker (gated by
-``RAG_INTENT_LLM``) can re-check queries the fast path labelled
-``specific``; the slow path is a TODO stub today.
+sub-millisecond, zero I/O.
+
+Plan B Phase 4 added a hybrid LLM tiebreaker exposed via
+:func:`classify_with_qu`. It escalates ``specific``-labelled queries to
+the QU LLM (``ext.services.query_understanding``) when one of six
+predicates fires (pronoun reference, relative time, multi-clause, long
+query, comparison verb, question-word with no entity). The hybrid path
+is governed by ``RAG_QU_ENABLED``.
 """
 from __future__ import annotations
 
+import enum
+import json as _json
+import logging
 import os
 import re
-from typing import Literal, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Literal, Optional, Tuple, TYPE_CHECKING
+
+
+if TYPE_CHECKING:
+    from .query_understanding import QueryUnderstanding
+
+
+# Shadow-mode A/B logger. Plan B Phase 4.8 wires every QU call (regex AND
+# LLM) into a JSON line on this logger when ``RAG_QU_SHADOW_MODE=1``.
+# The operator analyzer (``scripts/analyze_shadow_log.py``) ingests these.
+_shadow_log = logging.getLogger("orgchat.qu_shadow")
 
 
 Intent = Literal["metadata", "global", "specific_date", "specific"]
@@ -79,6 +98,101 @@ _NUM_MONTH = {
     1: "Jan", 2: "Feb", 3: "Mar", 4: "Apr", 5: "May", 6: "Jun",
     7: "Jul", 8: "Aug", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dec",
 }
+
+
+# --------------------------------------------------------------------------
+# Plan B Phase 4.4 — escalation predicates for the hybrid regex+LLM router.
+#
+# These detect query shapes the regex fast path can't disambiguate. Each
+# predicate is independent; the first match (in fixed order) becomes the
+# escalation reason so shadow-mode A/B logging stays deterministic.
+# --------------------------------------------------------------------------
+_PRONOUN_RE = re.compile(
+    r"\b(it|that|this|those|these|they|them)\b", re.IGNORECASE
+)
+_RELATIVE_TIME_RE = re.compile(
+    r"\b(last|previous|next|coming|prior)\s+(week|month|quarter|year|day)\b|"
+    r"\b(yesterday|tomorrow|today)\b",
+    re.IGNORECASE,
+)
+_MULTI_CLAUSE_CONNECTOR_RE = re.compile(
+    r"\b(and|or|but|also|while|whereas)\b", re.IGNORECASE
+)
+_QUESTION_WORD_RE = re.compile(
+    r"^\s*(what|how|when|where|why|which|who|do|did|is|was|are|were)\b",
+    re.IGNORECASE,
+)
+_CAPITALIZED_TOKEN_RE = re.compile(r"\b[A-Z][A-Za-z0-9]{2,}\b")
+_COMPARISON_VERB_RE = re.compile(
+    r"\b(compare|contrast|differ|change|evolve|trend)\w*\b", re.IGNORECASE
+)
+
+_LONG_QUERY_TOKEN_THRESHOLD = 25
+_MULTI_CLAUSE_TOKEN_THRESHOLD = 8
+
+
+class EscalationReason(enum.Enum):
+    """Why the hybrid router decided to escalate to the LLM (or didn't)."""
+
+    NONE = "none"
+    PRONOUN_REF = "pronoun_ref"
+    RELATIVE_TIME = "relative_time"
+    MULTI_CLAUSE = "multi_clause"
+    LONG_QUERY = "long_query"
+    NO_ENTITY = "no_entity_question"
+    COMPARISON_VERB = "comparison_verb"
+
+
+def should_escalate_to_llm(
+    query: str,
+    regex_label: str,
+    history: list[dict] | None,
+) -> Tuple[bool, EscalationReason]:
+    """Decide whether the hybrid router should consult the QU LLM.
+
+    Returns ``(escalate, reason)``. Escalation is only considered when the
+    regex result is ``"specific"`` — the other labels (``metadata``,
+    ``global``, ``specific_date``) are trusted as-is. Predicates fire in
+    fixed order so the same input always picks the same reason; that
+    determinism is required by shadow-mode A/B logging.
+    """
+    if regex_label != "specific":
+        return False, EscalationReason.NONE
+    if not query:
+        return False, EscalationReason.NONE
+
+    history = history or []
+    tokens = query.split()
+    n_tokens = len(tokens)
+
+    # 1. Pronoun reference — only meaningful with history
+    if history and _PRONOUN_RE.search(query):
+        return True, EscalationReason.PRONOUN_REF
+
+    # 2. Relative time
+    if _RELATIVE_TIME_RE.search(query):
+        return True, EscalationReason.RELATIVE_TIME
+
+    # 3. Multi-clause: connector + non-trivial length
+    if (
+        n_tokens > _MULTI_CLAUSE_TOKEN_THRESHOLD
+        and _MULTI_CLAUSE_CONNECTOR_RE.search(query)
+    ):
+        return True, EscalationReason.MULTI_CLAUSE
+
+    # 4. Long query
+    if n_tokens > _LONG_QUERY_TOKEN_THRESHOLD:
+        return True, EscalationReason.LONG_QUERY
+
+    # 5. Comparison verb
+    if _COMPARISON_VERB_RE.search(query):
+        return True, EscalationReason.COMPARISON_VERB
+
+    # 6. Question word + no capitalized entity
+    if _QUESTION_WORD_RE.search(query) and not _CAPITALIZED_TOKEN_RE.search(query):
+        return True, EscalationReason.NO_ENTITY
+
+    return False, EscalationReason.NONE
 
 
 def _normalize_year(raw: str) -> Optional[int]:
@@ -273,8 +387,9 @@ def classify_with_reason(query: str) -> Tuple[Intent, str]:
     #    extracted tuple to narrow retrieval to matching ``doc_id``s.
     #    The bridge re-extracts the tuple via ``extract_date_tuple`` so
     #    we don't have to change the signature of this function.
-    # 4. Fallback: ``specific`` (optionally overridden by the LLM
-    #    tiebreaker when ``RAG_INTENT_LLM=1``).
+    # 4. Fallback: ``specific``. The optional LLM tiebreaker has moved to
+    #    the async :func:`classify_with_qu` helper (Plan B Phase 4) and is
+    #    no longer reachable from this synchronous function.
     for reason, pat in _METADATA_PATTERNS:
         if pat.search(q):
             return "metadata", reason
@@ -287,43 +402,194 @@ def classify_with_reason(query: str) -> Tuple[Intent, str]:
         day, month, year = date_tuple
         return "specific_date", f"specific_date:extracted={day} {month} {year}"
 
-    # Optional LLM tiebreaker — only engaged when the fast path returned
-    # ``specific`` (the two positive classes are trusted as-is). Today
-    # this is a stub that always returns ``specific``; wire a real call
-    # later by replacing the body of ``_llm_classify``.
-    if os.environ.get("RAG_INTENT_LLM", "0") == "1":
-        llm_label, llm_reason = _llm_classify(q)
-        return llm_label, llm_reason
-
+    # The async hybrid classifier (:func:`classify_with_qu`) is the only
+    # supported LLM path and is governed by ``RAG_QU_ENABLED``. Sync
+    # callers (logging hooks, debug endpoints) keep regex-only behaviour.
     return "specific", _DEFAULT_REASON
 
 
-def _llm_classify(query: str) -> Tuple[Intent, str]:
-    """LLM tiebreaker — explicit not-implemented sentinel.
+@dataclass
+class HybridClassification:
+    """Result of :func:`classify_with_qu`.
 
-    When ``RAG_INTENT_LLM=1`` and the fast path returned ``specific``,
-    this function is called to second-guess the label. It is **not**
-    implemented today and must NOT silently succeed: a stub returning
-    ``("specific", "llm:stub_unimplemented")`` would let an operator
-    flip the flag in production and silently degrade intent
-    classification (the LLM-tier branch would behave exactly like the
-    regex tier with no diagnostic).
-
-    Plan B Phase 4 will replace this with the Qwen3-4B Query
-    Understanding LLM. Until then, the only correct behaviour for the
-    flag-on path is to fail loudly so the operator either:
-      * unsets ``RAG_INTENT_LLM`` (regex tier, current default), or
-      * waits for Plan B Phase 4 to land the real classifier.
-
-    Raises:
-        NotImplementedError: always, when ``RAG_INTENT_LLM=1``.
+    ``intent`` and ``resolved_query`` are the primary signals consumed by
+    the chat bridge. ``source`` is one of ``"regex"`` / ``"llm"`` —
+    metric labels and shadow-mode logging key off it. ``escalation_reason``
+    records which predicate fired (or :attr:`EscalationReason.NONE` for a
+    non-escalated regex hit). ``regex_reason`` is the rule label from
+    :func:`classify_with_reason` for observability.
     """
-    raise NotImplementedError(
-        "RAG_INTENT_LLM is set but _llm_classify is not implemented. "
-        "Plan B Phase 4 will replace this with the Qwen3-4B Query "
-        "Understanding LLM. Unset RAG_INTENT_LLM to use the regex "
-        "classifier."
+
+    intent: str
+    resolved_query: str
+    temporal_constraint: Optional[dict]
+    entities: list[str] = field(default_factory=list)
+    confidence: float = 1.0
+    source: str = "regex"
+    escalation_reason: EscalationReason = EscalationReason.NONE
+    regex_reason: str = ""
+    cached: bool = False
+
+
+async def _invoke_qu(
+    query: str, history: list[dict],
+) -> Optional["QueryUnderstanding"]:
+    """Indirection so tests can monkey-patch the LLM call.
+
+    Local import keeps the regex hot-path free of httpx + dataclass
+    overhead; the import is only paid when the router escalates.
+    """
+    from .query_understanding import analyze_query
+
+    return await analyze_query(query=query, history=history)
+
+
+async def classify_with_qu(
+    query: str, history: list[dict] | None = None,
+) -> HybridClassification:
+    """Hybrid regex+LLM classifier (Plan B Phase 4) with optional shadow mode.
+
+    Always runs regex first. Escalates to the QU LLM only when:
+      * ``RAG_QU_ENABLED=1``, AND
+      * regex returned ``"specific"``, AND
+      * an escalation predicate fired (see :func:`should_escalate_to_llm`).
+
+    On QU failure (timeout, HTTP error, schema violation) or when the
+    LLM's confidence is below 0.5, the regex result is returned. The
+    bridge can rely on this never raising — it's safe to call on every
+    query.
+
+    **Shadow mode (Plan B Phase 4.8):** when ``RAG_QU_SHADOW_MODE=1``,
+    the LLM runs on EVERY query (not just escalated ones), both decisions
+    are emitted as a JSON line on the ``orgchat.qu_shadow`` logger, but
+    production routing remains regex-only. Use this to quantify the LLM-
+    vs-regex agreement distribution for ≥ 7 days before promoting
+    LLM-as-default.
+
+    Increments :data:`ext.services.metrics.rag_qu_invocations` exactly
+    once per call and :data:`rag_qu_escalations` once per LLM escalation.
+    """
+    # Local import keeps the metrics dep out of import-time fast paths.
+    from .metrics import rag_qu_escalations, rag_qu_invocations
+
+    regex_label, regex_reason = classify_with_reason(query)
+    history = history or []
+
+    # Default: regex result wins
+    result = HybridClassification(
+        intent=regex_label,
+        resolved_query=query,
+        temporal_constraint=None,
+        entities=[],
+        confidence=1.0,
+        source="regex",
+        escalation_reason=EscalationReason.NONE,
+        regex_reason=regex_reason,
+    )
+
+    qu_enabled = os.environ.get("RAG_QU_ENABLED", "0") == "1"
+    shadow_mode = os.environ.get("RAG_QU_SHADOW_MODE", "0") == "1"
+    if not qu_enabled and not shadow_mode:
+        try:
+            rag_qu_invocations.labels(source="regex").inc()
+        except Exception:
+            pass
+        return result
+
+    escalate, reason = should_escalate_to_llm(query, regex_label, history)
+    result.escalation_reason = reason
+
+    # In shadow mode, invoke the LLM on EVERY query. In normal mode, only
+    # on escalation.
+    if not shadow_mode and not escalate:
+        try:
+            rag_qu_invocations.labels(source="regex").inc()
+        except Exception:
+            pass
+        return result
+
+    if escalate and not shadow_mode:
+        try:
+            rag_qu_escalations.labels(reason=reason.value).inc()
+        except Exception:
+            pass
+
+    qu = await _invoke_qu(query, history)
+
+    if shadow_mode:
+        _emit_shadow_log(
+            query=query,
+            regex_label=regex_label,
+            regex_reason=regex_reason,
+            qu=qu,
+            escalation=reason,
+        )
+        # Shadow mode: production routing stays regex-only regardless of
+        # the LLM's verdict.
+        try:
+            rag_qu_invocations.labels(source="regex").inc()
+        except Exception:
+            pass
+        return result
+
+    if qu is None or qu.confidence < 0.5:
+        try:
+            rag_qu_invocations.labels(source="regex").inc()
+        except Exception:
+            pass
+        return result
+
+    try:
+        rag_qu_invocations.labels(source="llm").inc()
+    except Exception:
+        pass
+    return HybridClassification(
+        intent=qu.intent,
+        resolved_query=qu.resolved_query,
+        temporal_constraint=qu.temporal_constraint,
+        entities=qu.entities,
+        confidence=qu.confidence,
+        source="llm",
+        escalation_reason=reason,
+        regex_reason=regex_reason,
+        cached=qu.cached,
     )
 
 
-__all__ = ["Intent", "classify", "classify_with_reason", "extract_date_tuple"]
+def _emit_shadow_log(
+    *,
+    query: str,
+    regex_label: str,
+    regex_reason: str,
+    qu: Optional["QueryUnderstanding"],
+    escalation: EscalationReason,
+) -> None:
+    """Emit a single JSON line per QU shadow event (Plan B Phase 4.8).
+
+    Used by ``scripts/analyze_shadow_log.py`` to produce per-label
+    agreement reports during the 7-day shadow window.
+    """
+    payload = {
+        "query": query,
+        "regex_label": regex_label,
+        "regex_reason": regex_reason,
+        "llm_label": qu.intent if qu else None,
+        "llm_resolved_query": qu.resolved_query if qu else None,
+        "llm_temporal": qu.temporal_constraint if qu else None,
+        "llm_confidence": qu.confidence if qu else None,
+        "agree": (qu.intent == regex_label) if qu else None,
+        "escalation_reason": escalation.value,
+    }
+    _shadow_log.info(_json.dumps(payload, ensure_ascii=False))
+
+
+__all__ = [
+    "Intent",
+    "classify",
+    "classify_with_reason",
+    "classify_with_qu",
+    "extract_date_tuple",
+    "should_escalate_to_llm",
+    "EscalationReason",
+    "HybridClassification",
+]

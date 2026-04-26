@@ -106,3 +106,28 @@ eval-gate: eval
 	  --baseline $(BASELINE) \
 	  --latest $(LATEST) \
 	  --slo docs/runbook/slo.md
+
+# ---- Plan B Phase 5.4: temporal reshard ----
+
+.PHONY: reshard-kb-temporal eval-evolution
+
+reshard-kb-temporal:
+	@if [ -z "$(SOURCE)" ] || [ -z "$(TARGET)" ]; then \
+	  echo "Usage: make reshard-kb-temporal SOURCE=kb_1_v3 TARGET=kb_1_v4 [DRY_RUN=1]"; \
+	  exit 2; \
+	fi
+	@DRY_FLAG=$(if $(DRY_RUN),--dry-run,) ; \
+	$(ACTIVATE) && python scripts/reshard_kb_temporal.py \
+	  --source $(SOURCE) --target $(TARGET) $$DRY_FLAG
+
+eval-evolution:
+	@mkdir -p tests/eval/results
+	@if [ -z "$(KB_EVAL_ID)" ]; then \
+	  echo "Usage: make eval-evolution KB_EVAL_ID=<id>"; \
+	  exit 2; \
+	fi
+	$(ACTIVATE) && python -m tests.eval.harness \
+	  --golden tests/eval/golden_evolution.jsonl \
+	  --kb-id $(KB_EVAL_ID) \
+	  --api-base-url $(API_BASE) \
+	  --out tests/eval/results/evolution-latest.json

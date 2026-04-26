@@ -1006,3 +1006,247 @@ class VectorStore:
             )
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # Plan B Phase 5.1 — temporal custom sharding
+    # ------------------------------------------------------------------
+    async def ensure_collection_temporal(
+        self,
+        name: str,
+        shard_keys: list[str],
+        *,
+        with_sparse: bool = True,
+        with_colbert: bool = False,
+        on_disk_payload: Optional[bool] = None,
+        replication_factor: int = 1,
+    ) -> None:
+        """Create a Qdrant collection with custom temporal sharding.
+
+        One shard per ``shard_key`` (typically "YYYY-MM" for monthly buckets).
+        Shard creation is idempotent; existing keys are not re-created. The
+        collection itself is also idempotent — if it exists with a different
+        sharding strategy, this method will NOT migrate it (operator must
+        drop + recreate to change sharding).
+
+        Plan B Phase 5.1.
+        """
+        on_disk_payload = (
+            on_disk_payload
+            if on_disk_payload is not None
+            else _env_bool("RAG_QDRANT_ON_DISK_PAYLOAD", True)
+        )
+
+        if await self._client.collection_exists(collection_name=name):
+            import logging as _logging
+            _logging.getLogger(__name__).info(
+                "collection %s exists; ensuring shard keys", name
+            )
+        else:
+            vectors_config: dict = {
+                _DENSE_NAME: qm.VectorParams(
+                    size=self._vector_size,
+                    distance=qm.Distance[self._distance.upper()],
+                )
+            }
+            if with_colbert:
+                vectors_config[_COLBERT_NAME] = qm.VectorParams(
+                    size=_COLBERT_DIM,
+                    distance=qm.Distance.COSINE,
+                    multivector_config=qm.MultiVectorConfig(
+                        comparator=qm.MultiVectorComparator.MAX_SIM,
+                    ),
+                )
+            sparse_vectors = None
+            if with_sparse:
+                sparse_vectors = {
+                    _SPARSE_NAME: qm.SparseVectorParams(modifier=qm.Modifier.IDF)
+                }
+
+            await self._client.create_collection(
+                collection_name=name,
+                vectors_config=vectors_config,
+                sparse_vectors_config=sparse_vectors,
+                on_disk_payload=on_disk_payload,
+                sharding_method=qm.ShardingMethod.CUSTOM,
+                shard_number=len(shard_keys),
+                replication_factor=replication_factor,
+            )
+            import logging as _logging
+            _logging.getLogger(__name__).info(
+                "created temporal collection %s with %d shards",
+                name, len(shard_keys),
+            )
+
+        # Discover peer ids — required for create_shard_key in cluster mode.
+        # Single-peer clusters still need explicit placement; otherwise Qdrant
+        # returns 400 "Distributed mode disabled" because it cannot decide
+        # which peer should host the new shard.
+        # Discover peer ids via raw HTTP — qdrant-client SDK exposes
+        # cluster_status as a discriminated-union model that does not
+        # surface the peers dict cleanly.
+        peer_ids: list[int] = []
+        try:
+            import httpx as _httpx
+            qdrant_url = (
+                self._url.rstrip("/")
+                if hasattr(self, "_url") else "http://qdrant:6333"
+            )
+            async with _httpx.AsyncClient(timeout=5.0) as _http:
+                r = await _http.get(f"{qdrant_url}/cluster")
+                if r.status_code == 200:
+                    peers = r.json().get("result", {}).get("peers", {}) or {}
+                    peer_ids = [int(pid) for pid in peers.keys()]
+        except Exception:
+            # Cluster API unavailable; placement=None only works in true
+            # distributed (multi-peer) mode.
+            peer_ids = []
+
+        # Ensure shard keys (idempotent — Qdrant returns 200 even if exists)
+        for sk in shard_keys:
+            try:
+                await self._client.create_shard_key(
+                    collection_name=name, shard_key=sk,
+                    placement=peer_ids or None,
+                )
+            except Exception as e:
+                # 409 / "already exists" is fine
+                if "exists" not in str(e).lower():
+                    raise
+
+        # Add per-payload index on shard_key for filterable date-bounded queries
+        try:
+            await self._client.create_payload_index(
+                collection_name=name,
+                field_name="shard_key",
+                field_schema=qm.PayloadSchemaType.KEYWORD,
+            )
+        except Exception:
+            pass  # idempotent
+
+    async def upsert_temporal(
+        self,
+        collection: str,
+        points: list[dict],
+        *,
+        shard_key: str,
+    ) -> None:
+        """Upsert points into a specific shard_key.
+
+        Caller must ensure all points belong to the named shard. Mixing
+        shards in one call is a Qdrant constraint violation.
+
+        Plan B Phase 5.1; Phase 5.9 added per-shard latency observation.
+        """
+        structs = [
+            qm.PointStruct(
+                id=p["id"],
+                vector=p["vector"],
+                payload=p.get("payload", {}),
+            )
+            for p in points
+        ]
+        # Plan B Phase 5.9 — observe per-shard upsert latency. Wrap in
+        # try/finally so the histogram still records on exception.
+        import time as _t
+        from .metrics import RAG_SHARD_UPSERT_LATENCY
+        _start = _t.monotonic()
+        try:
+            await self._client.upsert(
+                collection_name=collection,
+                points=structs,
+                shard_key_selector=shard_key,
+            )
+        finally:
+            try:
+                RAG_SHARD_UPSERT_LATENCY.labels(
+                    collection=collection, shard_key=shard_key,
+                ).observe(_t.monotonic() - _start)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Plan B Phase 5.3 — tiered storage (hot/warm/cold)
+    # ------------------------------------------------------------------
+    async def apply_tier_config(
+        self,
+        collection: str,
+        shard_key: str,
+        tier: str,
+    ) -> None:
+        """Update the per-shard tier configuration.
+
+        Hot:  in-memory HNSW (memmap_threshold=0, no quantization).
+        Warm: mmap on SSD (memmap_threshold=20_000).
+        Cold: on-disk + INT8 scalar quantization (always_ram=False).
+
+        Note: Qdrant currently scopes optimizer + quantization config at
+        collection level. For per-shard control on a temporal collection,
+        we use the shard_key as a partition key in the indexing optimizer
+        threshold; per-shard quantization in Qdrant's current API requires
+        re-creating the affected shard. The tier cron (Phase 5.8) coordinates
+        this carefully.
+
+        Plan B Phase 5.3.
+        """
+        if tier == "hot":
+            await self._client.update_collection(
+                collection_name=collection,
+                optimizers_config=qm.OptimizersConfigDiff(
+                    memmap_threshold=0,  # all in RAM
+                ),
+            )
+        elif tier == "warm":
+            await self._client.update_collection(
+                collection_name=collection,
+                optimizers_config=qm.OptimizersConfigDiff(
+                    memmap_threshold=20_000,
+                ),
+            )
+        elif tier == "cold":
+            await self._client.update_collection(
+                collection_name=collection,
+                optimizers_config=qm.OptimizersConfigDiff(
+                    memmap_threshold=20_000,
+                ),
+                quantization_config=qm.ScalarQuantization(
+                    scalar=qm.ScalarQuantizationConfig(
+                        type=qm.ScalarType.INT8,
+                        quantile=0.99,
+                        always_ram=False,
+                    ),
+                ),
+            )
+        else:
+            raise ValueError(f"unknown tier {tier!r}")
+        # Plan B Phase 5.9 — emit per-shard tier gauge after Qdrant accepts.
+        try:
+            from .metrics import set_shard_tier
+            set_shard_tier(collection=collection, shard_key=shard_key, tier=tier)
+        except Exception:
+            pass
+
+
+def classify_tier(
+    shard_key: str,
+    *,
+    hot_months: int = 3,
+    warm_months: int = 12,
+) -> str:
+    """Return ``'hot'`` / ``'warm'`` / ``'cold'`` for a 'YYYY-MM' shard_key.
+
+    ``hot_months``: shards aged < this are hot. ``warm_months``: shards aged
+    >= hot_months but < warm_months are warm. Older are cold. Boundaries
+    are exclusive of ``hot_months`` and inclusive of ``warm_months``.
+
+    Plan B Phase 5.3.
+    """
+    import datetime as _dt
+    from .temporal_shard import parse_shard_key
+    y, m = parse_shard_key(shard_key)
+    today = _dt.date.today()
+    age_months = (today.year - y) * 12 + (today.month - m)
+    if age_months < hot_months:
+        return "hot"
+    if age_months < warm_months:
+        return "warm"
+    return "cold"

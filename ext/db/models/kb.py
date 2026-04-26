@@ -34,6 +34,23 @@ class KnowledgeBase(Base):
     rag_config: Mapped[dict[str, Any]] = mapped_column(
         _RagConfigType, server_default="{}", default=dict, nullable=False,
     )
+    # Plan B Phase 6.3: per-KB OCR policy. Default Tesseract (air-gap safe).
+    # Cloud backends (cloud:textract, cloud:document_ai) are operator opt-in
+    # only — see migration 011 + ext/services/ocr.py.
+    ocr_policy: Mapped[dict[str, Any]] = mapped_column(
+        _RagConfigType,
+        server_default=(
+            '{"enabled": true, "backend": "tesseract", '
+            '"language": "eng", "trigger_chars_per_page": 50}'
+        ),
+        default=lambda: {
+            "enabled": True,
+            "backend": "tesseract",
+            "language": "eng",
+            "trigger_chars_per_page": 50,
+        },
+        nullable=False,
+    )
 
     subtags: Mapped[list["KBSubtag"]] = relationship(
         back_populates="kb", cascade="all, delete-orphan"

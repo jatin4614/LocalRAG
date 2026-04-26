@@ -18,6 +18,41 @@ def repo_root() -> Path:
     return ROOT
 
 
+@pytest.fixture
+def fake_redis():
+    """In-memory async Redis double for cache unit tests.
+
+    Implements just the subset of ``redis.asyncio.Redis`` that production
+    code touches: ``get``, ``set`` (with ``ex`` TTL), ``ttl``, ``delete``.
+    Returning a fresh instance per test gives each test isolation without
+    monkey-patching the real client.
+    """
+
+    class _FakeRedis:
+        def __init__(self) -> None:
+            self._store: dict[str, str] = {}
+            self._ttls: dict[str, int] = {}
+
+        async def get(self, key):
+            return self._store.get(key)
+
+        async def set(self, key, value, ex=None):
+            self._store[key] = value
+            if ex is not None:
+                self._ttls[key] = int(ex)
+            return True
+
+        async def ttl(self, key):
+            return self._ttls.get(key, -1)
+
+        async def delete(self, key):
+            self._store.pop(key, None)
+            self._ttls.pop(key, None)
+            return 1
+
+    return _FakeRedis()
+
+
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption(
         "--integration",

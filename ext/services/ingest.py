@@ -7,6 +7,8 @@ metadata onto every resulting chunk so Qdrant payloads can surface hints like
 """
 from __future__ import annotations
 
+import io
+import logging
 import os
 import time
 import uuid
@@ -16,8 +18,24 @@ from . import flags
 from .chunker import chunk_text
 from .embedder import Embedder
 from .extractor import extract
+from .kb_config import get_chunking_strategy
+from .ocr import OCRBackend, ocr_pdf, select_ocr_backend
 from .pipeline_version import current_version
+from .temporal_shard import ShardKeyOrigin, extract_shard_key
 from .vector_store import VectorStore
+
+
+log = logging.getLogger("orgchat.ingest")
+
+
+def _sharding_enabled() -> bool:
+    """Read RAG_SHARDING_ENABLED at call time so tests / operators can toggle.
+
+    Default OFF — when off, the ingest path is byte-identical to pre-Phase-5.2:
+    no shard_key payload, normal ``upsert`` (not ``upsert_temporal``).
+    Plan B Phase 5.2.
+    """
+    return os.environ.get("RAG_SHARDING_ENABLED", "0") == "1"
 
 
 def _hybrid_enabled() -> bool:
@@ -227,8 +245,11 @@ def build_point_payload(
     # Optional canonical fields — only stamp when the caller provided them
     # so callers that don't compute these (tests, simple repair scripts)
     # produce minimal but still-valid payloads.
+    # Plan B Phase 6.6 / 6.7: structural fields stamped by chunker dispatch
+    # (``chunk_text_for_kb`` / ``extract_images_as_chunks``).
     for k in ("uploaded_at", "deleted", "model_version", "chunk_level",
-              "source_chunk_ids", "kind"):
+              "source_chunk_ids", "kind",
+              "chunk_type", "language", "continuation"):
         if k in chunk_meta:
             payload[k] = chunk_meta[k]
     return payload
@@ -261,14 +282,85 @@ async def ingest_bytes(
     if not blocks:
         return 0
 
-    # Chunk per block; carry the source block forward so we can stamp its
-    # structural metadata onto each resulting chunk.
+    # Plan B Phase 5.2 — derive a per-document shard_key once when temporal
+    # sharding is enabled. The same key is stamped on every chunk's payload
+    # and used as the ``shard_key_selector`` on the upsert. Default OFF —
+    # legacy ingest path is byte-identical.
+    sharding_on = _sharding_enabled()
+    doc_shard_key: str | None = None
+    doc_shard_origin: ShardKeyOrigin | None = None
+    if sharding_on:
+        # Use the first block's text as the body sample for date extraction.
+        # Most ingest pipelines emit blocks in source order so block[0] is
+        # the document head — the same place YAML frontmatter and the
+        # opening date typically live.
+        body_sample = blocks[0].text if blocks else ""
+        doc_shard_key, doc_shard_origin = extract_shard_key(
+            filename=filename, body=body_sample,
+        )
+        import logging as _log
+        _log.getLogger("orgchat.ingest").info(
+            "ingest doc=%s shard_key=%s origin=%s",
+            filename, doc_shard_key, doc_shard_origin.value,
+        )
+
+    # Chunk per block via the per-KB dispatcher (Plan B Phase 6.6).
+    # ``chunk_text_for_kb`` reads ``rag_config.chunking_strategy`` and
+    # double-gates on ``RAG_STRUCTURED_CHUNKER`` env. Default 'window'
+    # behaves byte-identically to the legacy chunk_text path.
+    # We carry per-chunk extras (chunk_type / language / continuation)
+    # in a parallel list keyed by global chunk index.
+    from .chunker import Chunk as _Chunk
     paired: list[tuple[object, object]] = []  # (Chunk, ExtractedBlock)
+    chunk_extras: list[dict] = []  # parallel to ``paired``
     for b in blocks:
-        for c in chunk_text(
-            b.text, chunk_tokens=chunk_tokens, overlap_tokens=overlap_tokens
-        ):
-            paired.append((c, b))
+        chunk_dicts = chunk_text_for_kb(
+            text=b.text,
+            rag_config=kb_rag_config,
+            chunk_size_tokens=chunk_tokens,
+            overlap_tokens=overlap_tokens,
+        )
+        for cd in chunk_dicts:
+            paired.append((
+                _Chunk(index=len(paired), text=cd["text"]), b,
+            ))
+            extras: dict = {}
+            ct = cd.get("chunk_type", "prose")
+            if ct != "prose":
+                extras["chunk_type"] = ct
+            if cd.get("language"):
+                extras["language"] = cd["language"]
+            if cd.get("continuation"):
+                extras["continuation"] = True
+            chunk_extras.append(extras)
+
+    # Plan B Phase 6.7 — image-caption chunks. Triple-gated by
+    # ``RAG_IMAGE_CAPTIONS=1`` (default off) inside the helper. PDF only;
+    # other mime types short-circuit because the helper expects PDF bytes.
+    if mime_type == "application/pdf":
+        try:
+            image_chunks = await extract_images_as_chunks(
+                pdf_bytes=data, filename=filename,
+            )
+        except Exception:  # noqa: BLE001 — fail-open
+            image_chunks = []
+        for ic in image_chunks:
+            # Synthesize a minimal block — image lives at its own page,
+            # outside any structural heading. Use the first block as the
+            # fallback "host" for sheet/heading_path so downstream
+            # build_point_payload still gets non-None values where the
+            # block-level structure made sense.
+            fake_block = blocks[0] if blocks else None
+            paired.append((
+                _Chunk(index=len(paired), text=ic["text"]), fake_block,
+            ))
+            extras: dict = {"chunk_type": "image_caption"}
+            if ic.get("page") is not None:
+                extras["page"] = ic["page"]
+            if ic.get("language"):
+                extras["language"] = ic["language"]
+            chunk_extras.append(extras)
+
     if not paired:
         return 0
 
@@ -466,6 +558,11 @@ async def ingest_bytes(
             payload.update(extra_payload_fields)
             for k in _absent_identity_keys:
                 payload.pop(k, None)
+            # Plan B Phase 5.2: temporal shard_key stamp (default-off).
+            if sharding_on and doc_shard_key is not None:
+                payload["shard_key"] = doc_shard_key
+                if doc_shard_origin is not None:
+                    payload["shard_key_origin"] = doc_shard_origin.value
 
             if doc_id is not None:
                 id_seed = f"doc:{doc_id}:chunk:{nidx}"
@@ -493,17 +590,28 @@ async def ingest_bytes(
             points.append(point)
     else:
         for gidx, ((chunk, block), vec) in enumerate(zip(paired, vectors)):
+            extras = chunk_extras[gidx] if gidx < len(chunk_extras) else {}
             chunk_meta = {
                 "chunk_index": gidx,
                 "text": chunk.text,
                 "context_prefix": getattr(chunk, "context_prefix", None),
-                "page": block.page,
-                "heading_path": list(block.heading_path),
-                "sheet": block.sheet,
+                # block may be None for image_caption chunks (no host block).
+                "page": extras.get("page", block.page if block is not None else None),
+                "heading_path": (
+                    list(block.heading_path) if block is not None else []
+                ),
+                "sheet": block.sheet if block is not None else None,
                 "uploaded_at": now,
                 "deleted": False,
                 "model_version": pv,
             }
+            # Plan B Phase 6.6 / 6.7 — structural / kind metadata from the
+            # chunker dispatcher. ``chunk_type``, ``language``, ``continuation``
+            # are surfaced verbatim so downstream retrieval / re-embedding
+            # tooling can distinguish prose / table / code / image_caption.
+            for k in ("chunk_type", "language", "continuation"):
+                if k in extras:
+                    chunk_meta[k] = extras[k]
             payload = build_point_payload(
                 kb_id=pb_kb_id, doc_id=doc_id, subtag_id=pb_subtag_id,
                 filename=pb_filename, owner_user_id=pb_owner,
@@ -512,6 +620,11 @@ async def ingest_bytes(
             payload.update(extra_payload_fields)
             for k in _absent_identity_keys:
                 payload.pop(k, None)
+            # Plan B Phase 5.2: temporal shard_key stamp (default-off).
+            if sharding_on and doc_shard_key is not None:
+                payload["shard_key"] = doc_shard_key
+                if doc_shard_origin is not None:
+                    payload["shard_key_origin"] = doc_shard_origin.value
 
             # Deterministic point ID: same doc + global chunk index always maps
             # to the same Qdrant point. This lets delete_by_doc reconstruct point
@@ -541,7 +654,20 @@ async def ingest_bytes(
             if cv is not None:
                 point["colbert_vector"] = cv
             points.append(point)
-    await vector_store.upsert(collection, points)
+    # Plan B Phase 5.2: route to per-shard upsert when temporal sharding is on.
+    # The named shard receives the entire batch (one-doc-per-shard invariant
+    # — ``doc_shard_key`` is derived per-document, not per-chunk).
+    if sharding_on and doc_shard_key is not None:
+        upsert_temporal = getattr(vector_store, "upsert_temporal", None)
+        if upsert_temporal is not None:
+            await upsert_temporal(
+                collection, points, shard_key=doc_shard_key,
+            )
+        else:
+            # Test double / minimal substitute: fall back to plain upsert.
+            await vector_store.upsert(collection, points)
+    else:
+        await vector_store.upsert(collection, points)
 
     # Tier 1: per-document summary point.
     # Gated by RAG_DOC_SUMMARIES (default OFF). When ON and we have a
@@ -667,3 +793,296 @@ async def _emit_doc_summary_point(
                 await s.commit()
     except Exception as e:  # noqa: BLE001 — best-effort mirror
         log.warning("kb_documents.doc_summary mirror failed doc_id=%s: %s", doc_id, e)
+
+
+# ---------------------------------------------------------------------------
+# Plan B Phase 6.4 — OCR fallback for PDFs with low extracted text.
+#
+# The wrapper detects pages where pdfplumber recovered fewer than the
+# configured threshold of characters (default 50) and re-runs the page
+# through the OCR pipeline (Tesseract by default — see ext/services/ocr.py).
+# Per-KB ``ocr_policy`` overrides the global ``RAG_OCR_ENABLED`` flag so
+# operators can disable OCR for KBs known to be all-text (faster ingest)
+# or switch a specific KB to a cloud backend (operator opt-in only).
+# ---------------------------------------------------------------------------
+
+async def extract_pdf_with_ocr_fallback(
+    *,
+    pdf_bytes: bytes,
+    filename: str,
+    ocr_policy: dict | None,
+) -> str:
+    """Extract text via pdfplumber; OCR pages where text < threshold.
+
+    Plan B Phase 6.4. Returns concatenated text. Per-page OCR is
+    triggered when ``len(page_text) < trigger_chars``. Falls open at
+    every layer:
+
+    * RAG_OCR_ENABLED=0 → return raw pdfplumber text (default-off path
+      stays byte-identical).
+    * Per-KB ocr_policy.enabled=False → skip OCR even if the global flag
+      is on.
+    * No low-text pages → no OCR call (cheap path stays cheap).
+
+    The OCR text replaces the pdfplumber text only for pages below the
+    threshold; pages with sufficient text are kept as-is.
+    """
+    pages = _extract_pdf_text_per_page(pdf_bytes)
+
+    if os.environ.get("RAG_OCR_ENABLED", "0") != "1":
+        return "\n\n".join(pages)
+
+    if ocr_policy and not ocr_policy.get("enabled", True):
+        return "\n\n".join(pages)
+
+    threshold = int(
+        (ocr_policy or {}).get(
+            "trigger_chars_per_page",
+            os.environ.get("RAG_OCR_TRIGGER_CHARS", "50"),
+        )
+    )
+
+    backend = select_ocr_backend(ocr_policy)
+    language = (ocr_policy or {}).get("language", "eng")
+
+    needs_ocr = any(len(p.strip()) < threshold for p in pages)
+    if not needs_ocr:
+        return "\n\n".join(pages)
+
+    log.info(
+        "ocr trigger: %s has %d/%d low-text pages",
+        filename,
+        sum(1 for p in pages if len(p.strip()) < threshold),
+        len(pages),
+    )
+    ocr_text = await _ocr_pdf_pages(
+        pdf_bytes, backend=backend, language=language,
+    )
+
+    # Splice OCR text in for low-text pages; keep pdfplumber text for
+    # the rest. ocr_text is a single concatenated string (one segment per
+    # page joined by "\n\n"); split + index by page so the output stays
+    # aligned 1:1 with the pdfplumber page list. If OCR returned fewer
+    # segments than pages (unlikely but possible — rasterize errors), the
+    # fallback is to keep the pdfplumber text for that page.
+    out_pages = []
+    ocr_segments = ocr_text.split("\n\n")
+    for i, p in enumerate(pages):
+        if len(p.strip()) < threshold and i < len(ocr_segments):
+            out_pages.append(ocr_segments[i])
+        else:
+            out_pages.append(p)
+    return "\n\n".join(out_pages)
+
+
+async def _ocr_pdf_pages(pdf_bytes, *, backend, language):
+    """Indirection for tests to patch.
+
+    Plan B Phase 6.4. Wraps ``ocr_pdf`` so the trigger threshold tests
+    can stub the call site without touching the underlying OCR module.
+    """
+    return await ocr_pdf(pdf_bytes, backend=backend, language=language)
+
+
+def _extract_pdf_text_per_page(pdf_bytes: bytes) -> list[str]:
+    """Extract per-page PDF text via pdfplumber.
+
+    Plan B Phase 6.4. Returns one string per page in source order so
+    callers (notably ``extract_pdf_with_ocr_fallback``) can spot
+    low-text pages and route them through OCR independently. Empty
+    pages return ``""`` rather than ``None`` so downstream length
+    checks are unambiguous.
+    """
+    import pdfplumber
+
+    pages = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            pages.append(page.extract_text() or "")
+    return pages
+
+
+# ---------------------------------------------------------------------------
+# Plan B Phase 6.6 — per-KB chunking strategy dispatch.
+#
+# ``chunk_text_for_kb`` is the new dispatch point: it reads
+# ``rag_config.chunking_strategy`` (window or structured) and routes the
+# extracted text to the right chunker. The window chunker keeps the
+# pre-Plan-B byte-identical behavior; the structured chunker preserves
+# tables + code blocks as atomic units (Plan B Phase 6.5).
+#
+# The structured path is double-gated by the env flag
+# ``RAG_STRUCTURED_CHUNKER`` so an operator can globally roll it back
+# without touching every KB row.
+# ---------------------------------------------------------------------------
+
+def chunk_text_for_kb(
+    *,
+    text: str,
+    rag_config: dict | None,
+    chunk_size_tokens: int = 800,
+    overlap_tokens: int = 100,
+) -> list[dict]:
+    """Dispatch to the right chunker per KB strategy.
+
+    Plan B Phase 6.6. Always returns a list of chunk dicts with at
+    least ``text`` and ``chunk_type`` keys. The window chunker emits
+    every chunk with ``chunk_type="prose"``; the structured chunker
+    distinguishes prose / table / code (and stamps ``language`` for
+    code chunks).
+    """
+    strategy = get_chunking_strategy(rag_config)
+    if strategy == "structured" and \
+            os.environ.get("RAG_STRUCTURED_CHUNKER", "0") == "1":
+        from .chunker_structured import chunk_structured
+        return chunk_structured(
+            text,
+            chunk_size_tokens=chunk_size_tokens,
+            overlap_tokens=overlap_tokens,
+        )
+    # Window default — wrap each Chunk's text into the dict shape.
+    return [
+        {"text": w, "chunk_type": "prose"}
+        for w in _chunk_window(
+            text,
+            chunk_size_tokens=chunk_size_tokens,
+            overlap_tokens=overlap_tokens,
+        )
+    ]
+
+
+def _chunk_window(text, *, chunk_size_tokens=800, overlap_tokens=100):
+    """Existing window-chunker entry point.
+
+    Wraps ``ext.services.chunker.chunk_text`` so callers downstream of
+    ``chunk_text_for_kb`` get a list of plain text strings (matching the
+    legacy contract). ``chunk_text`` returns ``Chunk`` dataclasses; we
+    flatten to ``.text`` strings here.
+    """
+    return [
+        c.text for c in chunk_text(
+            text,
+            chunk_tokens=chunk_size_tokens,
+            overlap_tokens=overlap_tokens,
+        )
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Plan B Phase 6.7 — image caption extraction.
+#
+# When a PDF carries embedded images (charts, screenshots, diagrams), we
+# extract them, send each through the vllm-vision service, and emit a
+# chunk with ``chunk_type="image_caption"``. This restores recall on
+# visual-content queries that today silently lose the image content.
+#
+# Triple-gated soft-fail:
+#   * RAG_IMAGE_CAPTIONS=0 (default) → never extract images at all
+#   * Image extraction fails → return [] + log
+#   * Vision service unreachable → skip per-image + tick
+#     ``rag_image_skip_total`` metric
+# ---------------------------------------------------------------------------
+
+async def extract_images_as_chunks(
+    *, pdf_bytes: bytes, filename: str,
+) -> list[dict]:
+    """Plan B Phase 6.7 — emit image_caption chunks for embedded images.
+
+    Returns a list of chunk dicts. Returns [] (silent skip) if:
+      - RAG_IMAGE_CAPTIONS=0, or
+      - vision service unreachable, or
+      - no images extracted
+    """
+    if os.environ.get("RAG_IMAGE_CAPTIONS", "0") != "1":
+        return []
+    try:
+        images = await _extract_pdf_images(pdf_bytes)
+    except Exception as e:
+        log.warning("image extraction failed for %s: %s", filename, e)
+        return []
+    if not images:
+        return []
+
+    out: list[dict] = []
+    for img in images:
+        try:
+            caption = await _caption_image(img["image_bytes"])
+        except Exception as e:
+            log.warning(
+                "image caption failed for %s page %s: %s",
+                filename, img.get("page"), e,
+            )
+            try:
+                from .metrics import RAG_IMAGE_SKIP
+                RAG_IMAGE_SKIP.inc()
+            except Exception:
+                pass
+            continue
+        if not caption:
+            continue
+        out.append({
+            "text": caption,
+            "chunk_type": "image_caption",
+            "payload": {
+                "page": img.get("page"),
+                "position": img.get("position"),
+            },
+        })
+    return out
+
+
+async def _extract_pdf_images(pdf_bytes: bytes) -> list[dict]:
+    """Use pymupdf to enumerate images. Returns list of dicts.
+
+    Plan B Phase 6.7. Each entry is
+    ``{"page": int, "image_bytes": bytes, "position": tuple}``.
+    """
+    import pymupdf
+
+    out = []
+    with pymupdf.open(stream=pdf_bytes) as doc:
+        for page_num, page in enumerate(doc, start=1):
+            for img_idx, img_info in enumerate(page.get_images(full=True)):
+                xref = img_info[0]
+                base_img = doc.extract_image(xref)
+                out.append({
+                    "page": page_num,
+                    "image_bytes": base_img["image"],
+                    "position": (img_idx,),
+                })
+    return out
+
+
+async def _caption_image(image_bytes: bytes) -> str:
+    """Send an image to vllm-vision and return the caption.
+
+    Plan B Phase 6.7. Soft-fails if the vision service is unreachable —
+    the caller catches the exception and ticks
+    ``rag_image_skip_total``.
+    """
+    import base64
+
+    import httpx
+
+    vision_url = os.environ.get(
+        "RAG_VISION_URL", "http://vllm-vision:8000/v1",
+    )
+    vision_model = os.environ.get("RAG_VISION_MODEL", "qwen2-vl-7b")
+    b64 = base64.b64encode(image_bytes).decode()
+    payload = {
+        "model": vision_model,
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text",
+                 "text": "Describe the key information in this image in 1-2 sentences."},
+                {"type": "image_url",
+                 "image_url": {"url": f"data:image/png;base64,{b64}"}},
+            ]},
+        ],
+        "max_tokens": 200,
+        "temperature": 0.0,
+    }
+    async with httpx.AsyncClient(timeout=20.0) as c:
+        r = await c.post(f"{vision_url}/chat/completions", json=payload)
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip()

@@ -28,3 +28,25 @@ All env flags read by the retrieval pipeline. Filled in by each phase of Plan A/
 
 Flags remaining default-OFF globally at end of Plan A (subject to Plan B Phase 4 audit):
 - `RAG_SEMCACHE`, `RAG_HYDE`, `RAG_RAPTOR`, `RAG_INTENT_ROUTING`, `RAG_DISABLE_REWRITE` (→ replaced by Query Understanding LLM).
+
+---
+
+## Plan B Phase 4 additions
+
+See `docs/runbook/plan-b-flag-reference.md` and `docs/runbook/qu-llm-runbook.md` for the full per-flag guidance. Summary:
+
+| Flag | Default | Owner phase | Runtime-safe toggle? | What it does |
+|---|---|---|---|---|
+| `RAG_QU_ENABLED` | `0` → `1` after shadow gate | Plan B Phase 4.6 | Yes (restart open-webui) | Master switch for the hybrid regex+LLM intent router. |
+| `RAG_QU_URL` | `http://vllm-qu:8000/v1` | Plan B Phase 4.1 | Yes | vLLM base URL. |
+| `RAG_QU_MODEL` | `qwen3-4b-qu` | Plan B Phase 4.1 | Yes | served-model-name. |
+| `RAG_QU_LATENCY_BUDGET_MS` | `600` | Plan B Phase 4.3 | Yes | Soft deadline. On miss the bridge falls back to regex. |
+| `RAG_QU_CACHE_ENABLED` | `1` | Plan B Phase 4.5 | Yes | Redis DB 4 cache for QU results. |
+| `RAG_QU_CACHE_TTL_SECS` | `300` | Plan B Phase 4.5 | Yes | Cache TTL (s). |
+| `RAG_QU_REDIS_DB` | `4` | Plan B Phase 4.5 | **No** (set once) | Must be unique vs DB 3 (RBAC cache). |
+| `RAG_QU_SHADOW_MODE` | `0` | Plan B Phase 4.8 | Yes | Run LLM on every query and log both decisions; production routing stays regex. |
+
+### Retired in Plan B Phase 4
+
+- **`RAG_INTENT_LLM`** — replaced by `RAG_QU_ENABLED` (Phase 4.4 deletes the `_llm_classify` stub; Phase 4.10 deletes the `intent_llm` per-KB rag_config key).
+- **`RAG_INTENT_ROUTING`** — subsumed by the hybrid router. The regex Tier-2 conditional in `_run_pipeline` stays in place during the Phase 4 shadow window for parity-comparison purposes.
