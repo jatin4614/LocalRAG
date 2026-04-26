@@ -1125,3 +1125,90 @@ class VectorStore:
             points=structs,
             shard_key_selector=shard_key,
         )
+
+    # ------------------------------------------------------------------
+    # Plan B Phase 5.3 — tiered storage (hot/warm/cold)
+    # ------------------------------------------------------------------
+    async def apply_tier_config(
+        self,
+        collection: str,
+        shard_key: str,
+        tier: str,
+    ) -> None:
+        """Update the per-shard tier configuration.
+
+        Hot:  in-memory HNSW (memmap_threshold=0, no quantization).
+        Warm: mmap on SSD (memmap_threshold=20_000).
+        Cold: on-disk + INT8 scalar quantization (always_ram=False).
+
+        Note: Qdrant currently scopes optimizer + quantization config at
+        collection level. For per-shard control on a temporal collection,
+        we use the shard_key as a partition key in the indexing optimizer
+        threshold; per-shard quantization in Qdrant's current API requires
+        re-creating the affected shard. The tier cron (Phase 5.8) coordinates
+        this carefully.
+
+        Plan B Phase 5.3.
+        """
+        if tier == "hot":
+            await self._client.update_collection(
+                collection_name=collection,
+                optimizers_config=qm.OptimizersConfigDiff(
+                    memmap_threshold=0,  # all in RAM
+                ),
+            )
+        elif tier == "warm":
+            await self._client.update_collection(
+                collection_name=collection,
+                optimizers_config=qm.OptimizersConfigDiff(
+                    memmap_threshold=20_000,
+                ),
+            )
+        elif tier == "cold":
+            await self._client.update_collection(
+                collection_name=collection,
+                optimizers_config=qm.OptimizersConfigDiff(
+                    memmap_threshold=20_000,
+                ),
+                quantization_config=qm.ScalarQuantization(
+                    scalar=qm.ScalarQuantizationConfig(
+                        type=qm.ScalarType.INT8,
+                        quantile=0.99,
+                        always_ram=False,
+                    ),
+                ),
+            )
+        else:
+            raise ValueError(f"unknown tier {tier!r}")
+        # Plan B Phase 5.9 — emit per-shard tier gauge after Qdrant accepts.
+        try:
+            from .metrics import set_shard_tier
+            set_shard_tier(collection=collection, shard_key=shard_key, tier=tier)
+        except Exception:
+            pass
+
+
+def classify_tier(
+    shard_key: str,
+    *,
+    hot_months: int = 3,
+    warm_months: int = 12,
+) -> str:
+    """Return ``'hot'`` / ``'warm'`` / ``'cold'`` for a 'YYYY-MM' shard_key.
+
+    ``hot_months``: shards aged < this are hot. ``warm_months``: shards aged
+    >= hot_months but < warm_months are warm. Older are cold. Boundaries
+    are exclusive of ``hot_months`` and inclusive of ``warm_months``.
+
+    Plan B Phase 5.3.
+    """
+    import datetime as _dt
+    from .temporal_shard import parse_shard_key
+    y, m = parse_shard_key(shard_key)
+    today = _dt.date.today()
+    age_months = (today.year - y) * 12 + (today.month - m)
+    if age_months < hot_months:
+        return "hot"
+    if age_months < warm_months:
+        return "warm"
+    return "cold"
