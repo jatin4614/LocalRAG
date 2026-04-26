@@ -9,14 +9,20 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 # System deps needed by the ingest pipeline's extractors (pandoc / docx libs
-# transitively), kept tight.
+# transitively + tesseract for the Plan B Phase 6.3 OCR fallback), kept tight.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       curl \
       pandoc \
+      tesseract-ocr \
+      tesseract-ocr-eng \
     && rm -rf /var/lib/apt/lists/*
 
 # Runtime deps. Mirror the subset of project requirements the ingest worker
 # actually imports — no upstream Open WebUI stack, no frontend build.
+# Heavy ML deps (torch / transformers / sentence-transformers) are
+# deliberately NOT installed: rerank + dense embedding live in the
+# main open-webui process; the worker only handles extract + chunk + TEI
+# (HTTP) + sparse fastembed + Qdrant upsert.
 RUN pip install \
       "celery[redis]>=5.3" \
       "redis>=5.0" \
@@ -27,8 +33,18 @@ RUN pip install \
       "openpyxl>=3.1" \
       "tiktoken>=0.7" \
       "pydantic>=2.8" \
+      "pydantic-settings>=2.0" \
       "sqlalchemy[asyncio]>=2.0.30" \
-      "asyncpg>=0.29"
+      "asyncpg>=0.29" \
+      "tenacity>=8.2" \
+      "prometheus-client>=0.19" \
+      "python-json-logger>=2.0" \
+      "pdfplumber>=0.11" \
+      "pymupdf>=1.24" \
+      "pytesseract>=0.3.10" \
+      "pillow>=10.0" \
+      "fastembed>=0.3" \
+      "numpy>=1.26"
 
 # Project source. Only ext/ is needed for the worker.
 COPY ext/ /app/ext/
