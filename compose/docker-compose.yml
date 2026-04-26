@@ -205,12 +205,13 @@ services:
     ports:
       - "8101:8000"
     command:
+      # Quantization is auto-detected from the model's config.json
+      # (compressed-tensors AWQ-4bit). Passing --quantization explicitly
+      # makes vLLM error out on a mismatch with the cpatonn build.
       - "--model"
       - "cpatonn/Qwen3-4B-Instruct-2507-AWQ-4bit"
       - "--served-model-name"
       - "qwen3-4b-qu"
-      - "--quantization"
-      - "awq"
       - "--dtype"
       - "auto"
       - "--max-model-len"

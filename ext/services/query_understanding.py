@@ -272,8 +272,18 @@ async def analyze_query(
         ],
         "temperature": 0.0,
         "max_tokens": 256,
-        # vLLM V1 + xgrammar guided_json. The schema is enforced server-side.
-        "extra_body": {"guided_json": QU_OUTPUT_SCHEMA},
+        # vLLM V1 supports the OpenAI-spec response_format with json_schema —
+        # this is what xgrammar guided_json hooks into in practice. The
+        # legacy ``extra_body.guided_json`` is silently dropped by vllm-
+        # openai >= 0.6.4 (the model just emits arbitrary JSON instead).
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "query_understanding",
+                "schema": QU_OUTPUT_SCHEMA,
+                "strict": True,
+            },
+        },
     }
 
     _t0 = _time.monotonic()
