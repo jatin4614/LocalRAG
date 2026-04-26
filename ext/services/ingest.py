@@ -17,7 +17,18 @@ from .chunker import chunk_text
 from .embedder import Embedder
 from .extractor import extract
 from .pipeline_version import current_version
+from .temporal_shard import ShardKeyOrigin, extract_shard_key
 from .vector_store import VectorStore
+
+
+def _sharding_enabled() -> bool:
+    """Read RAG_SHARDING_ENABLED at call time so tests / operators can toggle.
+
+    Default OFF — when off, the ingest path is byte-identical to pre-Phase-5.2:
+    no shard_key payload, normal ``upsert`` (not ``upsert_temporal``).
+    Plan B Phase 5.2.
+    """
+    return os.environ.get("RAG_SHARDING_ENABLED", "0") == "1"
 
 
 def _hybrid_enabled() -> bool:
@@ -261,6 +272,28 @@ async def ingest_bytes(
     if not blocks:
         return 0
 
+    # Plan B Phase 5.2 — derive a per-document shard_key once when temporal
+    # sharding is enabled. The same key is stamped on every chunk's payload
+    # and used as the ``shard_key_selector`` on the upsert. Default OFF —
+    # legacy ingest path is byte-identical.
+    sharding_on = _sharding_enabled()
+    doc_shard_key: str | None = None
+    doc_shard_origin: ShardKeyOrigin | None = None
+    if sharding_on:
+        # Use the first block's text as the body sample for date extraction.
+        # Most ingest pipelines emit blocks in source order so block[0] is
+        # the document head — the same place YAML frontmatter and the
+        # opening date typically live.
+        body_sample = blocks[0].text if blocks else ""
+        doc_shard_key, doc_shard_origin = extract_shard_key(
+            filename=filename, body=body_sample,
+        )
+        import logging as _log
+        _log.getLogger("orgchat.ingest").info(
+            "ingest doc=%s shard_key=%s origin=%s",
+            filename, doc_shard_key, doc_shard_origin.value,
+        )
+
     # Chunk per block; carry the source block forward so we can stamp its
     # structural metadata onto each resulting chunk.
     paired: list[tuple[object, object]] = []  # (Chunk, ExtractedBlock)
@@ -466,6 +499,11 @@ async def ingest_bytes(
             payload.update(extra_payload_fields)
             for k in _absent_identity_keys:
                 payload.pop(k, None)
+            # Plan B Phase 5.2: temporal shard_key stamp (default-off).
+            if sharding_on and doc_shard_key is not None:
+                payload["shard_key"] = doc_shard_key
+                if doc_shard_origin is not None:
+                    payload["shard_key_origin"] = doc_shard_origin.value
 
             if doc_id is not None:
                 id_seed = f"doc:{doc_id}:chunk:{nidx}"
@@ -512,6 +550,11 @@ async def ingest_bytes(
             payload.update(extra_payload_fields)
             for k in _absent_identity_keys:
                 payload.pop(k, None)
+            # Plan B Phase 5.2: temporal shard_key stamp (default-off).
+            if sharding_on and doc_shard_key is not None:
+                payload["shard_key"] = doc_shard_key
+                if doc_shard_origin is not None:
+                    payload["shard_key_origin"] = doc_shard_origin.value
 
             # Deterministic point ID: same doc + global chunk index always maps
             # to the same Qdrant point. This lets delete_by_doc reconstruct point
@@ -541,7 +584,20 @@ async def ingest_bytes(
             if cv is not None:
                 point["colbert_vector"] = cv
             points.append(point)
-    await vector_store.upsert(collection, points)
+    # Plan B Phase 5.2: route to per-shard upsert when temporal sharding is on.
+    # The named shard receives the entire batch (one-doc-per-shard invariant
+    # — ``doc_shard_key`` is derived per-document, not per-chunk).
+    if sharding_on and doc_shard_key is not None:
+        upsert_temporal = getattr(vector_store, "upsert_temporal", None)
+        if upsert_temporal is not None:
+            await upsert_temporal(
+                collection, points, shard_key=doc_shard_key,
+            )
+        else:
+            # Test double / minimal substitute: fall back to plain upsert.
+            await vector_store.upsert(collection, points)
+    else:
+        await vector_store.upsert(collection, points)
 
     # Tier 1: per-document summary point.
     # Gated by RAG_DOC_SUMMARIES (default OFF). When ON and we have a
