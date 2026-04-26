@@ -315,6 +315,25 @@ def with_overrides(overrides: Mapping[str, str]):
     return _with_overrides(overrides)
 
 
+_VALID_CHUNKING_STRATEGIES = ("window", "structured")
+
+
+def get_chunking_strategy(rag_config: dict | None) -> str:
+    """Return 'window' (default) or 'structured'.
+
+    Plan B Phase 6.6. Reads ``chunking_strategy`` from a KB's
+    ``rag_config`` JSONB blob (migration 010). Unknown values fall back
+    to ``"window"`` so a hand-edited row never silently switches the
+    chunker on an admin who didn't expect it.
+    """
+    if not rag_config:
+        return "window"
+    raw = (rag_config.get("chunking_strategy") or "window").lower().strip()
+    if raw not in _VALID_CHUNKING_STRATEGIES:
+        return "window"
+    return raw
+
+
 def get_ocr_policy(kb_id: int, db_session) -> dict | None:
     """Return the per-KB OCR policy or None if disabled.
 
@@ -342,4 +361,5 @@ __all__ = [
     "resolve_chunk_params",
     "with_overrides",
     "get_ocr_policy",
+    "get_chunking_strategy",
 ]

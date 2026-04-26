@@ -18,6 +18,7 @@ from . import flags
 from .chunker import chunk_text
 from .embedder import Embedder
 from .extractor import extract
+from .kb_config import get_chunking_strategy
 from .ocr import OCRBackend, ocr_pdf, select_ocr_backend
 from .pipeline_version import current_version
 from .temporal_shard import ShardKeyOrigin, extract_shard_key
@@ -836,3 +837,69 @@ def _extract_pdf_text_per_page(pdf_bytes: bytes) -> list[str]:
         for page in pdf.pages:
             pages.append(page.extract_text() or "")
     return pages
+
+
+# ---------------------------------------------------------------------------
+# Plan B Phase 6.6 — per-KB chunking strategy dispatch.
+#
+# ``chunk_text_for_kb`` is the new dispatch point: it reads
+# ``rag_config.chunking_strategy`` (window or structured) and routes the
+# extracted text to the right chunker. The window chunker keeps the
+# pre-Plan-B byte-identical behavior; the structured chunker preserves
+# tables + code blocks as atomic units (Plan B Phase 6.5).
+#
+# The structured path is double-gated by the env flag
+# ``RAG_STRUCTURED_CHUNKER`` so an operator can globally roll it back
+# without touching every KB row.
+# ---------------------------------------------------------------------------
+
+def chunk_text_for_kb(
+    *,
+    text: str,
+    rag_config: dict | None,
+    chunk_size_tokens: int = 800,
+    overlap_tokens: int = 100,
+) -> list[dict]:
+    """Dispatch to the right chunker per KB strategy.
+
+    Plan B Phase 6.6. Always returns a list of chunk dicts with at
+    least ``text`` and ``chunk_type`` keys. The window chunker emits
+    every chunk with ``chunk_type="prose"``; the structured chunker
+    distinguishes prose / table / code (and stamps ``language`` for
+    code chunks).
+    """
+    strategy = get_chunking_strategy(rag_config)
+    if strategy == "structured" and \
+            os.environ.get("RAG_STRUCTURED_CHUNKER", "0") == "1":
+        from .chunker_structured import chunk_structured
+        return chunk_structured(
+            text,
+            chunk_size_tokens=chunk_size_tokens,
+            overlap_tokens=overlap_tokens,
+        )
+    # Window default — wrap each Chunk's text into the dict shape.
+    return [
+        {"text": w, "chunk_type": "prose"}
+        for w in _chunk_window(
+            text,
+            chunk_size_tokens=chunk_size_tokens,
+            overlap_tokens=overlap_tokens,
+        )
+    ]
+
+
+def _chunk_window(text, *, chunk_size_tokens=800, overlap_tokens=100):
+    """Existing window-chunker entry point.
+
+    Wraps ``ext.services.chunker.chunk_text`` so callers downstream of
+    ``chunk_text_for_kb`` get a list of plain text strings (matching the
+    legacy contract). ``chunk_text`` returns ``Chunk`` dataclasses; we
+    flatten to ``.text`` strings here.
+    """
+    return [
+        c.text for c in chunk_text(
+            text,
+            chunk_tokens=chunk_size_tokens,
+            overlap_tokens=overlap_tokens,
+        )
+    ]
