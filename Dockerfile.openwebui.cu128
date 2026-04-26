@@ -29,9 +29,10 @@ ENV ENV=prod \
 
 WORKDIR /app/backend
 
-# System deps (matching upstream)
+# System deps (matching upstream + Plan B Phase 6.3 OCR baseline)
 RUN apt-get update && apt-get install -y --no-install-recommends \
       curl gcc g++ ffmpeg pandoc netcat-openbsd \
+      tesseract-ocr tesseract-ocr-eng \
     && rm -rf /var/lib/apt/lists/*
 
 # Upstream Python deps
@@ -57,6 +58,16 @@ RUN uv pip install --system --no-cache-dir \
     'sqlalchemy[asyncio]' argon2-cffi python-docx openpyxl \
     fastembed prometheus-client scikit-learn \
     'sentence-transformers>=3.3' 'transformers>=4.49'
+
+# Plan B Phase 6.3 — OCR fallback for scanned PDFs.
+# Tesseract apt package is installed above; pytesseract is the Python binding,
+# pymupdf rasterizes pages, pillow handles the in-memory image. Cloud backends
+# (boto3, google-cloud-documentai) are NOT installed by default — operators
+# must opt in per ext/services/ocr.py + docs/runbook/ocr-runbook.md.
+RUN uv pip install --system --no-cache-dir \
+    pytesseract==0.3.13 \
+    pymupdf==1.24.10 \
+    pillow==10.4.0
 
 # Observability — OTel SDK + auto-instrumentors. All imports are lazy in
 # ext/services/obs.py so unsetting OBS_ENABLED makes the whole stack dormant.

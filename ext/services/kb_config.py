@@ -315,6 +315,25 @@ def with_overrides(overrides: Mapping[str, str]):
     return _with_overrides(overrides)
 
 
+def get_ocr_policy(kb_id: int, db_session) -> dict | None:
+    """Return the per-KB OCR policy or None if disabled.
+
+    Plan B Phase 6.3. Reads from the ``ocr_policy`` column added in
+    migration 011. Returns None when the KB doesn't exist OR when the
+    policy explicitly disables OCR (``enabled=False``). Otherwise
+    returns the policy dict so the ingest path can pick a backend +
+    language.
+    """
+    from ..db.models import KnowledgeBase
+    kb = db_session.query(KnowledgeBase).filter_by(id=kb_id).first()
+    if not kb:
+        return None
+    policy = kb.ocr_policy or {}
+    if not policy.get("enabled", True):
+        return None
+    return policy
+
+
 __all__ = [
     "VALID_KEYS",
     "merge_configs",
@@ -322,4 +341,5 @@ __all__ = [
     "validate_config",
     "resolve_chunk_params",
     "with_overrides",
+    "get_ocr_policy",
 ]
