@@ -245,8 +245,11 @@ def build_point_payload(
     # Optional canonical fields — only stamp when the caller provided them
     # so callers that don't compute these (tests, simple repair scripts)
     # produce minimal but still-valid payloads.
+    # Plan B Phase 6.6 / 6.7: structural fields stamped by chunker dispatch
+    # (``chunk_text_for_kb`` / ``extract_images_as_chunks``).
     for k in ("uploaded_at", "deleted", "model_version", "chunk_level",
-              "source_chunk_ids", "kind"):
+              "source_chunk_ids", "kind",
+              "chunk_type", "language", "continuation"):
         if k in chunk_meta:
             payload[k] = chunk_meta[k]
     return payload
@@ -301,14 +304,63 @@ async def ingest_bytes(
             filename, doc_shard_key, doc_shard_origin.value,
         )
 
-    # Chunk per block; carry the source block forward so we can stamp its
-    # structural metadata onto each resulting chunk.
+    # Chunk per block via the per-KB dispatcher (Plan B Phase 6.6).
+    # ``chunk_text_for_kb`` reads ``rag_config.chunking_strategy`` and
+    # double-gates on ``RAG_STRUCTURED_CHUNKER`` env. Default 'window'
+    # behaves byte-identically to the legacy chunk_text path.
+    # We carry per-chunk extras (chunk_type / language / continuation)
+    # in a parallel list keyed by global chunk index.
+    from .chunker import Chunk as _Chunk
     paired: list[tuple[object, object]] = []  # (Chunk, ExtractedBlock)
+    chunk_extras: list[dict] = []  # parallel to ``paired``
     for b in blocks:
-        for c in chunk_text(
-            b.text, chunk_tokens=chunk_tokens, overlap_tokens=overlap_tokens
-        ):
-            paired.append((c, b))
+        chunk_dicts = chunk_text_for_kb(
+            text=b.text,
+            rag_config=kb_rag_config,
+            chunk_size_tokens=chunk_tokens,
+            overlap_tokens=overlap_tokens,
+        )
+        for cd in chunk_dicts:
+            paired.append((
+                _Chunk(index=len(paired), text=cd["text"]), b,
+            ))
+            extras: dict = {}
+            ct = cd.get("chunk_type", "prose")
+            if ct != "prose":
+                extras["chunk_type"] = ct
+            if cd.get("language"):
+                extras["language"] = cd["language"]
+            if cd.get("continuation"):
+                extras["continuation"] = True
+            chunk_extras.append(extras)
+
+    # Plan B Phase 6.7 — image-caption chunks. Triple-gated by
+    # ``RAG_IMAGE_CAPTIONS=1`` (default off) inside the helper. PDF only;
+    # other mime types short-circuit because the helper expects PDF bytes.
+    if mime_type == "application/pdf":
+        try:
+            image_chunks = await extract_images_as_chunks(
+                pdf_bytes=data, filename=filename,
+            )
+        except Exception:  # noqa: BLE001 — fail-open
+            image_chunks = []
+        for ic in image_chunks:
+            # Synthesize a minimal block — image lives at its own page,
+            # outside any structural heading. Use the first block as the
+            # fallback "host" for sheet/heading_path so downstream
+            # build_point_payload still gets non-None values where the
+            # block-level structure made sense.
+            fake_block = blocks[0] if blocks else None
+            paired.append((
+                _Chunk(index=len(paired), text=ic["text"]), fake_block,
+            ))
+            extras: dict = {"chunk_type": "image_caption"}
+            if ic.get("page") is not None:
+                extras["page"] = ic["page"]
+            if ic.get("language"):
+                extras["language"] = ic["language"]
+            chunk_extras.append(extras)
+
     if not paired:
         return 0
 
@@ -538,17 +590,28 @@ async def ingest_bytes(
             points.append(point)
     else:
         for gidx, ((chunk, block), vec) in enumerate(zip(paired, vectors)):
+            extras = chunk_extras[gidx] if gidx < len(chunk_extras) else {}
             chunk_meta = {
                 "chunk_index": gidx,
                 "text": chunk.text,
                 "context_prefix": getattr(chunk, "context_prefix", None),
-                "page": block.page,
-                "heading_path": list(block.heading_path),
-                "sheet": block.sheet,
+                # block may be None for image_caption chunks (no host block).
+                "page": extras.get("page", block.page if block is not None else None),
+                "heading_path": (
+                    list(block.heading_path) if block is not None else []
+                ),
+                "sheet": block.sheet if block is not None else None,
                 "uploaded_at": now,
                 "deleted": False,
                 "model_version": pv,
             }
+            # Plan B Phase 6.6 / 6.7 — structural / kind metadata from the
+            # chunker dispatcher. ``chunk_type``, ``language``, ``continuation``
+            # are surfaced verbatim so downstream retrieval / re-embedding
+            # tooling can distinguish prose / table / code / image_caption.
+            for k in ("chunk_type", "language", "continuation"):
+                if k in extras:
+                    chunk_meta[k] = extras[k]
             payload = build_point_payload(
                 kb_id=pb_kb_id, doc_id=doc_id, subtag_id=pb_subtag_id,
                 filename=pb_filename, owner_user_id=pb_owner,
