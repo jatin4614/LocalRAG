@@ -27,11 +27,10 @@ router = APIRouter(tags=["upload"])
 
 MAX_UPLOAD_BYTES = int(os.environ.get("RAG_MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
 
-# Feature flag — default ("1") = legacy synchronous ingest in the request thread.
-# Set RAG_SYNC_INGEST=0 to route uploads through the Celery-backed queue
-# (blob store + ingest_worker). Flipped at module import; change env + restart
-# the FastAPI process to toggle.
-RAG_SYNC_INGEST = os.environ.get("RAG_SYNC_INGEST", "1") == "1"
+# Plan B Phase 6.2 — default flipped to async after Phase 6.1 soak validation.
+# Set RAG_SYNC_INGEST=1 to revert to the in-process synchronous ingest path.
+# Flipped at module import; change env + restart the FastAPI process to toggle.
+RAG_SYNC_INGEST = os.environ.get("RAG_SYNC_INGEST", "0") == "1"
 
 
 def _safe_truncate(msg: str, max_len: int = 1000) -> str:
