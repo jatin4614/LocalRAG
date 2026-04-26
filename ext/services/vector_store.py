@@ -1110,7 +1110,7 @@ class VectorStore:
         Caller must ensure all points belong to the named shard. Mixing
         shards in one call is a Qdrant constraint violation.
 
-        Plan B Phase 5.1.
+        Plan B Phase 5.1; Phase 5.9 added per-shard latency observation.
         """
         structs = [
             qm.PointStruct(
@@ -1120,11 +1120,24 @@ class VectorStore:
             )
             for p in points
         ]
-        await self._client.upsert(
-            collection_name=collection,
-            points=structs,
-            shard_key_selector=shard_key,
-        )
+        # Plan B Phase 5.9 — observe per-shard upsert latency. Wrap in
+        # try/finally so the histogram still records on exception.
+        import time as _t
+        from .metrics import RAG_SHARD_UPSERT_LATENCY
+        _start = _t.monotonic()
+        try:
+            await self._client.upsert(
+                collection_name=collection,
+                points=structs,
+                shard_key_selector=shard_key,
+            )
+        finally:
+            try:
+                RAG_SHARD_UPSERT_LATENCY.labels(
+                    collection=collection, shard_key=shard_key,
+                ).observe(_t.monotonic() - _start)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Plan B Phase 5.3 — tiered storage (hot/warm/cold)
