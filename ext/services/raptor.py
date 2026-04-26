@@ -403,8 +403,43 @@ def is_enabled() -> bool:
     return flags.get("RAG_RAPTOR", "0") == "1"
 
 
+# Plan B Phase 5.5 — temporal RAPTOR dispatcher.
+async def build_tree_for_collection(
+    *,
+    chunks: list[dict],
+    summarize,
+    embed,
+    chat_model: str,
+) -> list[dict]:
+    """Choose temporal vs flat tree based on whether chunks have ``shard_key``.
+
+    If any chunk has a ``shard_key`` payload key, route to
+    :func:`ext.services.temporal_raptor.build_temporal_tree` (callback-style
+    summarize/embed, suited to multi-year corpora).
+
+    Otherwise build the flat tree as before via :func:`build_tree`. The flat
+    builder's API is different (it takes ``leaves`` as ``[{text, index,
+    embedding}]`` and ``embedder`` as an instance with ``.embed()``), so this
+    branch returns an empty list when ``embed`` is callback-only — callers
+    must invoke flat ``build_tree`` directly via the existing ingest path
+    when no shard_key is present.
+
+    Plan B Phase 5.5.
+    """
+    has_shard_key = any(c.get("shard_key") for c in chunks)
+    if has_shard_key:
+        from .temporal_raptor import build_temporal_tree
+        return await build_temporal_tree(
+            chunks=chunks, summarize=summarize, embed=embed,
+            chat_model=chat_model,
+        )
+    # Flat path: callers should invoke build_tree() directly.
+    return []
+
+
 __all__ = [
     "RaptorNode",
     "build_tree",
+    "build_tree_for_collection",
     "is_enabled",
 ]
