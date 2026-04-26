@@ -1006,3 +1006,122 @@ class VectorStore:
             )
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # Plan B Phase 5.1 — temporal custom sharding
+    # ------------------------------------------------------------------
+    async def ensure_collection_temporal(
+        self,
+        name: str,
+        shard_keys: list[str],
+        *,
+        with_sparse: bool = True,
+        with_colbert: bool = False,
+        on_disk_payload: Optional[bool] = None,
+        replication_factor: int = 1,
+    ) -> None:
+        """Create a Qdrant collection with custom temporal sharding.
+
+        One shard per ``shard_key`` (typically "YYYY-MM" for monthly buckets).
+        Shard creation is idempotent; existing keys are not re-created. The
+        collection itself is also idempotent — if it exists with a different
+        sharding strategy, this method will NOT migrate it (operator must
+        drop + recreate to change sharding).
+
+        Plan B Phase 5.1.
+        """
+        on_disk_payload = (
+            on_disk_payload
+            if on_disk_payload is not None
+            else _env_bool("RAG_QDRANT_ON_DISK_PAYLOAD", True)
+        )
+
+        if await self._client.collection_exists(collection_name=name):
+            import logging as _logging
+            _logging.getLogger(__name__).info(
+                "collection %s exists; ensuring shard keys", name
+            )
+        else:
+            vectors_config: dict = {
+                _DENSE_NAME: qm.VectorParams(
+                    size=self._vector_size,
+                    distance=qm.Distance[self._distance.upper()],
+                )
+            }
+            if with_colbert:
+                vectors_config[_COLBERT_NAME] = qm.VectorParams(
+                    size=_COLBERT_DIM,
+                    distance=qm.Distance.COSINE,
+                    multivector_config=qm.MultiVectorConfig(
+                        comparator=qm.MultiVectorComparator.MAX_SIM,
+                    ),
+                )
+            sparse_vectors = None
+            if with_sparse:
+                sparse_vectors = {
+                    _SPARSE_NAME: qm.SparseVectorParams(modifier=qm.Modifier.IDF)
+                }
+
+            await self._client.create_collection(
+                collection_name=name,
+                vectors_config=vectors_config,
+                sparse_vectors_config=sparse_vectors,
+                on_disk_payload=on_disk_payload,
+                sharding_method=qm.ShardingMethod.CUSTOM,
+                shard_number=len(shard_keys),
+                replication_factor=replication_factor,
+            )
+            import logging as _logging
+            _logging.getLogger(__name__).info(
+                "created temporal collection %s with %d shards",
+                name, len(shard_keys),
+            )
+
+        # Ensure shard keys (idempotent — Qdrant returns 200 even if exists)
+        for sk in shard_keys:
+            try:
+                await self._client.create_shard_key(
+                    collection_name=name, shard_key=sk,
+                )
+            except Exception as e:
+                # 409 / "already exists" is fine
+                if "exists" not in str(e).lower():
+                    raise
+
+        # Add per-payload index on shard_key for filterable date-bounded queries
+        try:
+            await self._client.create_payload_index(
+                collection_name=name,
+                field_name="shard_key",
+                field_schema=qm.PayloadSchemaType.KEYWORD,
+            )
+        except Exception:
+            pass  # idempotent
+
+    async def upsert_temporal(
+        self,
+        collection: str,
+        points: list[dict],
+        *,
+        shard_key: str,
+    ) -> None:
+        """Upsert points into a specific shard_key.
+
+        Caller must ensure all points belong to the named shard. Mixing
+        shards in one call is a Qdrant constraint violation.
+
+        Plan B Phase 5.1.
+        """
+        structs = [
+            qm.PointStruct(
+                id=p["id"],
+                vector=p["vector"],
+                payload=p.get("payload", {}),
+            )
+            for p in points
+        ]
+        await self._client.upsert(
+            collection_name=collection,
+            points=structs,
+            shard_key_selector=shard_key,
+        )
