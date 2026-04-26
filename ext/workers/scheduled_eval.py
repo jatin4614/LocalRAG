@@ -257,6 +257,88 @@ else:
     _CRON = _DEFAULT_CRON
 
 
+# -----------------------------------------------------------------------
+# Plan B Phase 5.8 — daily tier movement cron.
+#
+# The wrapper task shells out to ``scripts/tier_storage_cron.py`` so the
+# tier reclassification logic stays in one importable module (and the
+# Celery worker doesn't need redis.asyncio + qdrant clients loaded into
+# its long-lived process). Subprocess gives a clean exit code + stderr
+# capture, mirroring the pattern used by ``run_weekly_eval``.
+#
+# Operator activation: install Celery Beat (compose service ``celery-beat``)
+# OR run the script manually. Shipping the beat entry here is inert until
+# beat is started — see ``docs/runbook/tiered-storage-runbook.md``.
+# -----------------------------------------------------------------------
+
+_TIER_CRON_DAILY = crontab(minute="0", hour="3")
+
+
+def _tier_collections() -> list[str]:
+    """Collections to manage. Comma-separated env override.
+
+    Default: ``kb_1_v4`` (the Plan B 5.4 sharded collection). Operators
+    add more via ``RAG_TIER_COLLECTIONS=kb_1_v4,kb_2_v4`` once those
+    collections come online.
+    """
+    raw = os.environ.get("RAG_TIER_COLLECTIONS", "kb_1_v4")
+    return [c.strip() for c in raw.split(",") if c.strip()]
+
+
+@app.task(
+    name="ext.workers.scheduled_eval.tier_storage_cron",
+    queue="ingest",
+)
+def tier_storage_cron(collection: str = "kb_1_v4") -> dict[str, Any]:
+    """Celery wrapper around ``scripts/tier_storage_cron.py``.
+
+    Returns ``{"returncode": int, "stdout": tail, "stderr": tail}``.
+    Idempotent — Redis DB 5 cache makes repeated runs no-ops when no
+    boundary has crossed.
+    """
+    cmd = [
+        "python",
+        str(_REPO_ROOT / "scripts" / "tier_storage_cron.py"),
+        "--collection", collection,
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(_REPO_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=int(os.environ.get("RAG_TIER_CRON_TIMEOUT", "1800")),
+            check=False,
+        )
+        return {
+            "returncode": proc.returncode,
+            "stdout": (proc.stdout or "")[-2000:],
+            "stderr": (proc.stderr or "")[-2000:],
+        }
+    except subprocess.TimeoutExpired as e:
+        return {
+            "returncode": 124,
+            "stdout": "",
+            "stderr": f"tier cron timeout after {e.timeout}s",
+        }
+    except Exception as e:  # noqa: BLE001
+        return {
+            "returncode": 1,
+            "stdout": "",
+            "stderr": f"tier cron subprocess error: {e}",
+        }
+
+
+_tier_beat_entries: dict[str, Any] = {}
+for _coll in _tier_collections():
+    _tier_beat_entries[f"tier-storage-cron-daily-{_coll}"] = {
+        "task": "ext.workers.scheduled_eval.tier_storage_cron",
+        "schedule": _TIER_CRON_DAILY,
+        "kwargs": {"collection": _coll},
+        "options": {"queue": "ingest"},
+    }
+
+
 app.conf.beat_schedule = {
     **getattr(app.conf, "beat_schedule", {}),
     "weekly-eval": {
@@ -264,4 +346,5 @@ app.conf.beat_schedule = {
         "schedule": _CRON,
         "options": {"queue": "ingest"},
     },
+    **_tier_beat_entries,
 }
