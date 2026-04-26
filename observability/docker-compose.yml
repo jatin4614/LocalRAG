@@ -24,6 +24,10 @@ services:
       - --web.enable-lifecycle
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts-retrieval.yml:/etc/prometheus/alerts-retrieval.yml:ro
+      - ./prometheus/alerts-gpu.yml:/etc/prometheus/alerts-gpu.yml:ro
+      - ./prometheus/alerts-qu.yml:/etc/prometheus/alerts-qu.yml:ro
+      - ./prometheus/alerts-tiered-shards.yml:/etc/prometheus/alerts-tiered-shards.yml:ro
       - ../volumes/observability/prometheus:/prometheus
     ports:
       - "127.0.0.1:9091:9090"
