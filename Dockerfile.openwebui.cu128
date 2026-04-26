@@ -57,7 +57,8 @@ RUN uv pip install --system --no-cache-dir \
     pyjwt pypdf tiktoken qdrant-client httpx pydantic-settings asyncpg \
     'sqlalchemy[asyncio]' argon2-cffi python-docx openpyxl \
     fastembed prometheus-client scikit-learn \
-    'sentence-transformers>=3.3' 'transformers>=4.49'
+    'sentence-transformers>=3.3' 'transformers>=4.49' \
+    'celery[redis]>=5.3' 'redis>=5.0'
 
 # Plan B Phase 6.3 — OCR fallback for scanned PDFs.
 # Tesseract apt package is installed above; pytesseract is the Python binding,
