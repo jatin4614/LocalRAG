@@ -7,6 +7,8 @@ metadata onto every resulting chunk so Qdrant payloads can surface hints like
 """
 from __future__ import annotations
 
+import io
+import logging
 import os
 import time
 import uuid
@@ -16,9 +18,13 @@ from . import flags
 from .chunker import chunk_text
 from .embedder import Embedder
 from .extractor import extract
+from .ocr import OCRBackend, ocr_pdf, select_ocr_backend
 from .pipeline_version import current_version
 from .temporal_shard import ShardKeyOrigin, extract_shard_key
 from .vector_store import VectorStore
+
+
+log = logging.getLogger("orgchat.ingest")
 
 
 def _sharding_enabled() -> bool:
@@ -723,3 +729,110 @@ async def _emit_doc_summary_point(
                 await s.commit()
     except Exception as e:  # noqa: BLE001 — best-effort mirror
         log.warning("kb_documents.doc_summary mirror failed doc_id=%s: %s", doc_id, e)
+
+
+# ---------------------------------------------------------------------------
+# Plan B Phase 6.4 — OCR fallback for PDFs with low extracted text.
+#
+# The wrapper detects pages where pdfplumber recovered fewer than the
+# configured threshold of characters (default 50) and re-runs the page
+# through the OCR pipeline (Tesseract by default — see ext/services/ocr.py).
+# Per-KB ``ocr_policy`` overrides the global ``RAG_OCR_ENABLED`` flag so
+# operators can disable OCR for KBs known to be all-text (faster ingest)
+# or switch a specific KB to a cloud backend (operator opt-in only).
+# ---------------------------------------------------------------------------
+
+async def extract_pdf_with_ocr_fallback(
+    *,
+    pdf_bytes: bytes,
+    filename: str,
+    ocr_policy: dict | None,
+) -> str:
+    """Extract text via pdfplumber; OCR pages where text < threshold.
+
+    Plan B Phase 6.4. Returns concatenated text. Per-page OCR is
+    triggered when ``len(page_text) < trigger_chars``. Falls open at
+    every layer:
+
+    * RAG_OCR_ENABLED=0 → return raw pdfplumber text (default-off path
+      stays byte-identical).
+    * Per-KB ocr_policy.enabled=False → skip OCR even if the global flag
+      is on.
+    * No low-text pages → no OCR call (cheap path stays cheap).
+
+    The OCR text replaces the pdfplumber text only for pages below the
+    threshold; pages with sufficient text are kept as-is.
+    """
+    pages = _extract_pdf_text_per_page(pdf_bytes)
+
+    if os.environ.get("RAG_OCR_ENABLED", "0") != "1":
+        return "\n\n".join(pages)
+
+    if ocr_policy and not ocr_policy.get("enabled", True):
+        return "\n\n".join(pages)
+
+    threshold = int(
+        (ocr_policy or {}).get(
+            "trigger_chars_per_page",
+            os.environ.get("RAG_OCR_TRIGGER_CHARS", "50"),
+        )
+    )
+
+    backend = select_ocr_backend(ocr_policy)
+    language = (ocr_policy or {}).get("language", "eng")
+
+    needs_ocr = any(len(p.strip()) < threshold for p in pages)
+    if not needs_ocr:
+        return "\n\n".join(pages)
+
+    log.info(
+        "ocr trigger: %s has %d/%d low-text pages",
+        filename,
+        sum(1 for p in pages if len(p.strip()) < threshold),
+        len(pages),
+    )
+    ocr_text = await _ocr_pdf_pages(
+        pdf_bytes, backend=backend, language=language,
+    )
+
+    # Splice OCR text in for low-text pages; keep pdfplumber text for
+    # the rest. ocr_text is a single concatenated string (one segment per
+    # page joined by "\n\n"); split + index by page so the output stays
+    # aligned 1:1 with the pdfplumber page list. If OCR returned fewer
+    # segments than pages (unlikely but possible — rasterize errors), the
+    # fallback is to keep the pdfplumber text for that page.
+    out_pages = []
+    ocr_segments = ocr_text.split("\n\n")
+    for i, p in enumerate(pages):
+        if len(p.strip()) < threshold and i < len(ocr_segments):
+            out_pages.append(ocr_segments[i])
+        else:
+            out_pages.append(p)
+    return "\n\n".join(out_pages)
+
+
+async def _ocr_pdf_pages(pdf_bytes, *, backend, language):
+    """Indirection for tests to patch.
+
+    Plan B Phase 6.4. Wraps ``ocr_pdf`` so the trigger threshold tests
+    can stub the call site without touching the underlying OCR module.
+    """
+    return await ocr_pdf(pdf_bytes, backend=backend, language=language)
+
+
+def _extract_pdf_text_per_page(pdf_bytes: bytes) -> list[str]:
+    """Extract per-page PDF text via pdfplumber.
+
+    Plan B Phase 6.4. Returns one string per page in source order so
+    callers (notably ``extract_pdf_with_ocr_fallback``) can spot
+    low-text pages and route them through OCR independently. Empty
+    pages return ``""`` rather than ``None`` so downstream length
+    checks are unambiguous.
+    """
+    import pdfplumber
+
+    pages = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            pages.append(page.extract_text() or "")
+    return pages
