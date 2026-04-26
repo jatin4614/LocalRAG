@@ -89,6 +89,34 @@ def classify_intent(query: str) -> str:
     return "specific"
 
 
+# Plan B Phase 5.6 — derive an "evolution" hint when the LLM-classified
+# intent is "global" AND the original query carries a comparison verb.
+# The 4-class hybrid classifier intentionally never emits "evolution"
+# (keeps the 4-class invariant for caches + metrics); instead the
+# retriever takes the derived hint and routes level injection (L2 + L3
+# instead of L3 + L4).
+_EVOLUTION_VERBS: tuple[str, ...] = (
+    "compare", "evolve", "evolution", "evolved", "change", "changed",
+    "trend", "trending", "differ", "different", "contrast", "shift",
+    "shifted", "trajectory", "growth", "vs", "versus",
+)
+
+
+def derive_temporal_intent_hint(*, intent: str, query: str) -> str:
+    """Map a 4-class intent to the temporal level-injection rules.
+
+    Returns one of: ``"global"`` | ``"evolution"`` | ``"specific_date"`` |
+    ``"specific"`` | ``"metadata"``.
+
+    Plan B Phase 5.6. Pure function — safe to call on the hot path.
+    """
+    if intent == "global" and query:
+        ql = query.lower()
+        if any(v in ql for v in _EVOLUTION_VERBS):
+            return "evolution"
+    return intent
+
+
 # -----------------------------------------------------------------------
 # Plan B Phase 4.6 — async hybrid classifier wrapper with Redis cache.
 # -----------------------------------------------------------------------
