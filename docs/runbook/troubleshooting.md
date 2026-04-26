@@ -267,3 +267,15 @@ Fix:
    `python -c "from ext.services.vector_store import classify_tier; print(classify_tier('<shard_key>'))"`.
 2. If pinning a shard, also write the override into Redis DB 5 (see `tiered-storage-runbook.md` "Pin a specific shard to hot").
 3. If the boundaries themselves are unstable, widen them (e.g. `RAG_TIER_HOT_MONTHS=4` with a 1-month buffer).
+
+## OCR / image-caption issues
+
+See `docs/runbook/ocr-runbook.md` for the full guide. Quick checks:
+
+- `docker exec orgchat-open-webui tesseract --version` — verify Tesseract installed
+- `docker exec orgchat-open-webui python -c "import pytesseract; print(pytesseract.get_languages())"` — verify language packs
+- `curl -s http://localhost:9090/api/v1/query?query=rag_image_skip_total` — non-zero means vision service unreachable
+- `kb_config.ocr_policy` for a specific KB:
+  ```sql
+  SELECT id, name, ocr_policy FROM knowledge_bases WHERE id = <kb_id>;
+  ```

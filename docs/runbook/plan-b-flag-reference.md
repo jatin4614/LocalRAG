@@ -38,16 +38,18 @@ the sharded code paths are inert (no shard_key, no temporal levels).
 | `RAG_RAPTOR` | Plan A | `0` | Legacy flat RAPTOR for non-sharded collections | Yes (restart). Plan B 5.10 audit decision: KEEP off; superseded by `RAG_RAPTOR_TEMPORAL` on sharded collections. Flat tree is retained as opt-in for any collection that did not undergo temporal resharding. |
 | `RAG_RAPTOR_TEMPORAL` | 5.5 | `1` (for sharded collections only) | Build temporal-then-semantic tree at ingest. Inert on non-sharded collections. Flag is documented here for forward compatibility — the actual gate is "collection has shard_key" (see `ext/services/temporal_raptor.py`). | Yes (restart) |
 
-## Phase 6 — Async ingest + OCR (NOT YET SHIPPED)
+## Phase 6 — Async ingest + OCR
 
-| Flag | Phase | Default | Description |
-|---|---|---|---|
-| `RAG_SYNC_INGEST` | 6.2 | `1` → `0` after soak | Sync ingest path; `0` = celery worker |
-| `RAG_OCR_ENABLED` | 6.3 | `0` → `1` after verification | OCR fallback for scanned PDFs |
-| `RAG_OCR_BACKEND` | 6.3 | `tesseract` | `tesseract` or `cloud:textract` or `cloud:document_ai` |
-| `RAG_OCR_TRIGGER_CHARS` | 6.4 | `50` | <N chars per page → rasterize+OCR |
-| `RAG_STRUCTURED_CHUNKER` | 6.5 | `0` → `1` after KB strategy | Tables/code as atomic units |
-| `RAG_IMAGE_CAPTIONS` | 6.7 | `0` | Emit chunks with `chunk_type="image_caption"` |
+| Flag | Phase | Default | Description | Safe to toggle at runtime? |
+|---|---|---|---|---|
+| `RAG_SYNC_INGEST` | 6.2 | `0` (flipped after soak) | `0` = Celery async path, `1` = legacy in-process sync ingest | Yes (restart open-webui) |
+| `RAG_OCR_ENABLED` | 6.3 | `0` → `1` after verification | OCR fallback for scanned PDFs | Yes (restart) |
+| `RAG_OCR_BACKEND` | 6.3 | `tesseract` | `tesseract` or `cloud:textract` or `cloud:document_ai` | Yes (restart) |
+| `RAG_OCR_TRIGGER_CHARS` | 6.4 | `50` | <N chars per page → rasterize+OCR | Yes (restart) |
+| `RAG_STRUCTURED_CHUNKER` | 6.5 | `0` → `1` after KB strategy | Tables/code as atomic units | Yes (restart) |
+| `RAG_IMAGE_CAPTIONS` | 6.7 | `0` | Emit chunks with `chunk_type="image_caption"` | Yes (restart) |
+| `RAG_VISION_URL` | 6.7 | `http://vllm-vision:8000/v1` | vllm-vision endpoint for image captions | Yes (restart) |
+| `RAG_VISION_MODEL` | 6.7 | `qwen2-vl-7b` | served model name | Yes (restart) |
 
 ## Plan B retires these Plan A flags
 
