@@ -168,25 +168,15 @@ async def test_mmr_off_explicit_zero_same_as_unset(configured_bridge, monkeypatc
     assert configured_bridge["rerank_top_k"] == [_FINAL_K]
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "Phase 2.2 intent overlay: classify_intent on the test query maps "
-        "to 'specific', and _INTENT_FLAG_POLICY['specific'] forces "
-        "RAG_MMR=0, overriding the test's RAG_MMR=1. The rerank widening "
-        "from _final_k to 2*_final_k is gated on _mmr_on, which is now "
-        "False — so rerank_top_k stays at _final_k. Design decision pending "
-        "— see triage report bucket F."
-    ),
-)
 @pytest.mark.asyncio
 async def test_mmr_on_widens_rerank_topk_to_20(configured_bridge, monkeypatch):
     """RAG_MMR=1 -> rerank called with 2*_final_k (=20) by default.
 
-    TODO(intent-overlay): re-enable once the env-flag vs intent-policy
-    interaction is decided. See docs/runbook/preexisting-test-triage.md
-    bucket F.
+    Uses RAG_INTENT_OVERLAY_MODE=env (B3 design call) so the operator's
+    explicit RAG_MMR=1 wins over the per-intent overlay's RAG_MMR=0 for
+    'specific' queries.
     """
+    monkeypatch.setenv("RAG_INTENT_OVERLAY_MODE", "env")
     monkeypatch.setenv("RAG_MMR", "1")
     monkeypatch.delenv("RAG_RERANK_TOP_K", raising=False)
 
@@ -202,24 +192,15 @@ async def test_mmr_on_widens_rerank_topk_to_20(configured_bridge, monkeypatch):
     assert len(out) == _FINAL_K
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "Phase 2.2 intent overlay: same root cause as "
-        "test_mmr_on_widens_rerank_topk_to_20 — _INTENT_FLAG_POLICY forces "
-        "RAG_MMR=0 for 'specific' queries, so the MMR stub is never invoked "
-        "and configured_bridge['mmr_top_k'] is never populated, raising "
-        "KeyError. Design decision pending — see triage report bucket F."
-    ),
-)
 @pytest.mark.asyncio
 async def test_rerank_top_k_override_with_mmr(configured_bridge, monkeypatch):
     """RAG_RERANK_TOP_K overrides the default widened value when MMR is on.
 
-    TODO(intent-overlay): re-enable once the env-flag vs intent-policy
-    interaction is decided. See docs/runbook/preexisting-test-triage.md
-    bucket F.
+    Uses RAG_INTENT_OVERLAY_MODE=env (B3 design call) so the operator's
+    explicit RAG_MMR=1 wins over the per-intent overlay's RAG_MMR=0 for
+    'specific' queries.
     """
+    monkeypatch.setenv("RAG_INTENT_OVERLAY_MODE", "env")
     monkeypatch.setenv("RAG_MMR", "1")
     monkeypatch.setenv("RAG_RERANK_TOP_K", "15")
 

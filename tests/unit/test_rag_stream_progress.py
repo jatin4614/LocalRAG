@@ -206,23 +206,16 @@ async def test_mmr_skipped_when_flag_off(configured_bridge, monkeypatch):
     assert any(e.get("status") == "skipped" for e in mmr_events)
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "Phase 2.2 intent overlay: classify_intent('hi') -> 'specific', and "
-        "_INTENT_FLAG_POLICY['specific'] forces RAG_CONTEXT_EXPAND=1, so the "
-        "expand block runs (emitting 'running' + 'done'/'error') instead of "
-        "the 'skipped' branch this test asserts. Design decision pending — "
-        "see triage report bucket F."
-    ),
-)
 @pytest.mark.asyncio
 async def test_expand_skipped_when_flag_off(configured_bridge, monkeypatch):
-    """TODO(intent-overlay): re-enable once we decide how the env flag and
-    intent-policy overlay interact. See docs/runbook/preexisting-test-triage.md
-    bucket F.
+    """With RAG_CONTEXT_EXPAND off, the expand stage emits a 'skipped' event.
+
+    Uses RAG_INTENT_OVERLAY_MODE=env (B3 design call) so the operator's
+    explicit RAG_CONTEXT_EXPAND=0 wins over the per-intent overlay's
+    RAG_CONTEXT_EXPAND=1 default for 'specific' queries.
     """
-    monkeypatch.delenv("RAG_CONTEXT_EXPAND", raising=False)
+    monkeypatch.setenv("RAG_INTENT_OVERLAY_MODE", "env")
+    monkeypatch.setenv("RAG_CONTEXT_EXPAND", "0")
 
     events: list[dict] = []
 
