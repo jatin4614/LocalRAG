@@ -903,3 +903,123 @@ def _chunk_window(text, *, chunk_size_tokens=800, overlap_tokens=100):
             overlap_tokens=overlap_tokens,
         )
     ]
+
+
+# ---------------------------------------------------------------------------
+# Plan B Phase 6.7 — image caption extraction.
+#
+# When a PDF carries embedded images (charts, screenshots, diagrams), we
+# extract them, send each through the vllm-vision service, and emit a
+# chunk with ``chunk_type="image_caption"``. This restores recall on
+# visual-content queries that today silently lose the image content.
+#
+# Triple-gated soft-fail:
+#   * RAG_IMAGE_CAPTIONS=0 (default) → never extract images at all
+#   * Image extraction fails → return [] + log
+#   * Vision service unreachable → skip per-image + tick
+#     ``rag_image_skip_total`` metric
+# ---------------------------------------------------------------------------
+
+async def extract_images_as_chunks(
+    *, pdf_bytes: bytes, filename: str,
+) -> list[dict]:
+    """Plan B Phase 6.7 — emit image_caption chunks for embedded images.
+
+    Returns a list of chunk dicts. Returns [] (silent skip) if:
+      - RAG_IMAGE_CAPTIONS=0, or
+      - vision service unreachable, or
+      - no images extracted
+    """
+    if os.environ.get("RAG_IMAGE_CAPTIONS", "0") != "1":
+        return []
+    try:
+        images = await _extract_pdf_images(pdf_bytes)
+    except Exception as e:
+        log.warning("image extraction failed for %s: %s", filename, e)
+        return []
+    if not images:
+        return []
+
+    out: list[dict] = []
+    for img in images:
+        try:
+            caption = await _caption_image(img["image_bytes"])
+        except Exception as e:
+            log.warning(
+                "image caption failed for %s page %s: %s",
+                filename, img.get("page"), e,
+            )
+            try:
+                from .metrics import RAG_IMAGE_SKIP
+                RAG_IMAGE_SKIP.inc()
+            except Exception:
+                pass
+            continue
+        if not caption:
+            continue
+        out.append({
+            "text": caption,
+            "chunk_type": "image_caption",
+            "payload": {
+                "page": img.get("page"),
+                "position": img.get("position"),
+            },
+        })
+    return out
+
+
+async def _extract_pdf_images(pdf_bytes: bytes) -> list[dict]:
+    """Use pymupdf to enumerate images. Returns list of dicts.
+
+    Plan B Phase 6.7. Each entry is
+    ``{"page": int, "image_bytes": bytes, "position": tuple}``.
+    """
+    import pymupdf
+
+    out = []
+    with pymupdf.open(stream=pdf_bytes) as doc:
+        for page_num, page in enumerate(doc, start=1):
+            for img_idx, img_info in enumerate(page.get_images(full=True)):
+                xref = img_info[0]
+                base_img = doc.extract_image(xref)
+                out.append({
+                    "page": page_num,
+                    "image_bytes": base_img["image"],
+                    "position": (img_idx,),
+                })
+    return out
+
+
+async def _caption_image(image_bytes: bytes) -> str:
+    """Send an image to vllm-vision and return the caption.
+
+    Plan B Phase 6.7. Soft-fails if the vision service is unreachable —
+    the caller catches the exception and ticks
+    ``rag_image_skip_total``.
+    """
+    import base64
+
+    import httpx
+
+    vision_url = os.environ.get(
+        "RAG_VISION_URL", "http://vllm-vision:8000/v1",
+    )
+    vision_model = os.environ.get("RAG_VISION_MODEL", "qwen2-vl-7b")
+    b64 = base64.b64encode(image_bytes).decode()
+    payload = {
+        "model": vision_model,
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text",
+                 "text": "Describe the key information in this image in 1-2 sentences."},
+                {"type": "image_url",
+                 "image_url": {"url": f"data:image/png;base64,{b64}"}},
+            ]},
+        ],
+        "max_tokens": 200,
+        "temperature": 0.0,
+    }
+    async with httpx.AsyncClient(timeout=20.0) as c:
+        r = await c.post(f"{vision_url}/chat/completions", json=payload)
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip()

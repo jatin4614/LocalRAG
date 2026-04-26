@@ -413,3 +413,18 @@ def set_shard_tier(*, collection: str, shard_key: str, tier: str) -> None:
 def prom_available() -> bool:
     """Return True if prometheus_client was importable at module load."""
     return _PROM_AVAILABLE
+
+
+# ---------------------------------------------------------------------------
+# Plan B Phase 6.7 — image caption ingest skip counter.
+#
+# Incremented when ``ext.services.ingest.extract_images_as_chunks``
+# captions an image but the vision service raises (most often because
+# vllm-vision is on-demand and not yet warm). Operators monitor this
+# alongside ``rag_image_skip_total`` in Grafana to spot regressions in
+# image recall.
+# ---------------------------------------------------------------------------
+RAG_IMAGE_SKIP = Counter(
+    f"{_NS}_image_skip_total",
+    "Images that could not be captioned (e.g. vision unreachable).",
+)
