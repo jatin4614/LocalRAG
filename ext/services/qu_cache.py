@@ -91,7 +91,16 @@ class QUCache:
         self, query: str, last_turn_id: str | None
     ) -> Optional[QueryUnderstanding]:
         """Look up a cached :class:`QueryUnderstanding`. Returns ``None``
-        on cache miss, redis error, or corrupt cached value (soft-fail)."""
+        on cache miss, redis error, or corrupt cached value (soft-fail).
+
+        Increments ``rag_qu_cache_hits_total`` on hit and
+        ``rag_qu_cache_misses_total`` on miss / corrupt / disabled.
+        Corrupt values count as misses so the hit-ratio gauge stays
+        honest even when a buggy writer pollutes the cache.
+        """
+        # Local import keeps prometheus_client out of the cache import path.
+        from .metrics import rag_qu_cache_hits, rag_qu_cache_misses
+
         if not self._enabled:
             return None
         key = _make_key(query, last_turn_id)
@@ -101,14 +110,26 @@ class QUCache:
             log.warning("qu_cache.get failed: %s", e)
             return None
         if not raw:
+            try:
+                rag_qu_cache_misses.inc()
+            except Exception:
+                pass
             return None
         try:
             data = json.loads(raw)
             qu = QueryUnderstanding(**data)
             qu.cached = True
+            try:
+                rag_qu_cache_hits.inc()
+            except Exception:
+                pass
             return qu
         except (json.JSONDecodeError, TypeError) as e:
             log.warning("qu_cache: corrupt cached value at %s: %s", key, e)
+            try:
+                rag_qu_cache_misses.inc()
+            except Exception:
+                pass
             return None
 
     async def set(

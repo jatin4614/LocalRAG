@@ -452,7 +452,14 @@ async def classify_with_qu(
     LLM's confidence is below 0.5, the regex result is returned. The
     bridge can rely on this never raising — it's safe to call on every
     query.
+
+    Increments :data:`ext.services.metrics.rag_qu_invocations` exactly
+    once per call (with the source that ultimately won) and
+    :data:`rag_qu_escalations` once per LLM escalation.
     """
+    # Local import keeps the metrics dep out of import-time fast paths.
+    from .metrics import rag_qu_escalations, rag_qu_invocations
+
     regex_label, regex_reason = classify_with_reason(query)
     history = history or []
 
@@ -469,22 +476,38 @@ async def classify_with_qu(
     )
 
     if os.environ.get("RAG_QU_ENABLED", "0") != "1":
+        try:
+            rag_qu_invocations.labels(source="regex").inc()
+        except Exception:
+            pass
         return result
 
     escalate, reason = should_escalate_to_llm(query, regex_label, history)
     result.escalation_reason = reason
     if not escalate:
+        try:
+            rag_qu_invocations.labels(source="regex").inc()
+        except Exception:
+            pass
         return result
+
+    try:
+        rag_qu_escalations.labels(reason=reason.value).inc()
+    except Exception:
+        pass
 
     qu = await _invoke_qu(query, history)
-    if qu is None:
-        # LLM failed or timed out — keep regex result
+    if qu is None or qu.confidence < 0.5:
+        try:
+            rag_qu_invocations.labels(source="regex").inc()
+        except Exception:
+            pass
         return result
 
-    # Trust threshold: don't let a low-confidence LLM call flip the label
-    if qu.confidence < 0.5:
-        return result
-
+    try:
+        rag_qu_invocations.labels(source="llm").inc()
+    except Exception:
+        pass
     return HybridClassification(
         intent=qu.intent,
         resolved_query=qu.resolved_query,

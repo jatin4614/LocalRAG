@@ -292,6 +292,48 @@ rag_eval_p95_latency = Gauge(
 )
 
 
+# -----------------------------------------------------------------------
+# Plan B Phase 4.7 — Query Understanding LLM metrics
+# -----------------------------------------------------------------------
+rag_qu_invocations = Counter(
+    f"{_NS}_qu_invocations_total",
+    "QU classifier invocations by source (regex / llm / cached)",
+    labelnames=("source",),
+)
+
+rag_qu_escalations = Counter(
+    f"{_NS}_qu_escalations_total",
+    "QU escalations from regex to LLM by predicate reason",
+    labelnames=("reason",),
+)
+
+rag_qu_latency = Histogram(
+    f"{_NS}_qu_latency_seconds",
+    "QU LLM call latency",
+    buckets=(0.05, 0.1, 0.2, 0.4, 0.6, 1.0, 2.0, 5.0),
+)
+
+rag_qu_schema_violations = Counter(
+    f"{_NS}_qu_schema_violations_total",
+    "QU LLM responses that failed schema validation",
+)
+
+rag_qu_cache_hits = Counter(
+    f"{_NS}_qu_cache_hits_total",
+    "QU cache hits",
+)
+
+rag_qu_cache_misses = Counter(
+    f"{_NS}_qu_cache_misses_total",
+    "QU cache misses",
+)
+
+rag_qu_cache_hit_ratio = Gauge(
+    f"{_NS}_qu_cache_hit_ratio",
+    "QU cache hit ratio (derived; recomputed every 30s by background task)",
+)
+
+
 @contextmanager
 def time_stage(stage: str) -> Iterator[None]:
     """Wrap a block to record its duration into ``stage_latency{stage="..."}``.

@@ -1,0 +1,39 @@
+groups:
+  - name: qu_llm_slo
+    interval: 30s
+    rules:
+      - alert: QULLMHighLatency
+        expr: histogram_quantile(0.95, rate(rag_qu_latency_seconds_bucket[5m])) > 0.6
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "QU LLM p95 latency > 600ms"
+          description: "vllm-qu p95 latency over the last 5 minutes is {{ $value }}s; SLO ceiling is 600ms. Check vllm-qu logs and GPU 1 saturation."
+
+      - alert: QULLMHighSchemaViolation
+        expr: rate(rag_qu_schema_violations_total[10m]) / clamp_min(rate(rag_qu_invocations_total{source="llm"}[10m]), 1e-9) > 0.01
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "QU LLM schema-violation rate > 1%"
+          description: "vllm-qu is producing JSON that fails the QueryUnderstanding schema. Check xgrammar guided_json setup; the Qwen revision may have rotated."
+
+      - alert: QULLMHighEscalationRate
+        expr: rate(rag_qu_escalations_total[1h]) / clamp_min(rate(rag_qu_invocations_total[1h]), 1e-9) > 0.40
+        for: 30m
+        labels:
+          severity: info
+        annotations:
+          summary: "QU LLM escalation rate > 40%"
+          description: "Hybrid router escalating more than expected. Run scripts/analyze_shadow_log.py to compare regex vs LLM disagreement and consider tuning escalation predicates."
+
+      - alert: QULLMLowCacheHitRatio
+        expr: rag_qu_cache_hit_ratio < 0.3
+        for: 1h
+        labels:
+          severity: info
+        annotations:
+          summary: "QU cache hit ratio < 30%"
+          description: "Either the workload is unique or RAG_QU_CACHE_TTL_SECS is too short. Try raising TTL to 900s."

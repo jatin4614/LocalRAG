@@ -246,8 +246,16 @@ async def analyze_query(
 
     Returns ``None`` on any failure — the caller falls back to regex.
     Soft-deadline via ``timeout_ms`` (default ``RAG_QU_LATENCY_BUDGET_MS``,
-    600 ms); deadline misses are logged at WARN.
+    600 ms); deadline misses are logged at WARN. The latency histogram
+    (`rag_qu_latency_seconds`) is observed on every call regardless of
+    outcome, and schema violations bump `rag_qu_schema_violations_total`.
     """
+    import time as _time
+
+    # Local imports keep the regex hot path (which never reaches here)
+    # free of metrics import cost.
+    from .metrics import rag_qu_latency, rag_qu_schema_violations
+
     qu_url = qu_url or os.environ.get("RAG_QU_URL", "http://vllm-qu:8000/v1")
     model = model or os.environ.get("RAG_QU_MODEL", "qwen3-4b-qu")
     if timeout_ms is None:
@@ -268,19 +276,34 @@ async def analyze_query(
         "extra_body": {"guided_json": QU_OUTPUT_SCHEMA},
     }
 
+    _t0 = _time.monotonic()
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             r = await client.post(f"{qu_url}/chat/completions", json=payload)
             r.raise_for_status()
             data = r.json()
             raw = data["choices"][0]["message"]["content"]
-            return parse_qu_response(raw)
+            try:
+                return parse_qu_response(raw)
+            except ValueError:
+                # Schema violation — bump the dedicated counter so the
+                # alert in observability/prometheus/alerts-qu.yml fires.
+                try:
+                    rag_qu_schema_violations.inc()
+                except Exception:
+                    pass
+                raise
     except (asyncio.TimeoutError, httpx.TimeoutException):
         log.warning("QU LLM timed out after %dms; falling back to regex", timeout_ms)
         return None
     except (httpx.HTTPError, KeyError, IndexError, ValueError) as e:
         log.warning("QU LLM error: %s; falling back to regex", e)
         return None
+    finally:
+        try:
+            rag_qu_latency.observe(_time.monotonic() - _t0)
+        except Exception:
+            pass
 
 
 __all__ = [
