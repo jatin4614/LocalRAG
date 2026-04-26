@@ -25,9 +25,8 @@ Plan B Phase 4 added a hybrid LLM tiebreaker exposed via
 :func:`classify_with_qu`. It escalates ``specific``-labelled queries to
 the QU LLM (``ext.services.query_understanding``) when one of six
 predicates fires (pronoun reference, relative time, multi-clause, long
-query, comparison verb, question-word with no entity). The legacy
-``RAG_INTENT_LLM`` flag is retired (Plan B Phase 4.10); use
-``RAG_QU_ENABLED`` instead.
+query, comparison verb, question-word with no entity). The hybrid path
+is governed by ``RAG_QU_ENABLED``.
 """
 from __future__ import annotations
 
@@ -403,7 +402,6 @@ def classify_with_reason(query: str) -> Tuple[Intent, str]:
         day, month, year = date_tuple
         return "specific_date", f"specific_date:extracted={day} {month} {year}"
 
-    # Plan B Phase 4 — the legacy ``RAG_INTENT_LLM`` tiebreaker is retired.
     # The async hybrid classifier (:func:`classify_with_qu`) is the only
     # supported LLM path and is governed by ``RAG_QU_ENABLED``. Sync
     # callers (logging hooks, debug endpoints) keep regex-only behaviour.

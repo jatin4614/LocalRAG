@@ -135,8 +135,8 @@ _KEY_TO_ENV: dict[str, str] = {
     "hyde": "RAG_HYDE",
     "hyde_n": "RAG_HYDE_N",
     "doc_summaries": "RAG_DOC_SUMMARIES",
-    "intent_routing": "RAG_INTENT_ROUTING",
-    "intent_llm": "RAG_INTENT_LLM",
+    # The QU LLM flags (RAG_QU_*) are cluster-wide and not exposed as
+    # per-KB rag_config keys.
 }
 
 

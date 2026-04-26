@@ -6,6 +6,8 @@ three labels plus a few tricky edge cases where the boundary between
 """
 from __future__ import annotations
 
+import pathlib
+
 import pytest
 
 from ext.services.query_intent import classify, classify_with_reason
@@ -125,3 +127,37 @@ def test_reason_for_specific_fallback() -> None:
     label, reason = classify_with_reason("what did the Jan report say")
     assert label == "specific"
     assert "default" in reason or "no_pattern_matched" in reason
+
+
+# --------------------------------------------------------------------------
+# Plan B Phase 4.10 — RAG_INTENT_LLM is retired. The async hybrid
+# classifier (classify_with_qu) is the only supported LLM path; the
+# legacy stub _llm_classify and its env-flag are gone from the source.
+# --------------------------------------------------------------------------
+def test_legacy_intent_llm_flag_purged_from_query_intent_module() -> None:
+    """The retired flag and stub must not appear in query_intent.py.
+
+    Source-text check (not just attribute introspection) so future
+    contributors can't reintroduce a docstring reference that would let
+    an operator search the codebase and assume the flag still exists.
+    """
+    from ext.services import query_intent
+
+    src = pathlib.Path(query_intent.__file__).read_text()
+    assert "RAG_INTENT_LLM" not in src, (
+        "RAG_INTENT_LLM is retired in Plan B Phase 4.10; "
+        "remove all references from ext/services/query_intent.py."
+    )
+    assert "_llm_classify" not in src, (
+        "_llm_classify stub must be removed (replaced by classify_with_qu)."
+    )
+
+
+def test_legacy_intent_llm_flag_purged_from_kb_config() -> None:
+    """The kb_config rag_config schema must no longer accept intent_llm."""
+    from ext.services import kb_config
+
+    assert "intent_llm" not in kb_config._KEY_TO_ENV, (
+        "intent_llm key must be removed from kb_config._KEY_TO_ENV "
+        "(Plan B Phase 4.10 retires RAG_INTENT_LLM)."
+    )
