@@ -1,0 +1,49 @@
+groups:
+  - name: tiered_shards
+    interval: 1m
+    rules:
+      - alert: ShardSearchLatencyHigh
+        expr: |
+          histogram_quantile(
+            0.95,
+            rate(rag_shard_search_latency_seconds_bucket[5m])
+          ) > 1.0
+        for: 10m
+        labels:
+          severity: warning
+          component: rag
+        annotations:
+          summary: "Per-shard p95 search latency > 1s on {{ $labels.collection }}/{{ $labels.shard_key }}"
+          description: |
+            Cold shards may be reading from disk. Check tier configuration.
+            Run `python scripts/tier_storage_cron.py --collection {{ $labels.collection }} --dry-run`
+            and inspect the desired tier vs the cached tier in Redis DB 5
+            (`tier:{{ $labels.collection }}:{{ $labels.shard_key }}`).
+
+      - alert: ShardCountUnexpectedlyHigh
+        expr: rag_shard_point_count > 1000000
+        for: 1h
+        labels:
+          severity: info
+          component: rag
+        annotations:
+          summary: "Shard {{ $labels.collection }}/{{ $labels.shard_key }} has > 1M points"
+          description: |
+            A single month's shard exceeds 1M points. Consider re-sharding
+            more granularly (e.g. per-week instead of per-month) or check
+            for an upstream data-spike incident around this date range.
+
+      - alert: ShardTierTransitionFlapping
+        expr: changes(rag_shard_tier[1d]) > 4
+        for: 6h
+        labels:
+          severity: info
+          component: rag
+        annotations:
+          summary: "Shard {{ $labels.collection }}/{{ $labels.shard_key }} flapping between tiers"
+          description: |
+            More than 4 tier transitions observed in the last 24h. The
+            tier cron may be misconfigured (RAG_TIER_HOT_MONTHS /
+            RAG_TIER_WARM_MONTHS) or operators may be manually overriding
+            and re-overriding. Inspect Redis DB 5 keys for the affected
+            shard and confirm the desired vs cached tier.
