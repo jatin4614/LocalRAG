@@ -101,30 +101,23 @@ def configured_bridge(monkeypatch):
     sys.modules.pop("ext.services.context_expand", None)
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "Phase 2.2 intent overlay: classify_intent('hello') -> 'specific', "
-        "and _INTENT_FLAG_POLICY['specific'] forces RAG_CONTEXT_EXPAND=1, "
-        "so context_expand IS imported even when the flag is 'unset' or "
-        "explicitly '0' at the env level. The test expresses the pre-Phase-2.2 "
-        "contract (env flag is the single source of truth). "
-        "Design decision pending — see triage report bucket F."
-    ),
-)
 @pytest.mark.asyncio
 async def test_flag_unset_does_not_import_context_expand(configured_bridge, monkeypatch):
-    """With RAG_CONTEXT_EXPAND unset, context_expand module must not be imported.
+    """With RAG_CONTEXT_EXPAND off, context_expand module must not be imported.
 
-    TODO(intent-overlay): re-enable once we decide how the env flag and
-    intent-policy overlay interact. Options: (a) gate the overlay behind
-    RAG_INTENT_ROUTING (currently the overlay always runs); (b) document
-    that the overlay supersedes the env default and update this test to
-    monkeypatch RAG_INTENT_ROUTING=0; (c) keep current behaviour and
-    delete this test as obsolete. See docs/runbook/preexisting-test-triage.md
-    bucket F.
+    Uses RAG_INTENT_OVERLAY_MODE=env (B3 design call) so the per-intent
+    policy overlay defers to the operator-set env value. Combined with an
+    explicit RAG_CONTEXT_EXPAND=0, the overlay drops the key and
+    flags.get returns the env value, preserving the pre-Phase-2.2
+    "env is the single source of truth" contract this test asserts.
     """
-    monkeypatch.delenv("RAG_CONTEXT_EXPAND", raising=False)
+    # B3 escape hatch: env wins over the per-intent overlay. Must be set
+    # BEFORE the bridge resolves intent flags (read at call time inside
+    # retrieve_kb_sources), and the relevant flag must be EXPLICITLY set
+    # so env mode actually has a value to surface — pure delete still
+    # leaves the intent default in the overlay.
+    monkeypatch.setenv("RAG_INTENT_OVERLAY_MODE", "env")
+    monkeypatch.setenv("RAG_CONTEXT_EXPAND", "0")
 
     out = await bridge.retrieve_kb_sources(
         kb_config=[{"kb_id": 1, "subtag_ids": []}],
@@ -137,21 +130,15 @@ async def test_flag_unset_does_not_import_context_expand(configured_bridge, monk
     assert "ext.services.context_expand" not in sys.modules
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "Phase 2.2 intent overlay: same as sibling test_flag_unset_*. The "
-        "explicit RAG_CONTEXT_EXPAND=0 is overridden by the per-intent "
-        "policy overlay for 'specific' queries (which the test query is). "
-        "Design decision pending — see triage report bucket F."
-    ),
-)
 @pytest.mark.asyncio
 async def test_flag_zero_does_not_import_context_expand(configured_bridge, monkeypatch):
     """RAG_CONTEXT_EXPAND=0 (explicit) → same as unset.
 
-    TODO(intent-overlay): see sibling test for the design-decision context.
+    Uses RAG_INTENT_OVERLAY_MODE=env (B3 design call) so the operator's
+    explicit RAG_CONTEXT_EXPAND=0 wins over the per-intent overlay's
+    default of RAG_CONTEXT_EXPAND=1 for 'specific' queries.
     """
+    monkeypatch.setenv("RAG_INTENT_OVERLAY_MODE", "env")
     monkeypatch.setenv("RAG_CONTEXT_EXPAND", "0")
 
     out = await bridge.retrieve_kb_sources(
