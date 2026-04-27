@@ -425,10 +425,19 @@ services:
       # Ingest must derive a shard_key per document (filename-first, body
       # fallback) so vector_store.upsert can pass shard_key_selector.
       RAG_SHARDING_ENABLED: ${RAG_SHARDING_ENABLED:-0}
+      # Plan B post-merge soak fix: tell budget.py to use the gemma tokenizer
+      # so token counts match the actual chat model (vllm-chat serves
+      # QuantTrio/gemma-4-31B-it-AWQ). cl100k undercounts gemma by ~10-15%.
+      RAG_BUDGET_TOKENIZER: ${RAG_BUDGET_TOKENIZER:-gemma-4}
+      RAG_BUDGET_TOKENIZER_MODEL: ${RAG_BUDGET_TOKENIZER_MODEL:-QuantTrio/gemma-4-31B-it-AWQ}
       SESSION_SECRET: ${SESSION_SECRET}
     volumes:
       - ../volumes/uploads:/app/backend/data/uploads
       - ../volumes/hf-cache:/root/.cache/huggingface
+      # Bind the gemma model dir from volumes/models into the HF cache
+      # subpath so AutoTokenizer.from_pretrained finds it offline. Mounted
+      # read-only — open-webui must never mutate the model store.
+      - ../volumes/models/models--QuantTrio--gemma-4-31B-it-AWQ:/root/.cache/huggingface/hub/models--QuantTrio--gemma-4-31B-it-AWQ:ro
       - ingest_blobs:/var/ingest
     depends_on:
       postgres:
