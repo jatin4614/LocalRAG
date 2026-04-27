@@ -32,48 +32,107 @@ class TokenizerPreflightError(RuntimeError):
 #   kind="hf"       => transformers.AutoTokenizer.from_pretrained(id)
 #
 # Adding a new chat-model family is a 2-line change: pick an alias, point at
-# the HF repo. RAG_BUDGET_TOKENIZER_MODEL (if set) overrides the default id
-# for the family aliases noted below.
+# the HF repo. RAG_BUDGET_TOKENIZER_MODEL (if set at lookup time) overrides
+# the default id for ALL hf aliases — see _resolve_spec below. Pinned IDs
+# remain authoritative when the env var is unset.
 _TOKENIZER_REGISTRY: dict[str, dict[str, str]] = {
     "cl100k": {"kind": "tiktoken", "id": "cl100k_base"},
-    "qwen": {
-        "kind": "hf",
-        "id": os.environ.get("RAG_BUDGET_TOKENIZER_MODEL", "Qwen/Qwen2.5-14B-Instruct"),
-    },
+    "qwen": {"kind": "hf", "id": "Qwen/Qwen2.5-14B-Instruct"},
     "qwen2.5": {"kind": "hf", "id": "Qwen/Qwen2.5-14B-Instruct"},
-    "gemma": {
-        "kind": "hf",
-        "id": os.environ.get("RAG_BUDGET_TOKENIZER_MODEL", "google/gemma-4-31B-it"),
-    },
+    "gemma": {"kind": "hf", "id": "google/gemma-4-31B-it"},
     "gemma-4": {"kind": "hf", "id": "google/gemma-4-31B-it"},
     "gemma-4-31b": {"kind": "hf", "id": "google/gemma-4-31B-it"},
     "gemma-3": {"kind": "hf", "id": "google/gemma-3-27b-it"},
     "gemma-3-12b": {"kind": "hf", "id": "google/gemma-3-12b-it"},
-    "llama": {
-        "kind": "hf",
-        "id": os.environ.get("RAG_BUDGET_TOKENIZER_MODEL", "meta-llama/Llama-3-8B-Instruct"),
-    },
+    "llama": {"kind": "hf", "id": "meta-llama/Llama-3-8B-Instruct"},
 }
+
+
+def _resolve_spec(alias: str) -> dict[str, str] | None:
+    """Look up an alias and apply ``RAG_BUDGET_TOKENIZER_MODEL`` override.
+
+    Returns a fresh dict (never mutates the registry). For ``hf`` aliases,
+    if ``RAG_BUDGET_TOKENIZER_MODEL`` is set, the resolved ``id`` is the
+    operator-supplied value; otherwise the pinned default is used.
+
+    Override applies uniformly to every ``hf`` alias. The env var is read
+    at lookup time (not at import) so pytest's ``monkeypatch.setenv`` flips
+    behavior without an import reload — the lru_cache on ``get_tokenizer``
+    is what pins the resolved tokenizer per process.
+    """
+    spec = _TOKENIZER_REGISTRY.get(alias)
+    if spec is None:
+        return None
+    if spec.get("kind") != "hf":
+        return dict(spec)
+    override = os.environ.get("RAG_BUDGET_TOKENIZER_MODEL")
+    if override:
+        return {"kind": "hf", "id": override}
+    return dict(spec)
 
 
 def _get_tokenizer_alias() -> str:
     return os.environ.get("RAG_BUDGET_TOKENIZER", "cl100k").lower()
 
 
+class _TokenizerHandle:
+    """Uniform encode/decode surface over tiktoken and HF tokenizers.
+
+    The chunker needs ``encode(text) -> list[int]`` and ``decode(ids) -> str``;
+    the budget enforcer just needs ``len(encode(text))``. Wrapping both
+    backends in a single shape lets ``ext.services.chunker`` and
+    ``ext.services.budget`` share one cached instance — chunk boundaries
+    and budget counts then use identical token vocabularies.
+
+    For HF backends we always pass ``add_special_tokens=False`` so chunk
+    sizes match real-prompt token counts (special tokens are added by the
+    chat template, not per chunk).
+    """
+
+    __slots__ = ("_kind", "_inner")
+
+    def __init__(self, kind: str, inner) -> None:
+        self._kind = kind
+        self._inner = inner
+
+    @property
+    def kind(self) -> str:
+        return self._kind
+
+    def encode(self, text: str) -> list[int]:
+        if self._kind == "hf":
+            return list(self._inner.encode(text, add_special_tokens=False))
+        # tiktoken
+        return list(self._inner.encode(text))
+
+    def decode(self, ids) -> str:
+        if self._kind == "hf":
+            # skip_special_tokens defaults to False on most HF tokenizers;
+            # we pass True so a hard-split chunk that grabs a tail token
+            # which happens to be <eos>/<bos> doesn't leak control tokens
+            # into the chunk text.
+            return self._inner.decode(list(ids), skip_special_tokens=True)
+        return self._inner.decode(list(ids))
+
+
+def _make_tiktoken_handle() -> _TokenizerHandle:
+    """Load cl100k_base via tiktoken. Owned by budget.py to keep the
+    chunker -> budget import direction one-way."""
+    import tiktoken  # local import — keeps chunker free of tiktoken at module load
+    return _TokenizerHandle("tiktoken", tiktoken.get_encoding("cl100k_base"))
+
+
 @lru_cache(maxsize=1)
-def _budget_tokenizer():
-    """Return a callable (text -> int) that counts tokens.
+def get_tokenizer() -> _TokenizerHandle:
+    """Return the shared tokenizer handle.
 
-    Alias is chosen via RAG_BUDGET_TOKENIZER (default: cl100k, matches the
-    old behavior). Unknown alias logs a warning and falls back to cl100k.
-
-    For HF-backed aliases (qwen / gemma / llama), the first call downloads
-    tokenizer vocab. When ``RAG_BUDGET_TOKENIZER_MODEL`` is set, it overrides
-    the default id for the family alias (qwen / gemma / llama). Exact-version
-    aliases like 'qwen2.5', 'gemma-3', 'gemma-3-12b' always use their pinned id.
+    Both the budget enforcer and the ingest-time chunker route through
+    this so chunk boundaries are sized in the same token vocabulary the
+    prompt-budget pass will count against. Cached for the life of the
+    process — tokenizer load is the dominant first-call cost.
     """
     alias = _get_tokenizer_alias()
-    spec = _TOKENIZER_REGISTRY.get(alias)
+    spec = _resolve_spec(alias)
 
     if spec is None:
         logger.warning(
@@ -82,7 +141,7 @@ def _budget_tokenizer():
             alias,
             ", ".join(sorted(_TOKENIZER_REGISTRY)),
         )
-        spec = _TOKENIZER_REGISTRY["cl100k"]
+        return _make_tiktoken_handle()
 
     kind = spec["kind"]
     ident = spec["id"]
@@ -106,26 +165,31 @@ def _budget_tokenizer():
                 tokenizer_fallback_total.labels(from_alias=alias, to="cl100k").inc()
             except Exception:  # pragma: no cover - metrics is fail-open
                 pass
-            return _cl100k_counter()
-
-        def _count(text: str) -> int:
-            return len(tok.encode(text, add_special_tokens=False))
-        return _count
+            return _make_tiktoken_handle()
+        return _TokenizerHandle("hf", tok)
 
     if kind == "tiktoken":
-        return _cl100k_counter()
+        return _make_tiktoken_handle()
 
     logger.warning("unknown tokenizer kind %r; falling back to cl100k", kind)
-    return _cl100k_counter()
+    return _make_tiktoken_handle()
 
 
-def _cl100k_counter():
-    """Shared cl100k counter — reuses the chunker's encoder so we get caching."""
-    from ext.services.chunker import _encoder
-    enc = _encoder()
+@lru_cache(maxsize=1)
+def _budget_tokenizer():
+    """Return a callable (text -> int) that counts tokens.
+
+    Alias is chosen via RAG_BUDGET_TOKENIZER (default: cl100k, matches the
+    old behavior). Unknown alias logs a warning and falls back to cl100k.
+
+    Counts come from the same handle the chunker uses — see
+    :func:`get_tokenizer` — so the prompt-budget pass and ingest-time
+    chunk sizing share one token vocabulary.
+    """
+    handle = get_tokenizer()
 
     def _count(text: str) -> int:
-        return len(enc.encode(text))
+        return len(handle.encode(text))
     return _count
 
 
@@ -159,7 +223,7 @@ def preflight_tokenizer() -> None:
         _module_logger.info(msg)
         return
     alias = alias.lower()
-    spec = _TOKENIZER_REGISTRY.get(alias)
+    spec = _resolve_spec(alias)
     if spec is None:
         # Unknown alias — log but don't crash, consistent with the
         # existing _budget_tokenizer fallback path. Mirror to both
