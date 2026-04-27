@@ -133,6 +133,21 @@ def build_app() -> FastAPI:
                 type(exc).__name__, exc,
             )
 
+    # B3 — shadow log file handler. Operators can't analyze a stream
+    # that only goes to stderr, so when shadow mode is on we pin a
+    # rotating JSONL file at ``RAG_QU_SHADOW_LOG_PATH`` (default
+    # ``/var/log/orgchat/qu_shadow.jsonl``). Best-effort: install
+    # failures log a warning but don't crash startup.
+    try:
+        from ext.services.query_intent import maybe_install_shadow_log_file_handler
+        maybe_install_shadow_log_file_handler()
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning(
+            "shadow log file handler install failed (%s: %s) — "
+            "shadow JSONL will only go to stderr.",
+            type(exc).__name__, exc,
+        )
+
     @app.get("/healthz")
     async def healthz():
         return {"status": "ok"}
@@ -193,6 +208,20 @@ def build_ext_routers():
                 "Check GPU 1 VRAM and RAG_RERANK_MODEL cache.",
                 type(exc).__name__, exc,
             )
+
+    # B3 — shadow log file handler (mirrors build_app). Without this the
+    # shadow JSONL only goes to stderr/docker logs, so the operator
+    # analyzer (`scripts/analyze_shadow_log.py`) has nothing persistent
+    # to grep. Best-effort: install failures log a warning, never crash.
+    try:
+        from ext.services.query_intent import maybe_install_shadow_log_file_handler
+        maybe_install_shadow_log_file_handler()
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning(
+            "shadow log file handler install failed (%s: %s) — "
+            "shadow JSONL will only go to stderr.",
+            type(exc).__name__, exc,
+        )
 
     # Prom `/metrics` collides with upstream Svelte SPA catch-all — expose
     # on a dedicated in-container port (9464) for Prometheus scrape.
