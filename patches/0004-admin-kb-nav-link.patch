@@ -1,0 +1,21 @@
+diff --git a/src/routes/(app)/admin/+layout.svelte b/src/routes/(app)/admin/+layout.svelte
+index 2bce0f829..f7b9f3398 100644
+--- a/src/routes/(app)/admin/+layout.svelte
++++ b/src/routes/(app)/admin/+layout.svelte
+@@ -101,12 +101,15 @@
+ 							href="/admin/settings">{$i18n.t('Settings')}</a
+ 						>
+ 
++						<!-- Plan 5b — Knowledge Base admin: KBAdmin.svelte renders at
++							 /admin/kb/+page.svelte. Without this nav entry the page
++							 was reachable only by typing the URL directly. -->
+ 						<a
+ 							draggable="false"
+ 							class="min-w-fit p-1.5 {$page.url.pathname.includes('/admin/kb')
+ 								? ''
+ 								: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'} transition select-none"
+-							href="/admin/kb">{$i18n.t('Knowledge Bases')}</a
++							href="/admin/kb">{$i18n.t('Knowledge Base')}</a
+ 						>
+ 					</div>
+ 				</div>
