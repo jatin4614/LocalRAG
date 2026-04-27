@@ -8,10 +8,15 @@ the service on 20 MB uploads.
 Downstream modules (``ingest.py``, ``budget.py``) depend on:
 - ``chunk_text`` signature: (text, *, chunk_tokens, overlap_tokens) -> List[Chunk]
 - ``Chunk.text`` and ``Chunk.index`` fields
-- ``_encoder`` module-level helper (imported by ``budget.py``)
+- ``_encoder`` module-level helper (kept for back-compat; now delegates
+  to :func:`ext.services.budget.get_tokenizer` so chunk boundaries and
+  the prompt-budget pass share one token vocabulary).
 
-P1.5 will swap the tokenizer to ``BAAI/bge-m3``; for now we stay on
-``tiktoken.cl100k_base`` so the semantics match the existing index.
+The active tokenizer is whatever ``RAG_BUDGET_TOKENIZER`` selects in
+``budget.py`` (default: ``cl100k``). When the operator sets it to a
+chat-model alias (e.g. ``gemma-4``), chunk sizing tracks the real prompt
+token count instead of being off by ~10-15% — which previously evicted
+relevant chunks from the budget pass.
 """
 from __future__ import annotations
 
@@ -19,8 +24,6 @@ import re
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import List
-
-import tiktoken
 
 
 # Paragraph break: two (or more) newlines, possibly with whitespace between.
@@ -39,9 +42,18 @@ class Chunk:
 
 
 @lru_cache(maxsize=1)
-def _encoder() -> tiktoken.Encoding:
-    """Shared tokenizer. Also imported by ``budget.py`` — do not rename."""
-    return tiktoken.get_encoding("cl100k_base")
+def _encoder():
+    """Shared tokenizer. Returns the same handle :mod:`ext.services.budget`
+    uses for token counting, so chunk boundaries align with the prompt
+    budget pass.
+
+    Cached for the life of the process — tokenizer load is the dominant
+    first-call cost. The handle exposes ``encode(text) -> list[int]`` and
+    ``decode(ids) -> str``, matching the surface this module relied on
+    when it talked to ``tiktoken.Encoding`` directly.
+    """
+    from ext.services.budget import get_tokenizer  # local: avoid import cycle
+    return get_tokenizer()
 
 
 def _iter_regions(regex: "re.Pattern[str]", text: str):

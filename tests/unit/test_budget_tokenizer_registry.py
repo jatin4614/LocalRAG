@@ -82,14 +82,19 @@ def test_alias_gemma_resolves_to_hf_tokenizer(monkeypatch):
     assert "gemma" in called_with.lower()
 
 
-def test_alias_gemma_3_pin_ignores_env_override(monkeypatch):
-    """'gemma-3' is a pinned alias; RAG_BUDGET_TOKENIZER_MODEL should not affect it."""
+def test_alias_gemma_3_pin_keeps_default_when_no_override(monkeypatch):
+    """'gemma-3' resolves to its pinned id when RAG_BUDGET_TOKENIZER_MODEL is unset.
+
+    B8 makes the env override apply uniformly to every hf alias when set;
+    this test pins the unset case so versioned aliases remain
+    deterministic for operators who haven't opted into an override.
+    """
     captured: dict = {}
     _patch_auto_tokenizer(monkeypatch, captured=captured)
     budget = _reload_budget(
         monkeypatch,
         RAG_BUDGET_TOKENIZER="gemma-3",
-        RAG_BUDGET_TOKENIZER_MODEL="some/other-repo",
+        RAG_BUDGET_TOKENIZER_MODEL=None,
     )
     budget._count_tokens("x")
     called_with = captured["args"][0]
