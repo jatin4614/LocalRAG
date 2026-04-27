@@ -1,17 +1,58 @@
-"""Shared fixtures for integration tests needing a real Postgres + migrated schema."""
+"""Shared fixtures for integration tests needing a real Postgres + migrated schema.
+
+B10 — defaults so a fresh ``pytest tests/integration`` works out of the
+box. Two modes:
+
+* **Live container stack reachable** (CI on the dev box): tests use
+  testcontainers (Postgres / Redis / Qdrant spun up per session); the
+  upload + ingest router auto-takes the synchronous path so tests don't
+  need a live celery worker; INGEST_BLOB_ROOT lands in /tmp.
+
+* **Nothing live**: tests that genuinely need additional infra (live
+  celery worker, real upstream submodule, distributed Qdrant cluster)
+  skip cleanly with a "needs X" reason; everything else still runs
+  against the testcontainers it provisions itself.
+
+The env defaults below are set at module import time — they MUST happen
+before any ``from ext.routers.upload import ...`` because that module
+captures ``RAG_SYNC_INGEST`` and ``MAX_UPLOAD_BYTES`` at import. Pytest
+loads conftest.py before collecting test files, so this ordering is
+guaranteed.
+"""
 from __future__ import annotations
 
 import asyncio
+import os
+import tempfile
 from pathlib import Path
 from typing import AsyncGenerator
 
-import pytest
-import pytest_asyncio
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from testcontainers.core.container import DockerContainer
-from testcontainers.postgres import PostgresContainer
-from testcontainers.redis import RedisContainer
+# --- B10 env defaults (must be set before any test-file imports) ---------
+#
+# RAG_SYNC_INGEST=1 routes uploads through the in-process synchronous path
+# instead of dispatching to a Celery worker. The async path requires a
+# live worker reachable on the host network, which the integration suite
+# does not provision. Operators who need to exercise the async path can
+# opt in by setting RAG_SYNC_INGEST=0 in their shell before invoking
+# pytest.
+os.environ.setdefault("RAG_SYNC_INGEST", "1")
+#
+# INGEST_BLOB_ROOT defaults to /var/ingest in production (mounted volume
+# shared with celery-worker). On the host /var/ingest is read-only, so we
+# point at a process-scoped tempdir. ``setdefault`` so an operator
+# override still wins.
+_default_blob_root = Path(tempfile.gettempdir()) / "orgchat-integration-ingest"
+_default_blob_root.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("INGEST_BLOB_ROOT", str(_default_blob_root))
+# --- end B10 env defaults ------------------------------------------------
+
+import pytest  # noqa: E402 — env vars MUST be set before ext.* imports
+import pytest_asyncio  # noqa: E402
+from sqlalchemy import text  # noqa: E402
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine  # noqa: E402
+from testcontainers.core.container import DockerContainer  # noqa: E402
+from testcontainers.postgres import PostgresContainer  # noqa: E402
+from testcontainers.redis import RedisContainer  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 MIGRATIONS_DIR = ROOT / "ext/db/migrations"
