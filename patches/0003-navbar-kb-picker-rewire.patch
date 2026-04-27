@@ -1,0 +1,144 @@
+diff --git a/src/lib/components/chat/Navbar.svelte b/src/lib/components/chat/Navbar.svelte
+index 5c4e1364b..05f2c9a9e 100644
+--- a/src/lib/components/chat/Navbar.svelte
++++ b/src/lib/components/chat/Navbar.svelte
+@@ -22,6 +22,12 @@
+ 
+ 	import ShareChatModal from '../chat/ShareChatModal.svelte';
+ 	import ModelSelector from '../chat/ModelSelector.svelte';
++	import KBPickerModal from '../chat/KBPickerModal.svelte';
++	import {
++		getChatKBConfig,
++		setChatKBConfig,
++		type KBSelection
++	} from '$lib/apis/kb';
+ 	import Tooltip from '../common/Tooltip.svelte';
+ 	import Menu from '$lib/components/layout/Navbar/Menu.svelte';
+ 	import UserMenu from '$lib/components/layout/Sidebar/UserMenu.svelte';
+@@ -58,10 +64,85 @@
+ 	let closedBannerIds = [];
+ 
+ 	let showShareChatModal = false;
++
++	// Plan 5b — KB selection modal. Loads existing config when chatId
++	// resolves; persists via PUT /api/chats/{id}/kb_config on confirm.
++	// For brand-new chats (no chatId yet) we hold the selection in a
++	// pending var and apply it as soon as the chat row exists.
++	let showKBPicker = false;
++	let kbSelections: KBSelection[] = [];
++	let pendingKBSelections: KBSelection[] | null = null;
++	let lastLoadedChatId: string = '';
++
++	$: if ($chatId && $chatId !== lastLoadedChatId) {
++		lastLoadedChatId = $chatId;
++		loadKBConfigForCurrentChat();
++	}
++
++	async function loadKBConfigForCurrentChat() {
++		const token = localStorage.token || '';
++		if (!token || !$chatId) return;
++		try {
++			const data = await getChatKBConfig(token, $chatId);
++			const cfg = data?.config ?? data?.selectedKbConfig ?? [];
++			kbSelections = (Array.isArray(cfg) ? cfg : []).map((s: any) => ({
++				kb_id: s.kb_id,
++				subtag_ids: Array.isArray(s.subtag_ids) ? s.subtag_ids : []
++			}));
++		} catch (_e) {
++			kbSelections = [];
++		}
++		// If the user picked a KB before the chat existed, flush the pending choice.
++		if (pendingKBSelections && pendingKBSelections.length > 0) {
++			const flush = pendingKBSelections;
++			pendingKBSelections = null;
++			await persistKBSelections(flush);
++		}
++	}
++
++	async function persistKBSelections(selections: KBSelection[]) {
++		const token = localStorage.token || '';
++		if (!token || !$chatId) return;
++		try {
++			const result = await setChatKBConfig(token, $chatId, selections);
++			if (result) {
++				kbSelections = selections;
++				toast.success(
++					selections.length > 0
++						? $i18n.t(`Attached ${selections.length} KB(s) to chat`)
++						: $i18n.t('Cleared KB selection')
++				);
++			} else {
++				toast.error($i18n.t('Failed to save KB selection'));
++			}
++		} catch (_e) {
++			toast.error($i18n.t('Failed to save KB selection'));
++		}
++	}
++
++	async function onKBPickerConfirm(
++		event: CustomEvent<{ selections: KBSelection[] }>
++	) {
++		showKBPicker = false;
++		const next = event.detail.selections || [];
++		if ($chatId) {
++			await persistKBSelections(next);
++		} else {
++			// Defer until the first message creates the chat row.
++			pendingKBSelections = next;
++			kbSelections = next; // reflect in the badge immediately
++			toast.info($i18n.t('KB selection will apply once you send the first message'));
++		}
++	}
+ 	let showDownloadChatModal = false;
+ </script>
+ 
+ <ShareChatModal bind:show={showShareChatModal} chatId={$chatId} />
++<KBPickerModal
++	bind:show={showKBPicker}
++	selections={kbSelections}
++	on:confirm={onKBPickerConfirm}
++/>
+ 
+ <button
+ 	id="new-chat-button"
+@@ -119,6 +200,40 @@
+ 				<div class="self-start flex flex-none items-center text-gray-600 dark:text-gray-400">
+ 					<!-- <div class="md:hidden flex self-center w-[1px] h-5 mx-2 bg-gray-300 dark:bg-stone-700" /> -->
+ 
++					<!-- Plan 5b — KB selector modal trigger. Always visible; the picker
++						 itself loads available KBs lazily from /api/kb/available. Badge
++						 shows the count of currently-attached KBs. -->
++					<Tooltip content={$i18n.t('Select Knowledge Base')}>
++						<button
++							class="flex cursor-pointer items-center px-2 py-2 rounded-xl hover:bg-gray-50 dark:hover:bg-gray-850 transition"
++							id="kb-picker-button"
++							aria-label={$i18n.t('Select Knowledge Base')}
++							on:click={() => (showKBPicker = true)}
++						>
++							<svg
++								xmlns="http://www.w3.org/2000/svg"
++								fill="none"
++								viewBox="0 0 24 24"
++								stroke-width="1.5"
++								stroke="currentColor"
++								class="size-5"
++							>
++								<path
++									stroke-linecap="round"
++									stroke-linejoin="round"
++									d="M12 6.042A8.967 8.967 0 0 0 6 3.75c-1.052 0-2.062.18-3 .512v14.25A8.987 8.987 0 0 1 6 18c2.305 0 4.408.867 6 2.292m0-14.25a8.966 8.966 0 0 1 6-2.292c1.052 0 2.062.18 3 .512v14.25A8.987 8.987 0 0 0 18 18a8.967 8.967 0 0 0-6 2.292m0-14.25v14.25"
++								/>
++							</svg>
++							{#if kbSelections.length > 0}
++								<span
++									class="ml-1 text-xs font-semibold text-blue-600 dark:text-blue-400"
++								>
++									{kbSelections.length}
++								</span>
++							{/if}
++						</button>
++					</Tooltip>
++
+ 					{#if $user?.role === 'user' ? ($user?.permissions?.chat?.temporary ?? true) && !($user?.permissions?.chat?.temporary_enforced ?? false) : true}
+ 						{#if !chat?.id}
+ 							<Tooltip content={$i18n.t(`Temporary Chat`)}>
