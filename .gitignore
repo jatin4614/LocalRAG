@@ -33,3 +33,16 @@ volumes/
 dist/
 build/
 *.egg-info/
+
+# Claude Code state
+.claude/
+
+# Untracked sibling services / branding
+brand/
+tts_service/
+
+# Operator backups (qdrant snapshots etc.)
+qdrant-backups/
+
+# Loose snapshots that may accumulate
+*.snapshot
