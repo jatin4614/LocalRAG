@@ -428,3 +428,28 @@ RAG_IMAGE_SKIP = Counter(
     f"{_NS}_image_skip_total",
     "Images that could not be captioned (e.g. vision unreachable).",
 )
+
+
+# ---------------------------------------------------------------------------
+# B6 (audit fix) — silent-failure counter for chat_rag_bridge.
+#
+# Incremented every time an ``except Exception`` block inside
+# ``ext.services.chat_rag_bridge`` swallows an error to keep the pipeline
+# alive. The label is the failing stage (``intent``, ``retrieve_qdrant``,
+# ``rbac_lookup``, ``context_expand``, ``mmr_rerank``, ``budget_count``,
+# ``cite_render``, ``metric_emit``, ``progress_emit``, ``catalog_render``,
+# ``datetime_preamble``, ``kb_config_lookup``, ``kb_rag_config_load``,
+# ``date_doc_lookup``, ``log_rag_query``, ``qu_cache_init``,
+# ``qdrant_preflight``, ``rag_pipeline``, ``session_gauge`` etc).
+#
+# Pair this metric with the existing ``log.warning`` lines: a sudden ramp
+# on a single stage label tells operators which silent-fall-through is
+# masking real production failures. Default behavior of every existing
+# except block is preserved (no re-raise), this counter is purely
+# observational.
+# ---------------------------------------------------------------------------
+RAG_SILENT_FAILURE = Counter(
+    "rag_silent_failure_total",
+    "Silent (logged-only) failures in chat_rag_bridge that don't kill the pipeline",
+    labelnames=["stage"],
+)
