@@ -1214,25 +1214,20 @@ class VectorStore:
         shards in one call is a Qdrant constraint violation.
 
         Plan B Phase 5.1; Phase 5.9 added per-shard latency observation.
+        Plan B Phase 5 followup (2026-04-26): delegate to ``upsert`` so the
+        named-vector dispatch (sparse / colbert) and the schema-aware encoding
+        decisions live in one place. Previously this helper sent raw
+        ``vector=[...]`` which Qdrant rejects on named-vector collections
+        with "Wrong input: Not existing vector name error".
         """
-        structs = [
-            qm.PointStruct(
-                id=p["id"],
-                vector=p["vector"],
-                payload=p.get("payload", {}),
-            )
-            for p in points
-        ]
         # Plan B Phase 5.9 — observe per-shard upsert latency. Wrap in
         # try/finally so the histogram still records on exception.
         import time as _t
         from .metrics import RAG_SHARD_UPSERT_LATENCY
         _start = _t.monotonic()
         try:
-            await self._client.upsert(
-                collection_name=collection,
-                points=structs,
-                shard_key_selector=shard_key,
+            await self.upsert(
+                collection, points, shard_key_selector=shard_key,
             )
         finally:
             try:
