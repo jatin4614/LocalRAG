@@ -130,6 +130,21 @@ _COMPARISON_VERB_RE = re.compile(
 _LONG_QUERY_TOKEN_THRESHOLD = 25
 _MULTI_CLAUSE_TOKEN_THRESHOLD = 8
 
+# B12 — strong specific_date anchor phrasings. When a query has BOTH a
+# parseable date AND one of these anchors, route as specific_date even
+# if a global rule (e.g. global:summary_of) would otherwise match.
+# Caught in soak: "Summary of 4 February 2026 events" matched
+# global:summary_of and lost the date specificity. The anchors here are
+# narrow on purpose so they don't hijack month-only queries like
+# "Summary of January" (where extract_date_tuple returns None anyway,
+# so the short-circuit naturally falls through to global).
+_SPECIFIC_DATE_ANCHOR_RE = re.compile(
+    r"\b(summary|recap|report|update)\s+(of|from|for)\b|"
+    r"\bwhat\s+happened\s+on\b|"
+    r"\b(events?|activities|status|update)\s+(on|of|for)\s+\d",
+    re.IGNORECASE,
+)
+
 
 class EscalationReason(enum.Enum):
     """Why the hybrid router decided to escalate to the LLM (or didn't)."""
@@ -297,6 +312,19 @@ _METADATA_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
      re.compile(r"\bwhat\s+(files|reports|documents|docs)\s+do\s+(i|we|you)\s+have\b")),
     ("metadata:do_you_have",
      re.compile(r"\bdo\s+you\s+have\b")),
+    # B11 — "list all documents IN THE KB" / "in the corpus" is unambiguous
+    # catalog intent (the user wants the inventory). Only the explicit
+    # "in (the)? (kb|knowledge base|corpus|database)" qualifier promotes
+    # this to metadata; bare "list all reports" stays global per the
+    # existing aggregation contract (see global:list_all_every).
+    # Placed BEFORE metadata:enumerate_docs so the more-specific qualified
+    # form gets the unambiguous reason label.
+    ("metadata:list_in_kb",
+     re.compile(r"^(what|which|list|show)\s+(all\s+|every\s+|each\s+)?"
+                r"(the\s+)?(reports?|files?|documents?|docs?)\s+"
+                r"(in|from|inside|across|within)\s+(the\s+|your\s+|my\s+|our\s+)?"
+                r"(kb|knowledge\s+base|knowledge\s+sources?|corpus|database|"
+                r"data\s?store|library|collection|knowledge)\b")),
     # Bare enumeration: "list reports", "what files", "show docs", optionally
     # preceded by "the". Does NOT match "list all/every <docs>" — that form
     # is a global aggregation and routes to the doc-summary index (see the
@@ -438,6 +466,18 @@ def classify_with_reason(query: str) -> Tuple[Intent, str]:
     for reason, pat in _METADATA_PATTERNS:
         if pat.search(q):
             return "metadata", reason
+
+    # B12 — date-anchored short-circuit BEFORE global rules. When the
+    # query has a strong "summary/recap/report of <date>" phrasing AND
+    # a parseable date, the user wants that specific dated doc — not a
+    # cross-corpus aggregation. Without this, "Summary of 4 February
+    # 2026 events" was hijacked by global:summary_of.
+    if _SPECIFIC_DATE_ANCHOR_RE.search(q):
+        date_tuple = extract_date_tuple(query)
+        if date_tuple:
+            day, month, year = date_tuple
+            return "specific_date", f"specific_date:anchored={day} {month} {year}"
+
     for reason, pat in _GLOBAL_PATTERNS:
         if pat.search(q):
             return "global", reason
