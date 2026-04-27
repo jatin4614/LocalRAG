@@ -293,6 +293,35 @@ _METADATA_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
      re.compile(r"\bgive\s+me\s+the\s+list\b")),
     ("metadata:catalog_keyword",
      re.compile(r"\b(catalog|inventory)\b")),
+    # B5 — natural metadata phrasings the original list missed. Soak in
+    # production saw "What are total files available with you complete
+    # from when to when" hit the default fallback and get labelled
+    # "specific". These rules cover the families of phrasings that share
+    # the same intent (asking the catalog itself, not its contents).
+    ("metadata:total_files",
+     re.compile(r"\btotal\s+(files?|reports?|documents?|docs?)\b")),
+    ("metadata:date_range",
+     re.compile(r"\bfrom\s+when\s+to\s+when\b|"
+                r"\bwhat(?:'s|\s+is)?\s+the\s+date\s+range\b|"
+                r"\b(earliest|oldest)\s+to\s+(latest|newest|most\s+recent)\b|"
+                r"\bdate\s+range\s+(of|in|for)\b")),
+    ("metadata:complete_from_to",
+     re.compile(r"\bcomplete\s+from\b.*\bto\b|"
+                r"\b(available|covered|spanning)\s+from\b.*\bto\b")),
+    ("metadata:knowledge_sources",
+     re.compile(r"\b(your|the)\s+knowledge\s+(sources?|base)\b|"
+                r"\bwhat\s+(do|did)\s+you\s+have\s+on\s+file\b|"
+                r"\bwhat(?:'s|\s+is)?\s+in\s+(your|the)\s+corpus\b|"
+                r"\bwhat(?:'s|\s+is)?\s+in\s+(your|the)\s+knowledge\s+(base|sources?)\b")),
+    # NOTE: ``list all reports`` / ``list every <noun>`` belongs to the
+    # global aggregation bucket (it spans many docs), so this pattern is
+    # narrowly scoped to phrasings that explicitly invoke the assistant
+    # itself ("everything you know", "all you have", "show me everything").
+    ("metadata:show_everything",
+     re.compile(r"\b(list|show|tell\s+me)\s+(me\s+)?everything\b|"
+                r"\b(list|show|tell\s+me)\s+(me\s+)?all\s+you\s+(have|know)\b|"
+                r"\beverything\s+you\s+(have|know)\b|"
+                r"\ball\s+you\s+(have|know)\b")),
 ]
 
 # GLOBAL patterns match queries that want aggregation / coverage across
@@ -583,6 +612,109 @@ def _emit_shadow_log(
     _shadow_log.info(_json.dumps(payload, ensure_ascii=False))
 
 
+# --------------------------------------------------------------------------
+# B3 — shadow log file handler installer.
+#
+# The ``orgchat.qu_shadow`` logger only writes to stderr/docker logs by
+# default. Operators running ``scripts/analyze_shadow_log.py`` need a
+# persistent JSONL file. This helper attaches a RotatingFileHandler to
+# the shadow logger; FastAPI startup wires it in (see ``ext/app.py``)
+# only when ``RAG_QU_SHADOW_MODE=1`` (no point burning disk otherwise).
+#
+# Idempotent: safe to call repeatedly — duplicate handlers are skipped
+# by tagging the handler with a sentinel attribute.
+# --------------------------------------------------------------------------
+
+_SHADOW_LOG_HANDLER_SENTINEL = "_orgchat_qu_shadow_file_handler"
+_SHADOW_LOG_DEFAULT_PATH = "/var/log/orgchat/qu_shadow.jsonl"
+_SHADOW_LOG_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
+_SHADOW_LOG_BACKUP_COUNT = 5
+
+
+def install_shadow_log_file_handler(
+    *,
+    path: Optional[str] = None,
+    logger: Optional[logging.Logger] = None,
+) -> Optional[logging.Handler]:
+    """Attach a rotating JSONL file handler to the shadow-mode logger.
+
+    Returns the installed handler on success, or ``None`` when the
+    handler couldn't be installed (directory not writable, etc.). The
+    function is idempotent: a second call when a handler is already
+    attached is a no-op and returns the existing handler.
+
+    Best-effort: any failure (permissions, disk full, missing parent
+    directory we can't create) logs a warning and returns ``None`` so
+    startup never crashes on misconfigured log paths.
+    """
+    from logging.handlers import RotatingFileHandler
+    from pathlib import Path as _Path
+
+    target_logger = logger if logger is not None else _shadow_log
+
+    # Idempotency: if we already attached a handler, return it.
+    for existing in target_logger.handlers:
+        if getattr(existing, _SHADOW_LOG_HANDLER_SENTINEL, False):
+            return existing
+
+    log_path = _Path(
+        path
+        or os.environ.get("RAG_QU_SHADOW_LOG_PATH")
+        or _SHADOW_LOG_DEFAULT_PATH
+    )
+
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:  # noqa: BLE001
+        _logger_local = logging.getLogger(__name__)
+        _logger_local.warning(
+            "shadow log handler: could not create parent dir %s (%s) — "
+            "shadow JSONL will only go to stderr.",
+            log_path.parent, exc,
+        )
+        return None
+
+    try:
+        handler = RotatingFileHandler(
+            str(log_path),
+            maxBytes=_SHADOW_LOG_MAX_BYTES,
+            backupCount=_SHADOW_LOG_BACKUP_COUNT,
+            encoding="utf-8",
+        )
+    except Exception as exc:  # noqa: BLE001
+        _logger_local = logging.getLogger(__name__)
+        _logger_local.warning(
+            "shadow log handler: could not open %s (%s) — shadow JSONL "
+            "will only go to stderr.",
+            log_path, exc,
+        )
+        return None
+
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    handler.setLevel(logging.INFO)
+    setattr(handler, _SHADOW_LOG_HANDLER_SENTINEL, True)
+    target_logger.addHandler(handler)
+    # ``orgchat.qu_shadow`` is a child of root; without this propagate=True
+    # default we'd silently drop messages if root's level is WARNING.
+    if target_logger.level == logging.NOTSET or target_logger.level > logging.INFO:
+        target_logger.setLevel(logging.INFO)
+    return handler
+
+
+def maybe_install_shadow_log_file_handler(
+    *, path: Optional[str] = None,
+) -> Optional[logging.Handler]:
+    """Install the shadow file handler iff ``RAG_QU_SHADOW_MODE=1``.
+
+    Convenience wrapper used from FastAPI startup. Keeps the env-gate
+    in one place so callers don't have to duplicate the check, and so
+    tests can drive the gating without booting the whole app.
+    """
+    if os.environ.get("RAG_QU_SHADOW_MODE", "0") != "1":
+        return None
+    return install_shadow_log_file_handler(path=path)
+
+
 __all__ = [
     "Intent",
     "classify",
@@ -590,6 +722,8 @@ __all__ = [
     "classify_with_qu",
     "extract_date_tuple",
     "should_escalate_to_llm",
+    "install_shadow_log_file_handler",
+    "maybe_install_shadow_log_file_handler",
     "EscalationReason",
     "HybridClassification",
 ]
