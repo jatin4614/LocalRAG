@@ -32,6 +32,60 @@ from .celery_app import app
 log = logging.getLogger("orgchat.ingest_worker")
 
 
+async def _update_doc_status(
+    doc_id: int | str | None,
+    status: str,
+    *,
+    chunk_count: int | None = None,
+) -> None:
+    """Update ``kb_documents.ingest_status`` (and optionally chunk_count).
+
+    Best-effort, fire-and-forget: any DB error is logged + swallowed so a
+    transient Postgres blip never causes the task itself to fail. Skips when
+    doc_id is missing (private chat-scoped uploads have chat_id, not doc_id).
+    """
+    if doc_id is None:
+        return
+    db_url = os.environ.get("DATABASE_URL", "")
+    if not db_url:
+        return
+    if db_url.startswith("postgres://"):
+        db_url = db_url.replace("postgres://", "postgresql+asyncpg://", 1)
+    elif db_url.startswith("postgresql://") and "+asyncpg" not in db_url:
+        db_url = db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    try:
+        from sqlalchemy import text as _sql
+        from sqlalchemy.ext.asyncio import create_async_engine
+        engine = create_async_engine(db_url, pool_pre_ping=True)
+        try:
+            async with engine.begin() as conn:
+                if chunk_count is not None:
+                    await conn.execute(
+                        _sql(
+                            "UPDATE kb_documents "
+                            "SET ingest_status = :s, chunk_count = :c "
+                            "WHERE id = :i"
+                        ),
+                        {"s": status, "c": int(chunk_count), "i": int(doc_id)},
+                    )
+                else:
+                    await conn.execute(
+                        _sql(
+                            "UPDATE kb_documents SET ingest_status = :s "
+                            "WHERE id = :i"
+                        ),
+                        {"s": status, "i": int(doc_id)},
+                    )
+        finally:
+            await engine.dispose()
+    except Exception as e:  # noqa: BLE001 — best-effort
+        log.warning(
+            "ingest: failed to update kb_documents.ingest_status "
+            "doc_id=%s status=%s err=%s",
+            doc_id, status, e,
+        )
+
+
 def _blob_root() -> str:
     return os.environ.get("INGEST_BLOB_ROOT", "/var/ingest")
 
@@ -169,6 +223,10 @@ def ingest_blob(
                 # Exponential backoff: 1s, 2s, 4s
                 raise self.retry(exc=exc, countdown=2 ** self.request.retries)
             log.error("ingest: exhausted retries sha=%s err=%s", sha, exc)
+            try:
+                asyncio.run(_update_doc_status(_doc_id, "failed"))
+            except Exception:  # noqa: BLE001 — best-effort
+                pass
             raise Reject(reason=str(exc), requeue=False)
 
         # Success: best-effort blob cleanup (idempotent).
@@ -176,6 +234,14 @@ def ingest_blob(
             store.delete(sha)
         except Exception:  # noqa: BLE001 — cleanup is non-critical
             log.warning("ingest: blob cleanup failed sha=%s", sha)
+
+        # Plan B Phase 6.2 followup: transition kb_documents.ingest_status
+        # from 'queued' (set by upload route on async dispatch) to 'done'
+        # so the admin UI + cron sweepers see the correct lifecycle state.
+        try:
+            asyncio.run(_update_doc_status(_doc_id, "done", chunk_count=int(n)))
+        except Exception:  # noqa: BLE001 — best-effort
+            pass
 
         try:
             if _sp is not None:
