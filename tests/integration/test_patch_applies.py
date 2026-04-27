@@ -7,14 +7,21 @@ pytestmark = pytest.mark.integration
 ROOT = Path(__file__).resolve().parents[2]
 UPSTREAM = ROOT / "upstream"
 UPSTREAM_MAIN = UPSTREAM / "backend" / "open_webui" / "main.py"
+UPSTREAM_GIT = UPSTREAM / ".git"
 
 
 def _upstream_checked_out() -> bool:
-    """The ``upstream`` git submodule may be uncheckedout in some worktrees
-    (e.g. ``git worktree add`` doesn't recursively init submodules).
-    Skip these tests cleanly rather than failing CI on environment drift.
+    """Both the working tree AND the git metadata must be present.
+
+    B10 — the original check only looked at ``UPSTREAM_MAIN``. That is true
+    in some main-repo states even when the submodule was never initialised
+    (e.g. an old artifact tree without ``.git``), in which case
+    ``apply_patches.sh`` fails partway through with a confusing
+    ``checkout`` error rather than a clean skip. Requiring ``.git`` as
+    well makes the precondition match the spec ("upstream/ as a real
+    git submodule") and the script's actual requirements.
     """
-    return UPSTREAM_MAIN.exists()
+    return UPSTREAM_MAIN.exists() and UPSTREAM_GIT.exists()
 
 
 def _reset_upstream():

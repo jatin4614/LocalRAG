@@ -15,7 +15,40 @@ import subprocess
 import time
 import pytest
 
-pytestmark = pytest.mark.integration
+
+def _celery_reachable() -> bool:
+    """Probe the celery broker URL for reachability.
+
+    B10 — soak test needs a live celery worker AND the Redis broker.
+    Returns True only when both the env points somewhere AND the
+    broker URL responds. Connect failures are treated as "not live"
+    and the test skips with a clear reason instead of failing on the
+    first ``apply_async`` call.
+    """
+    try:
+        broker = os.environ.get("CELERY_BROKER_URL")
+        if not broker:
+            return False
+        # Cheap PING via redis-py (broker is redis://...). We don't import
+        # redis at module load to keep the import-time footprint minimal.
+        import redis  # type: ignore[import-untyped]
+        r = redis.from_url(broker, socket_connect_timeout=1.0)
+        r.ping()
+        return True
+    except Exception:
+        return False
+
+
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.skipif(
+        not _celery_reachable(),
+        reason=("celery broker unreachable (CELERY_BROKER_URL unset or "
+                "redis ping failed) — soak test needs a live celery "
+                "worker. Bring the compose stack up or export "
+                "CELERY_BROKER_URL=redis://localhost:6379/1."),
+    ),
+]
 
 
 def test_celery_soak_1000_docs():

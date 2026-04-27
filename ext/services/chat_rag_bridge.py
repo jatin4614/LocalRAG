@@ -1221,11 +1221,20 @@ async def _run_pipeline(
 
             async with _sessionmaker() as _s:
                 if whole_kb_ids:
+                    # B9 — only count successfully-ingested documents. A doc
+                    # in ``pending`` / ``failed`` status has zero retrievable
+                    # chunks; including it in "N documents available" misleads
+                    # the LLM (and the user) into believing those files are
+                    # already searchable. Live SELECT on every catalog
+                    # request — no caching layer between this query and the
+                    # database, so the count tracks Postgres truth.
                     res = await _s.execute(
                         _sql_text(
                             "SELECT kb_id, subtag_id, NULL::text AS subtag_name, filename "
                             "FROM kb_documents "
-                            "WHERE kb_id = ANY(:ids) AND deleted_at IS NULL "
+                            "WHERE kb_id = ANY(:ids) "
+                            "  AND deleted_at IS NULL "
+                            "  AND ingest_status = 'done' "
                             "ORDER BY uploaded_at DESC, filename"
                         ),
                         {"ids": whole_kb_ids},
@@ -1246,11 +1255,16 @@ async def _run_pipeline(
                         )
                         _params[f"k{_i}"] = _k
                         _params[f"s{_i}"] = _sids
+                    # B9 — same ``ingest_status='done'`` filter as the
+                    # whole-KB branch above; pending/failed docs would
+                    # otherwise pad the subtag-scoped catalog count.
                     _sql = (
                         "SELECT d.kb_id, d.subtag_id, t.name AS subtag_name, d.filename "
                         "FROM kb_documents d "
                         "JOIN kb_subtags t ON t.id = d.subtag_id "
-                        "WHERE d.deleted_at IS NULL AND (" + " OR ".join(_where_parts) + ") "
+                        "WHERE d.deleted_at IS NULL "
+                        "  AND d.ingest_status = 'done' "
+                        "  AND (" + " OR ".join(_where_parts) + ") "
                         "ORDER BY d.uploaded_at DESC, d.filename"
                     )
                     res = await _s.execute(_sql_text(_sql), _params)

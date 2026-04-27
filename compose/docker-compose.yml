@@ -368,6 +368,22 @@ services:
       RAG_FULL_CONTEXT: ${RAG_FULL_CONTEXT:-false}
       RAG_TOP_K: ${RAG_TOP_K:-5}
       RAG_TOP_K_RERANKER: ${RAG_TOP_K_RERANKER:-5}
+      # B1 — core retrieval flag passthrough. Without these, the chat
+      # process inherits Python module defaults from ext/services/* which
+      # have drifted from production reality (e.g. RAG_COLBERT default OFF
+      # while kb_1_v4 has the colbert named slot — new ingests would skip
+      # colbert vectors and the collection schema would split over time).
+      # Defaults below match the live Plan A / Plan B configuration:
+      #   RAG_HYBRID=1            BM25 + dense fusion (eval winner)
+      #   RAG_COLBERT=1           late-interaction rerank (kb_1_v4 has slot)
+      #   RAG_RERANK=1            BAAI/bge-reranker-v2-m3 on GPU 1
+      #   RAG_MMR=0               intent-conditional via _INTENT_FLAG_POLICY
+      #   RAG_CONTEXT_EXPAND=0    intent-conditional (same)
+      RAG_HYBRID: ${RAG_HYBRID:-1}
+      RAG_COLBERT: ${RAG_COLBERT:-1}
+      RAG_RERANK: ${RAG_RERANK:-1}
+      RAG_MMR: ${RAG_MMR:-0}
+      RAG_CONTEXT_EXPAND: ${RAG_CONTEXT_EXPAND:-0}
       CHUNK_SIZE: ${CHUNK_SIZE:-800}
       CHUNK_OVERLAP: ${CHUNK_OVERLAP:-100}
       RAG_FILE_MAX_SIZE: ${RAG_FILE_MAX_SIZE:-26214400}
@@ -481,6 +497,15 @@ services:
       RAG_EMBEDDING_OPENAI_API_BASE_URL: ${RAG_EMBEDDING_OPENAI_API_BASE_URL:-http://tei:80/v1}
       # Plan B Phase 5 — async ingest target may be custom-sharded.
       RAG_SHARDING_ENABLED: ${RAG_SHARDING_ENABLED:-0}
+      # B1 — retrieval flags must reach the celery ingest worker so new
+      # uploads write the same vector slots that retrieval expects. Without
+      # RAG_COLBERT=1 here the worker skips colbert vectors even though
+      # kb_1_v4 has the named slot, producing mixed-schema points.
+      # RAG_RERANK is included for parity (worker doesn't rerank, but
+      # other ingest helpers may peek at it).
+      RAG_HYBRID: ${RAG_HYBRID:-1}
+      RAG_COLBERT: ${RAG_COLBERT:-1}
+      RAG_RERANK: ${RAG_RERANK:-1}
     volumes:
       - ingest_blobs:/var/ingest
     command:
