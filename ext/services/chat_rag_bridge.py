@@ -18,6 +18,27 @@ from .obs import span
 
 logger = logging.getLogger("orgchat.rag_bridge")
 
+# B6 (audit fix) — central helper so every silent-fall-through site looks
+# the same: emit a WARNING (operators care), increment a stage-labelled
+# counter (Prometheus alerts), and never re-raise (preserves the existing
+# pipeline behavior — see CLAUDE.md "fail-open everywhere" §3 invariant).
+# Wrapped in its own try/except because metrics import or label cardinality
+# must never be the reason retrieval breaks.
+def _record_silent_failure(stage: str, err: BaseException) -> None:
+    """Log + count one swallowed exception. Never raises."""
+    try:
+        logger.warning("rag: %s failed (%s): %r", stage, type(err).__name__, err)
+    except Exception:
+        pass
+    try:
+        from .metrics import RAG_SILENT_FAILURE
+
+        RAG_SILENT_FAILURE.labels(stage=stage).inc()
+    except Exception:
+        # Counter import / label / inc must not propagate — that would
+        # defeat the point of the helper.
+        pass
+
 # -----------------------------------------------------------------------
 # Phase 4 — intent classification for structured query logging.
 #
@@ -178,7 +199,10 @@ def _get_qu_cache():
         _qu_cache_singleton = QUCache(redis_client=client)
         return _qu_cache_singleton
     except Exception as e:
+        # B6: keep the existing operator-facing warning AND emit the silent-
+        # failure counter so QU-cache outages can be alerted on.
         logger.warning("QU cache init failed: %s — running without cache", e)
+        _record_silent_failure("qu_cache_init", e)
         return None
 
 
@@ -347,8 +371,11 @@ def _log_rag_query(
             "total_ms": int(total_ms),
         }
         logger.info(_json.dumps(payload, separators=(",", ":")))
-    except Exception:
-        pass
+    except Exception as _err:
+        # B6: telemetry side-effect — must not fail the pipeline. Surface
+        # the swallow via warning + counter so a broken json.dumps shape
+        # (new field, weird type) is investigable.
+        _record_silent_failure("log_rag_query", _err)
 
 # P0.5 — history-aware query rewrite (flag-gated OFF by default).
 # When RAG_DISABLE_REWRITE=1 (default), behavior is byte-identical to pre-P0.5.
@@ -411,7 +438,10 @@ async def get_kb_config_for_chat(chat_id: str, user_id: str) -> Optional[list]:
                 meta = row[0] if isinstance(row[0], dict) else json.loads(row[0])
                 return meta.get("kb_config")
     except Exception as e:
-        logger.debug("kb_config lookup failed: %s", e)
+        # B6: bumped from debug → warning + counter. A failing chat-meta
+        # lookup means the user gets ZERO KB scoping — silent in prod
+        # before this fix.
+        _record_silent_failure("kb_config_lookup", e)
     return None
 
 
@@ -458,7 +488,10 @@ async def _load_kb_rag_configs(
                     out.append(cfg)
         return out
     except Exception as e:
-        logger.debug("kb_rag_config load failed: %s", e)
+        # B6: per-KB rag_config drives MMR / hybrid / context-expand
+        # toggles. A silent failure here reverts every KB to process
+        # defaults — important to alert on, hence warning + counter.
+        _record_silent_failure("kb_rag_config_load", e)
         return []
 
 
@@ -511,7 +544,10 @@ async def _lookup_doc_ids_by_date(
             )).all()
         return [int(r[0]) for r in rows]
     except Exception as e:
-        logger.debug("_lookup_doc_ids_by_date failed: %s", e)
+        # B6: a swallowed DB error here demotes specific_date intent to
+        # generic specific (per the caller's fall-through). Operators
+        # need to know — bumped to warning + counter.
+        _record_silent_failure("date_doc_lookup", e)
         return []
 
 
@@ -522,9 +558,11 @@ async def _emit(cb: Optional[Callable[[dict], Awaitable[None]]], event: dict) ->
         return
     try:
         await cb(event)
-    except Exception:
+    except Exception as _err:
         # Fail open — the caller disconnected or the consumer is broken.
-        pass
+        # B6: still surface via warning + counter; a steady stream of
+        # progress_emit failures means SSE is broken upstream.
+        _record_silent_failure("progress_emit", _err)
 
 
 async def retrieve_kb_sources(
@@ -568,8 +606,11 @@ async def retrieve_kb_sources(
         from .metrics import active_sessions
         active_sessions.inc()
         _session_inc = True
-    except Exception:
-        pass
+    except Exception as _err:
+        # B6: gauge inc failed — usually a prometheus_client missing
+        # entirely. Logging once per session is acceptable, dashboards
+        # rely on the counter to tell us this is happening.
+        _record_silent_failure("session_gauge_inc", _err)
     try:
         return await _retrieve_kb_sources_inner(
             kb_config=kb_config,
@@ -583,8 +624,8 @@ async def retrieve_kb_sources(
         if _session_inc:
             try:
                 active_sessions.dec()  # type: ignore[attr-defined]
-            except Exception:
-                pass
+            except Exception as _err:
+                _record_silent_failure("session_gauge_dec", _err)
 
 
 async def _retrieve_kb_sources_inner(
@@ -638,11 +679,36 @@ async def _retrieve_kb_sources_inner(
         # this so the cache contract is identical across surfaces. The
         # helper itself is the source of truth for the cache namespace
         # / TTL / fail-open semantics — see ``rbac.resolved_allowed_kb_ids``.
+        #
+        # B4 — wrap the RBAC lookup in an OTel span so Jaeger can show
+        # the per-user cache vs DB latency split (the helper itself emits
+        # no spans). Tag user_id (string), kb-config size, and the
+        # resolved allowed-KB count for correlation.
         from .rbac import resolved_allowed_kb_ids
-        async with _sessionmaker() as s:
-            allowed = await resolved_allowed_kb_ids(
-                s, user_id=user_id, redis=_redis_client(),
-            )
+        with span(
+            "rag.rbac_check",
+            user_id=str(user_id),
+            requested_kb_count=len(kb_config or []),
+        ) as _rbac_sp:
+            try:
+                async with _sessionmaker() as s:
+                    allowed = await resolved_allowed_kb_ids(
+                        s, user_id=user_id, redis=_redis_client(),
+                    )
+                try:
+                    _rbac_sp.set_attribute("allowed_kb_count", len(allowed))
+                except Exception:
+                    pass
+            except Exception as _rbac_exc:
+                # Re-raise so the existing outer error path (or caller)
+                # surfaces the issue. The span context manager records
+                # the exception + sets ERROR status automatically.
+                if _rbac_sp is not None:
+                    try:
+                        _rbac_sp.record_exception(_rbac_exc)
+                    except Exception:
+                        pass
+                raise
         selected_kbs = [cfg for cfg in kb_config if cfg.get("kb_id") in allowed]
         if not selected_kbs and not chat_id:
             return []
@@ -710,10 +776,35 @@ async def _run_pipeline(
     # relative time have been resolved against history (better dense recall),
     # but keep the original ``query`` for response framing — the user's
     # exact phrasing belongs in the answer's preamble.
+    #
+    # B4 — wrap the hybrid classifier so Jaeger can correlate intent
+    # source (regex vs LLM vs cached), confidence, and any escalation
+    # reason with the rest of the pipeline. Failures inside QU still
+    # soft-fall to regex (handled inside ``_classify_with_qu``); the
+    # span just attributes the chosen result.
     _last_turn_id = _extract_last_turn_id(history)
-    _hybrid = await _classify_with_qu(
-        query=query, history=history, last_turn_id=_last_turn_id,
-    )
+    with span(
+        "rag.intent_classify",
+        query_len=len(query or ""),
+        history_turns=len(history or []),
+    ) as _intent_sp:
+        _hybrid = await _classify_with_qu(
+            query=query, history=history, last_turn_id=_last_turn_id,
+        )
+        try:
+            _intent_sp.set_attribute("intent", str(_hybrid.intent))
+            _intent_sp.set_attribute("source", str(_hybrid.source))
+            _intent_sp.set_attribute("confidence", float(_hybrid.confidence or 0.0))
+            _intent_sp.set_attribute("cached", bool(getattr(_hybrid, "cached", False)))
+            _esc = getattr(_hybrid, "escalation_reason", None)
+            if _esc is not None:
+                _intent_sp.set_attribute(
+                    "escalation_reason",
+                    getattr(_esc, "value", None) or str(_esc),
+                )
+        except Exception:
+            # Span attribute set failures are never fatal — continue.
+            pass
     _intent_label = _hybrid.intent
     _retrieval_query = (
         _hybrid.resolved_query
@@ -744,6 +835,7 @@ async def _run_pipeline(
             # with full context (collection name, filter shape) rather
             # than the opaque preflight failure.
             logger.warning("rag: qdrant preflight raised %s; continuing", _hc_exc)
+            _record_silent_failure("qdrant_preflight", _hc_exc)
 
     # Tier 2 — intent routing (gated by RAG_INTENT_ROUTING, default OFF).
     # When OFF, _intent/_intent_reason are fixed values and every branch
@@ -787,8 +879,9 @@ async def _run_pipeline(
         flag_state.labels(flag="spotlight").set(
             1 if flags.get("RAG_SPOTLIGHT", "0") == "1" else 0
         )
-    except Exception:
+    except Exception as _err:
         _hybrid_flag = True  # best-effort for hit-counter label below
+        _record_silent_failure("flag_state_emit", _err)
 
     _pipeline_start = time.perf_counter()
 
@@ -807,7 +900,20 @@ async def _run_pipeline(
                 str(c.get("kb_id")) for c in (selected_kbs or [])
                 if c.get("kb_id") is not None
             )
-            with time_stage("retrieve"), span(
+            # B4 — outer ``rag.retrieve`` span covers routing decisions,
+            # date-doc lookup, level-filter selection, AND the actual
+            # Qdrant fan-out (the latter remains a nested ``retrieve.parallel``
+            # for compatibility with existing dashboards). Sharding mode is
+            # tagged via the level filter (doc/chunk/all) and per-KB top-k
+            # is recorded so operators can correlate with hit counts.
+            _rag_retrieve_span_cm = span(
+                "rag.retrieve",
+                kb_ids=_kb_ids_csv,
+                n_kbs=len(selected_kbs or []),
+                top_k=int(flags.get("RAG_RERANK_TOP_K") or 0) or 10,
+                intent=str(_intent),
+            )
+            with time_stage("retrieve"), _rag_retrieve_span_cm as _rag_retrieve_sp, span(
                 "retrieve.parallel",
                 n_kbs=len(selected_kbs or []),
                 kb_ids=_kb_ids_csv,
@@ -928,6 +1034,21 @@ async def _run_pipeline(
                             doc_ids=_date_doc_ids,
                         )
                 _retrieve_ms = int((time.perf_counter() - _tR) * 1000)
+                # B4 — tag the rag.retrieve span with the post-retrieval
+                # numbers so Jaeger shows hits + latency + sharding mode
+                # without needing to descend into retrieve.parallel.
+                # ``_level_filter`` only exists in the non-metadata branch;
+                # default to "skipped" otherwise so the attribute is always
+                # set (Jaeger filters on missing-attr are awkward).
+                try:
+                    _rag_retrieve_sp.set_attribute("hits", len(raw_hits))
+                    _rag_retrieve_sp.set_attribute("latency_ms", _retrieve_ms)
+                    _shard_mode = locals().get("_level_filter") or (
+                        "skipped" if _intent == "metadata" else "all"
+                    )
+                    _rag_retrieve_sp.set_attribute("sharding_mode", _shard_mode)
+                except Exception:
+                    pass
                 # The embed+retrieve bookend: once Qdrant returns we can
                 # emit the "embed done" and "retrieve done" events
                 # together since the bridge can't time-slice retrieve's
@@ -951,8 +1072,8 @@ async def _run_pipeline(
                     if _kb is None:
                         _kb = "chat" if _payload.get("chat_id") is not None else "unknown"
                     retrieval_hits_total.labels(kb=str(_kb), path=_path).inc()
-            except Exception:
-                pass
+            except Exception as _err:
+                _record_silent_failure("hit_counter_emit", _err)
 
             # P1.2 — dispatch through rerank_with_flag. Default (RAG_RERANK unset/0)
             # calls ``rerank`` which is byte-identical to the previous behaviour.
@@ -1016,8 +1137,11 @@ async def _run_pipeline(
                         "ms": int((time.perf_counter() - _tM) * 1000),
                         "top_k": len(reranked),
                     })
-                except Exception:
+                except Exception as _err:
                     # Fail open: on any MMR error, stick with reranker output.
+                    # B6: still surface via warning + counter so a broken
+                    # MMR (bad lambda, embedder issue) is alertable.
+                    _record_silent_failure("mmr_rerank", _err)
                     await _emit(progress_cb, {
                         "stage": "mmr", "status": "error",
                     })
@@ -1055,8 +1179,11 @@ async def _run_pipeline(
                         "ms": int((time.perf_counter() - _tE) * 1000),
                         "siblings_fetched": max(0, len(reranked) - _before),
                     })
-                except Exception:
+                except Exception as _err:
                     # Fail open: on any error, keep reranker/MMR output unchanged.
+                    # B6: log + count so a broken context_expand (Qdrant
+                    # scroll error, sibling-fetch failure) is visible.
+                    _record_silent_failure("context_expand", _err)
                     await _emit(progress_cb, {
                         "stage": "expand", "status": "error",
                     })
@@ -1067,9 +1194,26 @@ async def _run_pipeline(
 
             await _emit(progress_cb, {"stage": "budget", "status": "running"})
             _tB = time.perf_counter()
-            with time_stage("budget"):
+            # B4 — pipeline-level rag.budget span (the inner budget.truncate
+            # span lives inside budget_chunks). Tags chunks_in / chunks_kept
+            # so a sudden drop in kept-ratio is visible without parsing
+            # the inner span tree.
+            with span(
+                "rag.budget",
+                max_tokens=5000,
+                chunks_in=len(reranked),
+            ) as _budget_sp, time_stage("budget"):
                 # main-WIP bumped from 4000→5000 before upgrade; preserved here.
                 budgeted = budget_chunks(reranked, max_tokens=5000)
+                try:
+                    _budget_sp.set_attribute("chunks_kept", len(budgeted))
+                    _kept_total_tokens = sum(
+                        len(str(h.payload.get("text", ""))) // 4
+                        for h in budgeted
+                    )
+                    _budget_sp.set_attribute("total_tokens_est", _kept_total_tokens)
+                except Exception:
+                    pass
             await _emit(progress_cb, {
                 "stage": "budget", "status": "done",
                 "ms": int((time.perf_counter() - _tB) * 1000),
@@ -1077,6 +1221,10 @@ async def _run_pipeline(
             })
     except Exception as e:
         logger.exception("KB retrieval failed: %s", e)
+        # B6: stage="rag_pipeline" — the outer "any failure inside the
+        # retrieve+rerank+budget try-block" catch. Counter ramp here is
+        # the loudest signal of a regression.
+        _record_silent_failure("rag_pipeline", e)
         await _emit(progress_cb, {"stage": "error", "message": str(e)})
         return []
 
@@ -1099,6 +1247,34 @@ async def _run_pipeline(
             total_ms=_total_ms_empty,
         )
         return []
+
+    # B4 — open the ``rag.context_inject`` span manually (not a ``with``
+    # statement) so the existing early-return paths below stay intact.
+    # The span is closed in the ``finally`` at function end. ``chunks_in``
+    # is the post-budget hit count; ``chunks_in_prompt`` + a rough
+    # ``prompt_tokens`` estimate are tagged when the span closes.
+    _ctx_inject_span_cm = span(
+        "rag.context_inject",
+        chunks_in=len(budgeted),
+        intent=str(_intent),
+    )
+    _ctx_inject_sp = _ctx_inject_span_cm.__enter__()
+    _ctx_inject_open = True
+
+    def _close_ctx_inject_span(prompt_tokens: int = 0, chunks_in_prompt: int = 0) -> None:
+        nonlocal _ctx_inject_open
+        if not _ctx_inject_open:
+            return
+        try:
+            _ctx_inject_sp.set_attribute("chunks_in_prompt", int(chunks_in_prompt))
+            _ctx_inject_sp.set_attribute("prompt_tokens", int(prompt_tokens))
+        except Exception:
+            pass
+        try:
+            _ctx_inject_span_cm.__exit__(None, None, None)
+        except Exception:
+            pass
+        _ctx_inject_open = False
 
     # Collect doc_ids whose payload lacks a filename so we can back-fill from the DB.
     missing_doc_ids: set[int] = set()
@@ -1349,7 +1525,9 @@ async def _run_pipeline(
                 })
     except Exception as _e:
         # Fail-open: catalog is nice-to-have, not a correctness requirement.
-        logger.debug("kb catalog preamble skipped: %s", _e)
+        # B6: bumped from debug to warning + counter so a broken catalog
+        # (e.g. SQL schema drift, missing kb_subtags table) is alertable.
+        _record_silent_failure("catalog_render", _e)
 
     # --- Current-datetime preamble ---------------------------------------
     # Chat models have a training cutoff and cannot answer "what's today's
@@ -1392,7 +1570,10 @@ async def _run_pipeline(
                 }],
             })
         except Exception as _e:
-            logger.debug("datetime preamble skipped: %s", _e)
+            # B6: bumped from debug → warning + counter so a broken
+            # datetime preamble (zoneinfo missing, formatting error) is
+            # alertable in production.
+            _record_silent_failure("datetime_preamble", _e)
 
     # Emit a "hits" event before "done" so the UI can render citation
     # previews as soon as the backend has them, without waiting for the
@@ -1410,8 +1591,10 @@ async def _run_pipeline(
             "stage": "hits", "hits": _hit_summary,
             "intent": _intent, "intent_reason": _intent_reason,
         })
-    except Exception:
-        pass
+    except Exception as _err:
+        # B6: any failure building the hit-summary SSE event is logged so
+        # we can spot regressions in the metadata shape.
+        _record_silent_failure("hits_emit", _err)
 
     _total_ms_done = int((time.perf_counter() - _pipeline_start) * 1000)
     await _emit(progress_cb, {
@@ -1419,6 +1602,20 @@ async def _run_pipeline(
         "total_ms": _total_ms_done,
         "sources": len(sources_out),
     })
+    # B4 — close ``rag.context_inject`` with prompt-shape tags. Estimate
+    # tokens at 4 chars/token (matches the Plan A budget heuristic) so
+    # we never have to call the tokenizer again here.
+    _ctx_inject_total_chars = 0
+    for _src in sources_out:
+        for _doc in _src.get("document") or []:
+            try:
+                _ctx_inject_total_chars += len(_doc)
+            except Exception:
+                pass
+    _close_ctx_inject_span(
+        prompt_tokens=_ctx_inject_total_chars // 4,
+        chunks_in_prompt=len(sources_out),
+    )
     # Phase 4 — structured per-query log. Single JSON line so Loki /
     # friends can pivot on ``intent`` without having to parse a
     # human-formatted message. Best-effort: any logging error is
