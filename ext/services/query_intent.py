@@ -141,12 +141,19 @@ class EscalationReason(enum.Enum):
     LONG_QUERY = "long_query"
     NO_ENTITY = "no_entity_question"
     COMPARISON_VERB = "comparison_verb"
+    # Plan B Phase 4 followup: regex landed on its default-fallback rule
+    # (no specific pattern matched). The "specific" label is therefore a
+    # low-confidence guess, not an actual regex hit, so we always defer
+    # to the LLM here. Caught: "What are total files / from when to when"
+    # got labeled specific by default; LLM correctly said metadata.
+    REGEX_DEFAULT_FALLBACK = "regex_default_fallback"
 
 
 def should_escalate_to_llm(
     query: str,
     regex_label: str,
     history: list[dict] | None,
+    regex_reason: str = "",
 ) -> Tuple[bool, EscalationReason]:
     """Decide whether the hybrid router should consult the QU LLM.
 
@@ -155,11 +162,20 @@ def should_escalate_to_llm(
     ``global``, ``specific_date``) are trusted as-is. Predicates fire in
     fixed order so the same input always picks the same reason; that
     determinism is required by shadow-mode A/B logging.
+
+    ``regex_reason`` (Plan B Phase 4 followup) carries the regex rule
+    label. When it equals ``"default:no_pattern_matched"`` the regex
+    "specific" label was a fallback — we always escalate.
     """
     if regex_label != "specific":
         return False, EscalationReason.NONE
     if not query:
         return False, EscalationReason.NONE
+
+    # 0. Regex hit the default-fallback rule — its label is a low-confidence
+    #    guess, not a real pattern match. Always defer to the LLM.
+    if regex_reason == "default:no_pattern_matched":
+        return True, EscalationReason.REGEX_DEFAULT_FALLBACK
 
     history = history or []
     tokens = query.split()
@@ -496,7 +512,9 @@ async def classify_with_qu(
             pass
         return result
 
-    escalate, reason = should_escalate_to_llm(query, regex_label, history)
+    escalate, reason = should_escalate_to_llm(
+        query, regex_label, history, regex_reason=regex_reason,
+    )
     result.escalation_reason = reason
 
     # In shadow mode, invoke the LLM on EVERY query. In normal mode, only
@@ -524,8 +542,37 @@ async def classify_with_qu(
             qu=qu,
             escalation=reason,
         )
+        # Plan B Phase 4 followup: shadow mode still defers to the LLM
+        # when the regex was a default-fallback (low confidence) AND the
+        # LLM is confident enough to disagree decisively. Without this,
+        # high-confidence intent corrections (e.g. metadata queries that
+        # the regex labels "specific" by default) are silently discarded
+        # for the entire 7-day shadow window. Confidence threshold 0.80
+        # matches the LLM's typical disagreement floor.
+        regex_was_fallback = regex_reason == "default:no_pattern_matched"
+        if (
+            qu is not None
+            and regex_was_fallback
+            and qu.intent != regex_label
+            and qu.confidence >= 0.80
+        ):
+            try:
+                rag_qu_invocations.labels(source="llm").inc()
+            except Exception:
+                pass
+            return HybridClassification(
+                intent=qu.intent,
+                resolved_query=qu.resolved_query,
+                temporal_constraint=qu.temporal_constraint,
+                entities=qu.entities,
+                confidence=qu.confidence,
+                source="llm",
+                escalation_reason=reason,
+                regex_reason=regex_reason,
+                cached=qu.cached,
+            )
         # Shadow mode: production routing stays regex-only regardless of
-        # the LLM's verdict.
+        # the LLM's verdict (except the fallback override above).
         try:
             rag_qu_invocations.labels(source="regex").inc()
         except Exception:

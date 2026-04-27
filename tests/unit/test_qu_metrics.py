@@ -43,12 +43,16 @@ async def test_escalation_counter_incremented_on_escalation(monkeypatch):
 
     monkeypatch.setattr(qi, "_invoke_qu", fake_invoke)
 
+    # Plan B Phase 4 followup: the regex-default-fallback predicate fires
+    # before comparison_verb when regex hits its default rule (which it
+    # does for short queries with no specific pattern). Both routes
+    # increment the same family of counters; we just label the reason.
     before = _counter_value(
-        "rag_qu_escalations_total", {"reason": "comparison_verb"}
+        "rag_qu_escalations_total", {"reason": "regex_default_fallback"}
     )
     await qi.classify_with_qu("compare budgets", history=[])
     after = _counter_value(
-        "rag_qu_escalations_total", {"reason": "comparison_verb"}
+        "rag_qu_escalations_total", {"reason": "regex_default_fallback"}
     )
     assert after - before == 1.0
 

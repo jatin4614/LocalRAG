@@ -14,12 +14,16 @@ async def test_shadow_mode_logs_both_paths(monkeypatch, caplog):
     monkeypatch.setenv("RAG_QU_SHADOW_MODE", "1")
 
     async def fake_invoke(*a, **kw):
+        # Confidence below the fallback-override threshold (0.80) so shadow
+        # mode behaves as the original Phase 4.8 design: production stays
+        # regex even when LLM disagrees. The override carve-out is tested
+        # separately in test_shadow_mode_overrides_regex_when_fallback_low_confidence.
         return QueryUnderstanding(
             intent="global",
             resolved_query="what changed in 2026-Q1",
             temporal_constraint={"year": 2026, "quarter": 1, "month": None},
             entities=[],
-            confidence=0.91,
+            confidence=0.70,
         )
 
     monkeypatch.setattr(qi, "_invoke_qu", fake_invoke)
@@ -27,7 +31,7 @@ async def test_shadow_mode_logs_both_paths(monkeypatch, caplog):
     caplog.set_level("INFO", logger="orgchat.qu_shadow")
     result = await qi.classify_with_qu("what changed last quarter", history=[])
 
-    # Production routing is still regex-only in shadow mode
+    # Production routing is still regex-only in shadow mode (LLM under threshold)
     assert result.source == "regex"
     assert result.intent == "specific"
 
