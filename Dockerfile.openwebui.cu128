@@ -84,6 +84,16 @@ RUN uv pip install --system --no-cache-dir \
     'opentelemetry-instrumentation-logging>=0.48b0' \
     'python-json-logger>=2.0'
 
+# Plan B post-merge soak fix: pre-download tiktoken encoding so the offline
+# stack never tries to fetch openaipublic.blob.core.windows.net at runtime.
+# Caused real production breakage (chat_rag_bridge._run_pipeline crashed
+# during token-budget step → no RAG context injected → LLM answered with
+# generic template). Also pre-cache o200k_base in case ever needed.
+ENV TIKTOKEN_CACHE_DIR=/opt/tiktoken-cache
+RUN mkdir -p /opt/tiktoken-cache && \
+    python -c "import tiktoken; tiktoken.get_encoding('cl100k_base'); tiktoken.get_encoding('o200k_base')" && \
+    ls -la /opt/tiktoken-cache/
+
 # Frontend build output
 COPY --from=build /app/build /app/build
 COPY --from=build /app/CHANGELOG.md /app/CHANGELOG.md
