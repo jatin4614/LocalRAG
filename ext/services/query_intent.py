@@ -416,6 +416,28 @@ _GLOBAL_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("global:highlights_of",
      re.compile(r"\b(highlights?|key|main|major)\s+"
                 r"(points?|topics?|themes?|events?|findings?)?\s*(of|in|from|for)\b")),
+    # 2026-04-29 — operator feedback: queries like "Give a complete Table of
+    # activity starting from Jan till December…" were defaulting to
+    # ``specific`` and pulling top-12 chunks (biased to whichever months
+    # had more visit-mentioning text), missing Q4 entirely. The three
+    # patterns below surface the corpus-wide intent so retrieval pulls
+    # level=doc summaries (one per document, capped at RAG_GLOBAL_FINAL_K)
+    # and every month is represented.
+    ("global:complete_table_or_chronology",
+     re.compile(r"\b(complete|full|entire|whole)\s+"
+                r"(table|chronology|timeline|log|list|record|breakdown|"
+                r"account|history|picture|story|view)\b")),
+    ("global:month_to_month_range",
+     re.compile(r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|"
+                r"jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|"
+                r"oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s*"
+                r"(?:to|till|through|until|thru|-|–|—|/)\s*"
+                r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|"
+                r"jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|"
+                r"oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b")),
+    ("global:throughout_period",
+     re.compile(r"\bthroughout\s+(the\s+)?(year|month|quarter|period|"
+                r"reporting\s+period|2\d{3})\b")),
 ]
 
 
