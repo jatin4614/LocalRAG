@@ -845,12 +845,36 @@ async def _run_pipeline(
     #   * global    → retrieve only level="doc" summary points; skip
     #                 rerank/MMR/expand (summaries are self-contained).
     #   * specific  → unchanged pipeline.
+    #
+    # Phase 1.2 fix — when the QU LLM produced a high-confidence intent
+    # (``_hybrid.source == "llm"`` and ``confidence >= RAG_QU_INTENT_MIN_CONF``),
+    # use it instead of regex. The LLM sees pronouns, multi-clause queries,
+    # and "in May, July, December, and February 2023"-style phrasings that
+    # the regex's first-match-wins table can't model. Falls back to regex
+    # on QU failure (``_hybrid.source != "llm"`` covers timeout/error/cache).
     _intent: str = "specific"
     _intent_reason: str = "default"
+    _qu_min_conf = float(flags.get("RAG_QU_INTENT_MIN_CONF") or "0.80")
     if flags.get("RAG_INTENT_ROUTING", "0") == "1":
         from .query_intent import classify_with_reason as _ci_classify
-        _intent, _intent_reason = _ci_classify(query)
-        logger.info("rag: intent=%s reason=%s", _intent, _intent_reason)
+        _regex_intent, _regex_reason = _ci_classify(query)
+        if (
+            _hybrid is not None
+            and _hybrid.source == "llm"
+            and _hybrid.intent in ("metadata", "global", "specific", "specific_date")
+            and float(_hybrid.confidence or 0.0) >= _qu_min_conf
+        ):
+            _intent = _hybrid.intent
+            _intent_reason = (
+                f"llm:conf={_hybrid.confidence:.2f}"
+                f"|regex_was={_regex_intent}:{_regex_reason}"
+            )
+        else:
+            _intent, _intent_reason = _regex_intent, _regex_reason
+        logger.info(
+            "rag: intent=%s reason=%s source=%s",
+            _intent, _intent_reason, _hybrid.source if _hybrid else "regex",
+        )
 
     # Retrieve using our pipeline
     from .retriever import retrieve
@@ -999,6 +1023,27 @@ async def _run_pipeline(
                         _per_kb, _total = 30, 60
                     else:
                         _per_kb, _total = 10, 30
+                    # Phase 2.3 — multi-temporal scaling. When the QU LLM
+                    # extracted N>1 distinct months/quarters/years (so the
+                    # query's candidate pool is N monthly shards, not one),
+                    # bump the per_kb/total budget so each shard contributes
+                    # ~10-12 chunks. Without this, top-30 across 4 shards
+                    # gives ~7 hits/shard — and the LLM "no activities for
+                    # February 2023" failure mode resurfaces.
+                    if _hybrid is not None and _hybrid.source == "llm":
+                        _tc = _hybrid.temporal_constraint
+                        if _tc:
+                            from .retriever import _shard_keys_for_constraint
+                            _n_shards = len(_shard_keys_for_constraint(_tc))
+                            if _n_shards > 1:
+                                _per_kb = max(_per_kb, 12 * _n_shards)
+                                _total = max(_total, 12 * _n_shards * max(
+                                    1, len(selected_kbs or []),
+                                ))
+                                logger.info(
+                                    "rag: multi-temporal boost per_kb=%d total=%d shards=%d",
+                                    _per_kb, _total, _n_shards,
+                                )
                     # For global intent we silence HyDE AND the hybrid
                     # sparse arm. HyDE's hypothetical answers look like
                     # chunk content; BM25 inherently ranks term-rich
@@ -1013,6 +1058,21 @@ async def _run_pipeline(
                         {"RAG_HYDE": "0", "RAG_HYDE_N": "0", "RAG_HYBRID": "0"}
                         if _intent == "global"
                         else {}
+                    )
+                    # Phase 2.2 — pass the QU LLM's temporal_constraint to
+                    # the retriever. It expands ``months``/``years`` into
+                    # the matching shard_keys via _shard_keys_for_constraint
+                    # and adds a Qdrant ``shard_key`` MatchAny filter on
+                    # custom-sharded collections (kb_*_v* with monthly
+                    # buckets). Multi-month queries ("May, Jul, Dec, Feb
+                    # 2023") thus restrict the candidate pool to those 4
+                    # shards, dramatically improving recall versus a flat
+                    # top-30 over 8000+ chunks. Falls back to None when
+                    # QU returned regex (no temporal_constraint).
+                    _temporal_constraint = (
+                        _hybrid.temporal_constraint
+                        if (_hybrid is not None and _hybrid.source == "llm")
+                        else None
                     )
                     with span("embed.query", path="query"), flags.with_overrides(_retrieve_overrides):
                         # ``retrieve`` internally calls embedder.embed() — the
@@ -1032,6 +1092,7 @@ async def _run_pipeline(
                             owner_user_id=user_id,
                             level_filter=_level_filter,
                             doc_ids=_date_doc_ids,
+                            temporal_constraint=_temporal_constraint,
                         )
                 _retrieve_ms = int((time.perf_counter() - _tR) * 1000)
                 # B4 — tag the rag.retrieve span with the post-retrieval
@@ -1075,6 +1136,93 @@ async def _run_pipeline(
             except Exception as _err:
                 _record_silent_failure("hit_counter_emit", _err)
 
+            # 2026-04-29 — Global drill-down (Option A): doc summaries
+            # are ~80-token narrative paraphrases ("frequent visits by
+            # senior officers including X, Y…") that mention visits
+            # exist but lack date-level detail (e.g. "27 Jan: Maj Gen
+            # Wajid Aziz, 5 POK Bde, 5-day farewell"). For corpus-wide
+            # queries (intent=global) we pull one level=doc summary per
+            # doc above; here we fan out to per-doc chunk retrieval and
+            # merge so the LLM sees BOTH the per-doc summary AND the
+            # granular event chunks. Per-doc cap (RAG_GLOBAL_DRILLDOWN_K)
+            # prevents one high-similarity doc from crowding out others.
+            # Disabled (default) for non-global intents — no behavior
+            # change there. Fail-open: drill-down failure leaves the
+            # summary-only stream intact.
+            if (
+                _intent == "global"
+                and raw_hits
+                and flags.get("RAG_GLOBAL_DRILLDOWN", "1") == "1"
+            ):
+                _drilldown_k = int(flags.get("RAG_GLOBAL_DRILLDOWN_K", "2") or "0")
+                _doc_ids_for_drilldown = sorted({
+                    int(_h.payload["doc_id"])
+                    for _h in raw_hits
+                    if _h.payload.get("doc_id") is not None
+                    and _h.payload.get("level") == "doc"
+                })
+                if _doc_ids_for_drilldown and _drilldown_k > 0:
+                    _drilldown_total = _drilldown_k * len(_doc_ids_for_drilldown)
+                    await _emit(progress_cb, {
+                        "stage": "drilldown", "status": "running",
+                        "n_docs": len(_doc_ids_for_drilldown),
+                        "per_doc_k": _drilldown_k,
+                    })
+                    _tD = time.perf_counter()
+                    try:
+                        with span(
+                            "retrieve.global_drilldown",
+                            n_docs=len(_doc_ids_for_drilldown),
+                            per_doc_k=_drilldown_k,
+                        ), flags.with_overrides({
+                            "RAG_HYDE": "0", "RAG_HYDE_N": "0",
+                        }):
+                            _drilldown_hits = await retrieve(
+                                query=_retrieval_query,
+                                selected_kbs=selected_kbs,
+                                chat_id=chat_id,
+                                vector_store=_vector_store,
+                                embedder=_embedder,
+                                per_kb_limit=_drilldown_total,
+                                total_limit=_drilldown_total,
+                                owner_user_id=user_id,
+                                level_filter="chunk",
+                                doc_ids=_doc_ids_for_drilldown,
+                                temporal_constraint=_temporal_constraint,
+                            )
+                        _per_doc_count: dict[int, int] = {}
+                        _kept_drilldown: list = []
+                        for _h in _drilldown_hits:
+                            _did = _h.payload.get("doc_id")
+                            if _did is None:
+                                continue
+                            _did = int(_did)
+                            if _per_doc_count.get(_did, 0) >= _drilldown_k:
+                                continue
+                            _per_doc_count[_did] = _per_doc_count.get(_did, 0) + 1
+                            _kept_drilldown.append(_h)
+                        raw_hits = list(raw_hits) + _kept_drilldown
+                        logger.info(
+                            "rag.global_drilldown: docs=%d k=%d retrieved=%d kept=%d total_hits=%d ms=%d",
+                            len(_doc_ids_for_drilldown),
+                            _drilldown_k,
+                            len(_drilldown_hits),
+                            len(_kept_drilldown),
+                            len(raw_hits),
+                            int((time.perf_counter() - _tD) * 1000),
+                        )
+                        await _emit(progress_cb, {
+                            "stage": "drilldown", "status": "done",
+                            "ms": int((time.perf_counter() - _tD) * 1000),
+                            "added_chunks": len(_kept_drilldown),
+                            "total_hits": len(raw_hits),
+                        })
+                    except Exception as _err:
+                        _record_silent_failure("global_drilldown", _err)
+                        await _emit(progress_cb, {
+                            "stage": "drilldown", "status": "error",
+                        })
+
             # P1.2 — dispatch through rerank_with_flag. Default (RAG_RERANK unset/0)
             # calls ``rerank`` which is byte-identical to the previous behaviour.
             #
@@ -1082,7 +1230,30 @@ async def _run_pipeline(
             # for more candidates than the final budget so MMR actually has room
             # to diversify. When MMR is off, the old top-10 behaviour is preserved
             # byte-identically. An operator may override via ``RAG_RERANK_TOP_K``.
-            _final_k = 10
+            _final_k = 12
+            # For global "summarize all" intent we pull doc-level summaries (one
+            # point per document, level=doc); 10 was clipping multi-doc KBs to
+            # only 10 of N summaries even though the retrieve already returned
+            # all of them. Each summary is ~600 chars so 50 fits comfortably
+            # under the context budget. Scales down naturally for tiny KBs
+            # (min(50, raw_hits)) and up for medium ones; caps at 50 to keep
+            # the prompt tractable. Operator can still override via
+            # RAG_GLOBAL_FINAL_K.
+            if _intent == "global":
+                _global_cap = int(flags.get("RAG_GLOBAL_FINAL_K") or 50)
+                _final_k = max(_final_k, min(_global_cap, len(raw_hits) or _final_k))
+            # Phase 2.3 — keep at least N×8 final hits for multi-temporal
+            # queries so each requested month survives reranker truncation.
+            # For 4-month query (months: [2,5,7,12]) this is 32 hits — well
+            # under the 5000-token context budget but enough to give the LLM
+            # 6-8 evidence chunks per month.
+            if _hybrid is not None and _hybrid.source == "llm":
+                _tc_for_k = _hybrid.temporal_constraint
+                if _tc_for_k:
+                    from .retriever import _shard_keys_for_constraint
+                    _n_shards_k = len(_shard_keys_for_constraint(_tc_for_k))
+                    if _n_shards_k > 1:
+                        _final_k = max(_final_k, 8 * _n_shards_k)
             _rerank_top_k_env = flags.get("RAG_RERANK_TOP_K")
             _mmr_on = flags.get("RAG_MMR", "0") == "1" and not (_intent == "global")
             if _rerank_top_k_env is not None:
@@ -1198,13 +1369,22 @@ async def _run_pipeline(
             # span lives inside budget_chunks). Tags chunks_in / chunks_kept
             # so a sudden drop in kept-ratio is visible without parsing
             # the inner span tree.
+            # 2026-04-29 — Global drill-down (Option A): 12 doc summaries
+            # + ~24 drill-down chunks easily exceeds the 10K specific-intent
+            # budget. Use a wider cap for global intent only; specific /
+            # metadata / specific_date stay at 10K. Caller may override via
+            # RAG_BUDGET_TOKENS / RAG_GLOBAL_BUDGET_TOKENS env vars.
+            _budget_max = (
+                int(flags.get("RAG_GLOBAL_BUDGET_TOKENS", "22000") or "22000")
+                if _intent == "global"
+                else int(flags.get("RAG_BUDGET_TOKENS", "10000") or "10000")
+            )
             with span(
                 "rag.budget",
-                max_tokens=5000,
+                max_tokens=_budget_max,
                 chunks_in=len(reranked),
             ) as _budget_sp, time_stage("budget"):
-                # main-WIP bumped from 4000→5000 before upgrade; preserved here.
-                budgeted = budget_chunks(reranked, max_tokens=5000)
+                budgeted = budget_chunks(reranked, max_tokens=_budget_max)
                 try:
                     _budget_sp.set_attribute("chunks_kept", len(budgeted))
                     _kept_total_tokens = sum(
