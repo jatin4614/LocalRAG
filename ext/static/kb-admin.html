@@ -438,7 +438,10 @@ function _modalKey(e) {
 async function loadKBs() {
   const target = document.getElementById('kb-list');
   try {
-    const kbs = await api('/api/kb');
+    const resp = await api('/api/kb');
+    // H2: backend now returns paginated {items, total_count}. Tolerate both
+    // shapes so an older deployed backend (returning a bare list) still works.
+    const kbs = Array.isArray(resp) ? resp : (resp && resp.items) || [];
     clear(target);
     if (!kbs.length) { target.appendChild(el('p', { cls: 'sub', text: 'No KBs yet.' })); return; }
     const table = el('table');
@@ -619,8 +622,9 @@ async function deleteSubtag(id) {
 async function loadDocs() {
   const list = document.getElementById('doc-list');
   try {
-    const docs = await api(`/api/kb/${curKB}/documents`);
-    _docs = docs || [];
+    const resp = await api(`/api/kb/${curKB}/documents`);
+    // H2: paginated {items, total_count} from the backend; tolerate legacy list.
+    _docs = Array.isArray(resp) ? resp : (resp && resp.items) || [];
     _selectedDocs = new Set();
     _renderDocs();
   } catch (e) {
