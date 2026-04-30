@@ -19,6 +19,13 @@ input:focus,select:focus,textarea:focus,button:focus-visible{outline:2px solid #
 .btn-gray{background:#3d3d5c;color:#cbd5e1}.btn-gray:hover{background:#4d4d6c}
 .btn-sm{padding:4px 10px;font-size:0.78rem}
 .tag{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:6px;font-size:0.78rem;background:#1e3a5f;color:#93c5fd;margin:2px}
+.tag.editing{background:#1e293b}
+.tag-edit-input{background:transparent;border:none;color:#93c5fd;font-size:0.78rem;padding:0;width:auto;min-width:60px}
+.tag-edit-input:focus{outline:none}
+.bulk-bar{display:flex;align-items:center;gap:8px;padding:8px 10px;background:#1e293b;border-radius:8px;margin-bottom:8px}
+.bulk-bar select{max-width:200px}
+.doc-row label.row-check{display:inline-flex;align-items:center;margin-right:8px;cursor:pointer}
+.doc-row label.row-check input{width:auto;margin:0}
 .search-select{position:relative}
 .search-select-list{position:absolute;left:0;right:0;top:100%;background:#1a1b2e;border:1px solid #3d3d5c;border-top:none;border-radius:0 0 8px 8px;max-height:240px;overflow-y:auto;z-index:50}
 .search-select-list .item{padding:6px 12px;cursor:pointer;border-bottom:1px solid #2d2d50;font-size:0.85rem}
@@ -133,6 +140,12 @@ th{color:#64748b;font-size:0.75rem;text-transform:uppercase;font-weight:600}
       <!-- Documents per subtag -->
       <div class="mb-3">
         <h2>Documents</h2>
+        <div id="doc-bulk-bar" class="hidden bulk-bar">
+          <span class="sub" id="bulk-count">0 selected</span>
+          <select id="bulk-target-subtag" aria-label="Move to subtag"></select>
+          <button onclick="bulkMoveDocs()" class="btn btn-blue btn-sm" aria-label="Move selected documents">Move</button>
+          <button onclick="clearDocSelection()" class="btn btn-gray btn-sm" aria-label="Clear selection">Clear</button>
+        </div>
         <div id="doc-list"><p class="sub">Select a subtag or upload files below.</p></div>
       </div>
 
@@ -221,6 +234,9 @@ let curKB = null;
 let fileQueue = [];
 let _users = [];   // M3 — populated by loadUsers, consumed by grant search
 let _groups = [];  // M3 — populated by loadGroups, consumed by grant search
+let _subtags = []; // M6 — populated by loadSubtags, consumed by bulk-move dropdown
+let _docs = [];    // M6 — populated by loadDocs, consumed by bulk-move + ingest stream
+let _selectedDocs = new Set(); // M6 — multi-select doc ids
 
 // L1 — Toast stack with 5s TTL and a × close button. Replaces the
 // previous global single-element toast that flashed for 3s with no
@@ -491,15 +507,27 @@ async function selectKB(id,name) {
 async function loadSubtags() {
   const listEl = document.getElementById('subtag-list');
   const targetSel = document.getElementById('upload-subtag');
+  const bulkSel = document.getElementById('bulk-target-subtag');
   try {
     const s = await api(`/api/kb/${curKB}/subtags`);
-    clear(listEl); clear(targetSel);
-    if (!s.length) {
+    _subtags = s || [];
+    clear(listEl); clear(targetSel); clear(bulkSel);
+    if (!_subtags.length) {
       listEl.appendChild(el('p', { cls: 'sub', text: 'No subtags.' }));
     } else {
-      for (const x of s) {
+      for (const x of _subtags) {
         const tag = el('span', { cls: 'tag' });
-        tag.appendChild(document.createTextNode((x.name || '') + ' '));
+        // M6 — click name (or Enter on the focused span) to rename inline.
+        const labelSpan = el('span', {
+          text: x.name || '',
+          attrs: { tabindex: '0', 'aria-label': `Subtag ${x.name || ''} — press Enter to rename` },
+        });
+        labelSpan.style.cursor = 'pointer';
+        labelSpan.addEventListener('click', () => beginRenameSubtag(tag, labelSpan, x));
+        labelSpan.addEventListener('keydown', (ev) => {
+          if (ev.key === 'Enter') { ev.preventDefault(); beginRenameSubtag(tag, labelSpan, x); }
+        });
+        tag.appendChild(labelSpan);
         const rm = el('span', {
           text: '×',
           attrs: { role: 'button', tabindex: '0', 'aria-label': `Delete subtag ${x.name || ''}` },
@@ -514,10 +542,52 @@ async function loadSubtags() {
         listEl.appendChild(tag);
       }
     }
-    for (const x of s) {
+    for (const x of _subtags) {
       targetSel.appendChild(el('option', { text: x.name || '', attrs: { value: String(x.id) } }));
+      bulkSel.appendChild(el('option', { text: x.name || '', attrs: { value: String(x.id) } }));
     }
   }catch(e){toast(e.message,false);}
+}
+
+// M6 — inline rename. Click a subtag tag → input replaces label;
+// Enter saves, Esc cancels. TODO: depends on agent C exposing
+// PATCH /api/kb/{kb_id}/subtags/{subtag_id} with body {"name": "..."}.
+function beginRenameSubtag(tagEl, labelEl, sub) {
+  if (tagEl.classList.contains('editing')) return;
+  tagEl.classList.add('editing');
+  const input = el('input', {
+    cls: 'tag-edit-input',
+    attrs: { 'aria-label': `Rename subtag ${sub.name || ''}`, type: 'text' },
+  });
+  input.value = sub.name || '';
+  tagEl.replaceChild(input, labelEl);
+  input.focus();
+  input.select();
+  const cancel = () => {
+    tagEl.classList.remove('editing');
+    if (input.parentNode) tagEl.replaceChild(labelEl, input);
+  };
+  const commit = async () => {
+    const newName = (input.value || '').trim();
+    if (!newName || newName === sub.name) { cancel(); return; }
+    try {
+      // TODO: depends on agent C's PATCH /api/kb/{kb_id}/subtags/{subtag_id}
+      await api(`/api/kb/${curKB}/subtags/${sub.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ name: newName }),
+      });
+      toast('Subtag renamed');
+      loadSubtags();
+    } catch (e) {
+      toast(e.message, false);
+      cancel();
+    }
+  };
+  input.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') { ev.preventDefault(); commit(); }
+    else if (ev.key === 'Escape') { ev.preventDefault(); cancel(); }
+  });
+  input.addEventListener('blur', cancel);
 }
 async function createSubtag() {
   const n=document.getElementById('subtag-name').value.trim(); if(!n) return;
@@ -530,34 +600,99 @@ async function deleteSubtag(id) {
   try{await api(`/api/kb/${curKB}/subtags/${id}`,{method:'DELETE'}); toast('Deleted'); loadSubtags();}catch(e){toast(e.message,false);}
 }
 
-// Documents
+// Documents — refactored for M6 (bulk select + bulk move) and to
+// support per-row in-place updates (used by H13 SSE ingest stream).
 async function loadDocs() {
-  const target = document.getElementById('doc-list');
+  const list = document.getElementById('doc-list');
   try {
     const docs = await api(`/api/kb/${curKB}/documents`);
-    clear(target);
-    if (!docs || !docs.length) { target.appendChild(el('p', { cls: 'sub', text: 'No documents uploaded yet.' })); return; }
-    for (const d of docs) {
-      const row = el('div', { cls: 'doc-row' });
-      const info = el('div');
-      info.appendChild(el('strong', { text: d.filename || '' }));
-      info.appendChild(el('span', { cls: 'sub', text: ` ${d.mime_type || ''} · ${d.chunk_count ?? 0} chunks · ${d.ingest_status || ''}` }));
-      row.appendChild(info);
-      // H1 — re-embed button hidden; backend route returns 501.
-      const actions = el('div', { cls: 'flex gap-2' });
-      actions.appendChild(el('button', {
-        text: 'Del',
-        cls: 'btn btn-red',
-        attrs: { 'aria-label': `Delete document ${d.filename || ''}` },
-        on: { click: () => deleteDoc(d.id) },
-      }));
-      row.appendChild(actions);
-      target.appendChild(row);
-    }
-  }catch(e){
-    clear(target);
-    target.appendChild(el('p', { cls: 'sub', text: 'Could not load documents.' }));
+    _docs = docs || [];
+    _selectedDocs = new Set();
+    _renderDocs();
+  } catch (e) {
+    clear(list);
+    list.appendChild(el('p', { cls: 'sub', text: 'Could not load documents.' }));
   }
+}
+
+function _renderDocs() {
+  const list = document.getElementById('doc-list');
+  clear(list);
+  if (!_docs.length) {
+    list.appendChild(el('p', { cls: 'sub', text: 'No documents uploaded yet.' }));
+    _refreshBulkBar();
+    return;
+  }
+  for (const d of _docs) list.appendChild(_renderDocRow(d));
+  _refreshBulkBar();
+}
+
+function _renderDocRow(d) {
+  const row = el('div', { cls: 'doc-row', attrs: { 'data-doc-id': String(d.id) } });
+  // M6 — multi-select checkbox.
+  const checkLabel = el('label', { cls: 'row-check', attrs: { 'aria-label': `Select ${d.filename || ''}` } });
+  const cb = el('input', { attrs: { type: 'checkbox' } });
+  cb.checked = _selectedDocs.has(d.id);
+  cb.addEventListener('change', () => {
+    if (cb.checked) _selectedDocs.add(d.id); else _selectedDocs.delete(d.id);
+    _refreshBulkBar();
+  });
+  checkLabel.appendChild(cb);
+
+  const info = el('div');
+  const top = el('div');
+  top.appendChild(checkLabel);
+  top.appendChild(el('strong', { text: d.filename || '' }));
+  top.appendChild(el('span', {
+    cls: 'sub',
+    text: ` ${d.mime_type || ''} · ${d.chunk_count ?? 0} chunks · ${d.ingest_status || ''}`,
+  }));
+  info.appendChild(top);
+  row.appendChild(info);
+
+  // H1 — re-embed button hidden; backend route returns 501.
+  const actions = el('div', { cls: 'flex gap-2' });
+  actions.appendChild(el('button', {
+    text: 'Del',
+    cls: 'btn btn-red',
+    attrs: { 'aria-label': `Delete document ${d.filename || ''}` },
+    on: { click: () => deleteDoc(d.id) },
+  }));
+  row.appendChild(actions);
+  return row;
+}
+
+function _refreshBulkBar() {
+  const bar = document.getElementById('doc-bulk-bar');
+  const count = document.getElementById('bulk-count');
+  if (!bar || !count) return;
+  if (!_selectedDocs.size) { bar.classList.add('hidden'); return; }
+  bar.classList.remove('hidden');
+  count.textContent = `${_selectedDocs.size} selected`;
+}
+
+function clearDocSelection() {
+  _selectedDocs = new Set();
+  _renderDocs();
+}
+
+// M6 — bulk move. TODO: depends on agent C exposing
+// POST /api/kb/{kb_id}/subtags/{subtag_id}/move-docs
+// with body {"doc_ids": [...]}.
+async function bulkMoveDocs() {
+  if (!_selectedDocs.size) { toast('Select at least one document', 'warn'); return; }
+  const sub = document.getElementById('bulk-target-subtag').value;
+  if (!sub) { toast('Select a target subtag', 'warn'); return; }
+  const ids = Array.from(_selectedDocs);
+  try {
+    await api(`/api/kb/${curKB}/subtags/${sub}/move-docs`, {
+      method: 'POST',
+      body: JSON.stringify({ doc_ids: ids }),
+    });
+    toast(`Moved ${ids.length} document(s)`);
+    _selectedDocs = new Set();
+    loadDocs();
+  } catch (e) { toast(e.message, false); }
 }
 async function deleteDoc(id) {
   if(!confirm('Delete document and its vectors?')) return;
