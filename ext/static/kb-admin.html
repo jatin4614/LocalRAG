@@ -45,6 +45,10 @@ th{color:#64748b;font-size:0.75rem;text-transform:uppercase;font-weight:600}
 .modal h3{font-size:1.05rem;font-weight:600;margin-bottom:8px}
 .modal p{color:#cbd5e1;margin-bottom:14px;white-space:pre-wrap;font-size:0.9rem;line-height:1.45}
 .modal .actions{display:flex;justify-content:flex-end;gap:8px}
+.conn-dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#94a3b8;margin-right:6px;vertical-align:middle;transition:background 0.2s}
+.conn-dot.ok{background:#22c55e;box-shadow:0 0 6px #22c55e}
+.conn-dot.degraded{background:#fbbf24;box-shadow:0 0 6px #fbbf24}
+.conn-dot.down{background:#dc2626;box-shadow:0 0 6px #dc2626}
 .doc-row{display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid #2d2d50}
 .doc-row:last-child{border:none}
 .file-drop{border:2px dashed #3d3d5c;border-radius:10px;padding:20px;text-align:center;cursor:pointer;transition:0.2s}
@@ -78,7 +82,10 @@ th{color:#64748b;font-size:0.75rem;text-transform:uppercase;font-weight:600}
       <h1 id="page-title">Knowledge Base Management</h1>
       <p class="sub">Create KBs, manage documents, control access</p>
     </div>
-    <a href="/" class="btn btn-gray" aria-label="Back to chat">Back to Chat</a>
+    <div class="flex items-center gap-2">
+      <span id="conn-indicator" title="Backend connectivity" aria-live="polite"><span class="conn-dot" id="conn-dot"></span><span class="sub" id="conn-label">connecting…</span></span>
+      <a href="/" class="btn btn-gray" aria-label="Back to chat">Back to Chat</a>
+    </div>
   </div>
 
   <!-- Create KB -->
@@ -230,13 +237,84 @@ function toast(message, ok, opts) {
   timer = setTimeout(remove, ttl);
   return ++_toastSeq;
 }
-async function api(p, o={}) {
-  const h = {'Authorization':`Bearer ${T}`,'Content-Type':'application/json',...(o.headers||{})};
-  if (o.body instanceof FormData) delete h['Content-Type'];
-  const r = await fetch(p, {...o, headers:h});
-  if (!r.ok) { const e=await r.text(); throw new Error(e); }
-  if (r.status===204) return null;
-  return r.json();
+// M4 — Connection-status indicator. 'ok' on any 2xx response,
+// 'degraded' on retry-recovered errors, 'down' on hard failures.
+function setConn(status, label) {
+  const dot = document.getElementById('conn-dot');
+  const lbl = document.getElementById('conn-label');
+  if (!dot || !lbl) return;
+  dot.classList.remove('ok','degraded','down');
+  if (status) dot.classList.add(status);
+  lbl.textContent = label || '';
+}
+
+// M4 — Categorized error messages. Friendly text; the original raw
+// e.message is still surfaced inside the toast so an admin can debug
+// — but the leading line tells them whether to retry, log in, etc.
+function categorizeError(err, status) {
+  if (err && err.name === 'AbortError') {
+    return { kind: 'network', msg: 'Network timeout — backend unreachable.' };
+  }
+  if (status === 0 || status === undefined || (err && /failed to fetch|networkerror/i.test(err.message || ''))) {
+    return { kind: 'network', msg: 'Cannot reach backend. Check your connection.' };
+  }
+  if (status === 401) return { kind: '4xx', msg: 'Session expired — please log in again.' };
+  if (status === 403) return { kind: '4xx', msg: 'Forbidden (admin role required).' };
+  if (status === 404) return { kind: '4xx', msg: 'Not found.' };
+  if (status >= 400 && status < 500) return { kind: '4xx', msg: `Request rejected (${status}).` };
+  if (status === 502 || status === 503 || status === 504) {
+    return { kind: '5xx', msg: 'Backend overloaded or unavailable. Try again shortly.' };
+  }
+  if (status >= 500) return { kind: '5xx', msg: `Server error (${status}).` };
+  return { kind: 'other', msg: err && err.message ? err.message : 'Unknown error' };
+}
+
+// M4 — fetch wrapper with one retry on 502/503/504/network/timeout
+// and connection-indicator updates. Throws an Error with .status
+// and .category set for upstream error-rendering.
+async function api(path, opts) {
+  opts = opts || {};
+  const isForm = opts.body instanceof FormData;
+  const headers = Object.assign(
+    { 'Authorization': `Bearer ${T}` },
+    isForm ? {} : { 'Content-Type': 'application/json' },
+    opts.headers || {},
+  );
+  const controller = new AbortController();
+  const timeoutMs = opts.timeoutMs || 20000;
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const _fire = async () => fetch(path, Object.assign({}, opts, { headers, signal: controller.signal }));
+  let response, lastErr;
+  try { response = await _fire(); } catch (e) { lastErr = e; }
+  const transient = (st) => st === 502 || st === 503 || st === 504;
+  if (!response || transient(response.status)) {
+    // Single retry after 2s.
+    if (!(lastErr && lastErr.name === 'AbortError' && opts.signal && opts.signal.aborted)) {
+      setConn('degraded', 'retrying…');
+      await new Promise(r => setTimeout(r, 2000));
+      try { response = await _fire(); } catch (e) { lastErr = e; }
+    }
+  }
+  clearTimeout(timer);
+  if (!response) {
+    setConn('down', 'offline');
+    const cat = categorizeError(lastErr, 0);
+    const err = new Error(cat.msg + (lastErr && lastErr.message ? ` [${lastErr.message}]` : ''));
+    err.status = 0; err.category = cat.kind;
+    throw err;
+  }
+  if (!response.ok) {
+    let body = '';
+    try { body = await response.text(); } catch (_) {}
+    setConn(response.status >= 500 ? 'down' : 'ok', response.status >= 500 ? 'backend errors' : 'connected');
+    const cat = categorizeError(null, response.status);
+    const err = new Error(cat.msg + (body ? ` — ${body.slice(0, 240)}` : ''));
+    err.status = response.status; err.category = cat.kind;
+    throw err;
+  }
+  setConn('ok', 'connected');
+  if (response.status === 204) return null;
+  return response.json();
 }
 
 // ---- C1 — Safe DOM helpers. All untrusted server-controlled content
@@ -708,6 +786,7 @@ function _renderLoggedOut() {
 if (!T) {
   _renderLoggedOut();
 } else {
+  setConn('degraded', 'connecting…');
   loadKBs();loadUsers();loadGroups();
 }
 </script>
