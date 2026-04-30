@@ -238,6 +238,7 @@ let _groups = [];  // M3 — populated by loadGroups, consumed by grant search
 let _subtags = []; // M6 — populated by loadSubtags, consumed by bulk-move dropdown
 let _docs = [];    // M6 — populated by loadDocs, consumed by bulk-move + ingest stream
 let _selectedDocs = new Set(); // M6 — multi-select doc ids
+let _ingestES = null;          // H13 — EventSource handle
 
 // L1 — Toast stack with 5s TTL and a × close button. Replaces the
 // previous global single-element toast that flashed for 3s with no
@@ -487,7 +488,16 @@ async function deleteKB(id) {
     + ' - Soft-delete all documents in this KB (rows kept for audit)\n\n'
     + 'This cannot be undone.';
   if(!confirm(msg)) return;
-  try{await api(`/api/kb/${id}`,{method:'DELETE'}); toast('Deleted'); if(curKB===id){document.getElementById('kb-detail').classList.add('hidden'); curKB=null;} loadKBs();}catch(e){toast(e.message,false);}
+  try {
+    await api(`/api/kb/${id}`, { method: 'DELETE' });
+    toast('Deleted');
+    if (curKB === id) {
+      document.getElementById('kb-detail').classList.add('hidden');
+      curKB = null;
+      _stopIngestStream();   // H13 — release the SSE handle
+    }
+    loadKBs();
+  } catch (e) { toast(e.message, false); }
 }
 async function selectKB(id,name) {
   curKB=id; document.getElementById('detail-kb-name').textContent=name;
@@ -501,7 +511,10 @@ async function selectKB(id,name) {
     document.getElementById('adv-toggle').setAttribute('aria-expanded', 'false');
     document.getElementById('adv-toggle-arrow').textContent = '▶';
   }
-  loadSubtags(); loadGrants(); loadDocs();
+  loadSubtags(); loadGrants();
+  // H13 — ensure docs load before subscribing so the SSE handler has a
+  // populated _docs to update in place.
+  loadDocs().then(_startIngestStream);
 }
 
 // Subtags
@@ -1044,6 +1057,74 @@ async function saveAdvanced() {
     status.className = 'error mt-2';
   }
 }
+
+// =============================================================
+// H13 — SSE ingest progress.
+// EventSource subscription to /api/kb/{id}/ingest-stream?token=…
+// Live-updates doc rows (status string + chunk_count) and surfaces
+// failures inline (cooperates with H10). Cleaned up on KB switch +
+// page unload. The SSE endpoint already exists in the backend
+// (ext/routers/ingest_stream.py); this commit consumes it.
+// =============================================================
+function _stopIngestStream() {
+  if (_ingestES) {
+    try { _ingestES.close(); } catch (_) {}
+    _ingestES = null;
+  }
+}
+
+function _startIngestStream() {
+  _stopIngestStream();
+  if (!curKB || !T) return;
+  // EventSource cannot send custom headers, so we pass the JWT in the
+  // query (admin-only endpoint, kept the surface small) — this matches
+  // the backend's ?token=… fallback at L70-75 of ingest_stream.py.
+  const url = `/api/kb/${curKB}/ingest-stream?token=${encodeURIComponent(T)}`;
+  let es;
+  try { es = new EventSource(url); } catch (_) { return; }
+  _ingestES = es;
+  es.addEventListener('ready', () => setConn('ok', 'connected'));
+  es.addEventListener('ingest', (ev) => {
+    let payload;
+    try { payload = JSON.parse(ev.data); } catch (_) { return; }
+    _onIngestEvent(payload);
+  });
+  es.addEventListener('error', () => {
+    // EventSource auto-reconnects; we surface the degraded state so
+    // an admin sees the dot flip amber instead of silently waiting.
+    setConn('degraded', 'reconnecting…');
+  });
+}
+
+function _onIngestEvent(p) {
+  if (!p || p.doc_id == null) return;
+  const idx = _docs.findIndex(d => d.id === p.doc_id);
+  if (idx >= 0) {
+    const cur = _docs[idx];
+    if (p.stage) cur.ingest_status = p.stage;
+    if (p.chunks != null) cur.chunk_count = p.chunks;
+    if (p.error) cur.error_message = p.error;   // H10 ↔ H13 cooperation
+    if (p.filename && !cur.filename) cur.filename = p.filename;
+    // Replace the matching row in place so we don't lose other rows'
+    // checkbox state.
+    const list = document.getElementById('doc-list');
+    const old = list.querySelector(`[data-doc-id="${p.doc_id}"]`);
+    const fresh = _renderDocRow(cur);
+    if (old && old.parentNode) old.parentNode.replaceChild(fresh, old);
+  } else {
+    // New doc the page hadn't yet seen — append.
+    _docs.push({
+      id: p.doc_id,
+      filename: p.filename || `doc ${p.doc_id}`,
+      ingest_status: p.stage || 'pending',
+      chunk_count: p.chunks || 0,
+      error_message: p.error || null,
+    });
+    _renderDocs();
+  }
+}
+
+window.addEventListener('beforeunload', _stopIngestStream);
 
 async function loadUsers() {
   const target = document.getElementById('users-list');
