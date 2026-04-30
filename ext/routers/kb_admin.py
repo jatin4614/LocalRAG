@@ -271,14 +271,19 @@ async def patch_rag_config(
         )
 
     # Coerce to the expected Python types; any key whose value fails
-    # coercion is silently dropped by validate_config, so we compare back
-    # to detect bad types and raise 400.
+    # coercion OR violates H5 bounds is silently dropped by
+    # validate_config, so we compare back to detect bad input and
+    # raise 400. The error message intentionally says "bad value (type
+    # or out of range)" since both reasons surface here — admins
+    # debugging a rejected key should check both.
     cleaned = validate_config(body)
-    bad_types = [k for k in body if k in VALID_KEYS and k not in cleaned]
-    if bad_types:
+    bad_keys = [k for k in body if k in VALID_KEYS and k not in cleaned]
+    if bad_keys:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
-            detail=f"bad value type for: {sorted(bad_types)}",
+            detail=(
+                f"bad value (type or out of range) for: {sorted(bad_keys)}"
+            ),
         )
 
     kb = await kb_service.get_kb(session, kb_id=kb_id)
