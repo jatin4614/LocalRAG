@@ -133,6 +133,9 @@ class KBAccess(Base):
     granted_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+    # Migration 015: optional soft-delete. NULL = live grant; non-NULL =
+    # revoked at that time. Service code may still hard-DELETE.
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
     kb: Mapped[KnowledgeBase] = relationship(back_populates="access")
 
