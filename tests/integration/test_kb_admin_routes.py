@@ -225,6 +225,26 @@ async def test_kb_create_integrity_error_returns_409(client, engine, monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_delete_kb_never_existed_returns_404(client):
+    """M10: deleting a never-existed KB → 404."""
+    r = await client.delete("/api/kb/99999", headers=ADMIN)
+    assert r.status_code == 404
+    assert "not found" in r.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_delete_kb_already_deleted_returns_410(client):
+    """M10: second delete on the same KB → 410 Gone (not 404)."""
+    r = await client.post("/api/kb", headers=ADMIN, json={"name": "Twice-Killed"})
+    kb_id = r.json()["id"]
+    r = await client.delete(f"/api/kb/{kb_id}", headers=ADMIN)
+    assert r.status_code == 204, r.text
+    r = await client.delete(f"/api/kb/{kb_id}", headers=ADMIN)
+    assert r.status_code == 410, r.text
+    assert "already deleted" in r.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
 async def test_subtag_create_duplicate_name_returns_409(client):
     """H8: duplicate subtag name within same KB → 409 sanitized."""
     r = await client.post("/api/kb", headers=ADMIN, json={"name": "S-KB"})

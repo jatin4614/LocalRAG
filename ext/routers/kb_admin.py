@@ -309,11 +309,32 @@ async def delete_kb(
     user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(_get_session),
 ) -> Response:
+    """M10: distinguish 'never existed' (404) from 'already deleted' (410).
+
+    ``soft_delete_kb`` returns False either when the row doesn't exist
+    OR when it was already soft-deleted (its WHERE clause requires
+    ``deleted_at IS NULL``). The previous handler conflated both into
+    404, hiding double-delete attempts behind a generic 'not found'.
+    Now we follow up the False return with a SELECT to disambiguate:
+
+      * row missing entirely         → 404 'kb not found'
+      * row exists with deleted_at   → 410 'kb already deleted'
+
+    Lets admin UIs render the right message ('was already removed',
+    'never existed') without an extra round-trip.
+    """
     ok = await kb_service.soft_delete_kb(session, kb_id=kb_id)
-    if not ok:
+    if ok:
+        await session.commit()
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    # Disambiguate: did the row never exist, or is it already deleted?
+    row = (await session.execute(
+        select(KnowledgeBase.deleted_at).where(KnowledgeBase.id == kb_id)
+    )).first()
+    if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="kb not found")
-    await session.commit()
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+    raise HTTPException(status.HTTP_410_GONE, detail="kb already deleted")
 
 
 # ---------------------------------------------------------------------------
