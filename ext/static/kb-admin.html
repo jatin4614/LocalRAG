@@ -200,10 +200,10 @@ async function loadDocs() {
     const docs = await api(`/api/kb/${curKB}/documents`);
     const el = document.getElementById('doc-list');
     if (!docs||!docs.length) { el.innerHTML='<p class="sub">No documents uploaded yet.</p>'; return; }
+    // H1 — re-embed button hidden; backend route returns 501.
     el.innerHTML = docs.map(d=>`<div class="doc-row">
       <div><strong>${d.filename}</strong> <span class="sub">${d.mime_type||''} &middot; ${d.chunk_count} chunks &middot; ${d.ingest_status}</span></div>
       <div class="flex gap-2">
-        <button onclick="reembed(${d.id})" class="btn btn-gray btn-sm">Re-embed</button>
         <button onclick="deleteDoc(${d.id})" class="btn btn-red">Del</button>
       </div>
     </div>`).join('');
