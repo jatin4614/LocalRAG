@@ -998,25 +998,68 @@ def _chunk_window(text, *, chunk_size_tokens=800, overlap_tokens=100):
 async def extract_images_as_chunks(
     *, pdf_bytes: bytes, filename: str,
 ) -> list[dict]:
-    """Plan B Phase 6.7 — emit image_caption chunks for embedded images.
+    """Plan B Phase 6.7 + page-render fallback — emit image_caption chunks.
 
-    Returns a list of chunk dicts. Returns [] (silent skip) if:
-      - RAG_IMAGE_CAPTIONS=0, or
-      - vision service unreachable, or
-      - no images extracted
+    Two-tier extraction:
+      1. ``_extract_pdf_images`` returns embedded raster images (PDFs that
+         actually carry photos / screenshots). Cheap and fast.
+      2. Page-render fallback — when the PDF's diagrams are vector-drawn
+         (network maps, flowcharts, org charts), pymupdf finds only the
+         tiny decorative shapes. ``_render_pdf_pages_as_images`` renders
+         each page to PNG at ``RAG_RENDER_PDF_DPI`` (default 200) and
+         captions the page-image. Triggered when tier 1 yields no images
+         of useful size (>= ``RAG_VISION_RASTER_MIN_BYTES``, default 5 KB).
+         Disable with ``RAG_RENDER_PDF_PAGES_FOR_VISION=0``.
+
+    Triple-gated soft-fail:
+      * RAG_IMAGE_CAPTIONS=0 (default) → never extract images at all
+      * Image extraction OR page-render fails → return [] + log
+      * Vision service unreachable → skip per-image + tick
+        ``rag_image_skip_total`` metric
     """
     if os.environ.get("RAG_IMAGE_CAPTIONS", "0") != "1":
         return []
+
+    # Tier 1 — embedded rasters.
     try:
         images = await _extract_pdf_images(pdf_bytes)
     except Exception as e:
         log.warning("image extraction failed for %s: %s", filename, e)
-        return []
-    if not images:
+        images = []
+
+    # Filter to "useful" images. Tiny decorative shapes (e.g. the 263-byte
+    # bullet glyphs in NFS.pdf) waste vision budget without conveying
+    # information — they trigger generic captions and pollute retrieval.
+    min_bytes = int(os.environ.get("RAG_VISION_RASTER_MIN_BYTES", "5000"))
+    useful = [
+        img for img in images
+        if len(img.get("image_bytes") or b"") >= min_bytes
+    ]
+
+    # Tier 2 — page-render fallback for vector-drawn PDFs.
+    if not useful and os.environ.get("RAG_RENDER_PDF_PAGES_FOR_VISION", "1") == "1":
+        try:
+            dpi = int(os.environ.get("RAG_RENDER_PDF_DPI", "200"))
+            max_pages = int(os.environ.get("RAG_RENDER_PDF_MAX_PAGES", "50"))
+            useful = await _render_pdf_pages_as_images(
+                pdf_bytes, dpi=dpi, max_pages=max_pages,
+            )
+            log.info(
+                "extract_images_as_chunks: %s — no embedded raster >= %d B; "
+                "page-render fallback produced %d page images at %d DPI",
+                filename, min_bytes, len(useful), dpi,
+            )
+        except Exception as e:
+            log.warning(
+                "page-render fallback failed for %s: %s", filename, e,
+            )
+            return []
+
+    if not useful:
         return []
 
     out: list[dict] = []
-    for img in images:
+    for img in useful:
         try:
             caption = await _caption_image(img["image_bytes"])
         except Exception as e:
@@ -1062,6 +1105,40 @@ async def _extract_pdf_images(pdf_bytes: bytes) -> list[dict]:
                     "image_bytes": base_img["image"],
                     "position": (img_idx,),
                 })
+    return out
+
+
+async def _render_pdf_pages_as_images(
+    pdf_bytes: bytes, *, dpi: int = 200, max_pages: int = 50,
+) -> list[dict]:
+    """Render each PDF page to a PNG raster.
+
+    Used as a fallback when ``_extract_pdf_images`` returns no useful
+    embedded images (typical for vector-drawn diagrams: pymupdf finds
+    only the PDF's tiny decorative shapes, not the actual rendered
+    graphic). Each rendered page is treated as a single image-caption
+    candidate with the same payload shape as embedded-image extraction
+    so downstream retrieval can render "see page N" hints.
+
+    ``dpi``: 200 is a reasonable trade between OCR-quality (text inside
+    diagrams stays legible at this resolution) and payload size
+    (~300 KB per A4 page).
+    ``max_pages``: cap to avoid runaway cost on long PDFs. Pages beyond
+    the cap are skipped silently — the fallback is best-effort.
+    """
+    import pymupdf
+
+    out: list[dict] = []
+    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+        for page_num in range(min(doc.page_count, max_pages)):
+            page = doc.load_page(page_num)
+            pix = page.get_pixmap(dpi=dpi)
+            png = pix.tobytes("png")
+            out.append({
+                "page": page_num + 1,
+                "image_bytes": png,
+                "position": ("page-render",),
+            })
     return out
 
 
@@ -1113,10 +1190,14 @@ async def _caption_image(image_bytes: bytes) -> str:
                  "image_url": {"url": f"data:image/png;base64,{b64}"}},
             ]},
         ],
-        "max_tokens": 800,
+        "max_tokens": int(os.environ.get("RAG_VISION_MAX_TOKENS", "800")),
         "temperature": 0.0,
     }
-    async with httpx.AsyncClient(timeout=20.0) as c:
+    # Default 120s. Page-rendered diagram captions on a 31B vision-LLM
+    # routinely take 30-90s; the prior 20s default silently dropped most
+    # of them. Tunable per deploy.
+    vision_timeout = float(os.environ.get("RAG_VISION_TIMEOUT_SECS", "120"))
+    async with httpx.AsyncClient(timeout=vision_timeout) as c:
         r = await c.post(f"{vision_url}/chat/completions", json=payload)
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"].strip()
