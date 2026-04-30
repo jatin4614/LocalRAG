@@ -95,9 +95,9 @@ th{color:#64748b;font-size:0.75rem;text-transform:uppercase;font-weight:600}
         </div>
         <div class="file-drop" id="file-drop" onclick="document.getElementById('upload-files').click()" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="this.classList.remove('dragover')" ondrop="handleDrop(event)">
           Drop files here or click to browse<br>
-          <span class="sub">Supports: TXT, MD, PDF, DOCX, XLSX, CSV</span>
+          <span class="sub">Supports: TXT, MD, PDF, DOCX, XLSX, CSV, PPTX</span>
         </div>
-        <input type="file" id="upload-files" multiple accept=".txt,.md,.pdf,.docx,.doc,.xlsx,.csv" style="display:none" onchange="addFiles(this.files)">
+        <input type="file" id="upload-files" multiple accept=".txt,.md,.pdf,.docx,.doc,.xlsx,.csv,.pptx" style="display:none" onchange="addFiles(this.files)">
         <div id="file-queue" class="file-list"></div>
         <div id="upload-actions" class="hidden mt-2">
           <button onclick="uploadAll()" class="btn btn-green">Upload All</button>
