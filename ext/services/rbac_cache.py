@@ -10,9 +10,31 @@ task in ``chat_rag_bridge`` subscribes and drops the matching keys.
 
 Sacred invariant (CLAUDE.md §2): zero cross-user data leakage. The cache
 key namespace ``rbac:user:{user_id}`` includes the user_id so two users
-can never share a cache entry. The TTL is a safety net in case the
-pub/sub message is dropped (Redis restart, replica disconnect): even
-without invalidation, a stale grant cannot persist past ``TTL`` seconds.
+can never share a cache entry.
+
+TTL trade-off (M7)
+------------------
+The 30-second default TTL is a deliberate balance between two failure
+modes:
+
+* **Too long** (e.g. 5 minutes): a revoked grant could remain visible
+  to the affected user for up to TTL seconds if the pub/sub
+  invalidation is dropped (Redis restart, replica disconnect, network
+  blip). For a security-sensitive surface this is the bigger risk.
+
+* **Too short** (e.g. 5 seconds): every chat request hits the DB on
+  cache miss, removing the point of the cache for active users —
+  exactly the chat-heavy users who would benefit most. Latency
+  regresses by the cost of one Postgres lookup per request.
+
+30s is the sweet spot for our deployment shape (20-200 users, single
+replica). The pub/sub channel is the fast path; the TTL is the safety
+net. Operators in HIPAA/SOC2 environments may want to drop it to 5s
+or 0 (disable) and accept the latency hit. ``RAG_RBAC_CACHE_TTL_SECS``
+is the knob; ``rag_rbac_cache_inval_failed_total`` counter (incremented
+when pub/sub publish fails) is the monitoring signal — a non-zero rate
+means the TTL is the only thing keeping users from seeing stale grants,
+and operators should investigate the Redis health.
 """
 from __future__ import annotations
 

@@ -75,6 +75,14 @@ async def _invalidate_rbac_cache_for_grant(
         log.warning(
             "rbac cache: invalidate failed for users %s: %s", affected, exc
         )
+        # M7: record the failure so operators can alarm on a non-zero
+        # rate (TTL is the only thing now keeping users from stale
+        # grants; investigate Redis health).
+        try:
+            from ..services.metrics import RAG_RBAC_CACHE_INVAL_FAILED
+            RAG_RBAC_CACHE_INVAL_FAILED.inc()
+        except Exception:
+            pass
 
 router = APIRouter(prefix="/api/kb", tags=["kb-admin"])
 
