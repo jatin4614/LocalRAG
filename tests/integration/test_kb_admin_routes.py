@@ -48,7 +48,11 @@ async def test_admin_create_and_list_kb(client):
 
     r2 = await client.get("/api/kb", headers=ADMIN)
     assert r2.status_code == 200
-    assert any(kb["name"] == "Eng" for kb in r2.json())
+    payload = r2.json()
+    # H2: paginated response shape
+    assert "items" in payload
+    assert "total_count" in payload
+    assert any(kb["name"] == "Eng" for kb in payload["items"])
 
 
 @pytest.mark.asyncio
@@ -230,3 +234,124 @@ async def test_subtag_create_duplicate_name_returns_409(client):
     r2 = await client.post(f"/api/kb/{kb_id}/subtags", headers=ADMIN, json={"name": "Dup"})
     assert r2.status_code == 409, r2.text
     assert "already in use" in r2.json()["detail"].lower()
+
+
+# ---------------------------------------------------------------------------
+# H2 — pagination on list endpoints
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_list_kbs_paginated_returns_total_count(client):
+    # Seed 5 KBs.
+    for i in range(5):
+        r = await client.post("/api/kb", headers=ADMIN, json={"name": f"Page-{i}"})
+        assert r.status_code == 201, r.text
+
+    # Default pagination (limit=100): all 5 fit.
+    r = await client.get("/api/kb", headers=ADMIN)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total_count"] >= 5
+    assert len(body["items"]) >= 5
+
+    # Limit=2 returns 2 items but total_count counts all.
+    r = await client.get("/api/kb?limit=2", headers=ADMIN)
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body["items"]) == 2
+    assert body["total_count"] >= 5
+
+    # Offset=2 + limit=2 returns the 3rd-and-4th newest.
+    r = await client.get("/api/kb?limit=2&offset=2", headers=ADMIN)
+    assert r.status_code == 200
+    assert len(r.json()["items"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_list_kbs_pagination_bounds_enforced(client):
+    # limit=0 violates ge=1
+    r = await client.get("/api/kb?limit=0", headers=ADMIN)
+    assert r.status_code == 422
+    # limit=2000 violates le=1000
+    r = await client.get("/api/kb?limit=2000", headers=ADMIN)
+    assert r.status_code == 422
+    # offset=-1 violates ge=0
+    r = await client.get("/api/kb?offset=-1", headers=ADMIN)
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_doc_out_includes_error_message_for_failed_docs(client, engine):
+    """H10: failed ingest exposes error_message in DocOut so the admin UI
+    can render the cause inline (instead of forcing operators to grep
+    celery logs).
+    """
+    r = await client.post("/api/kb", headers=ADMIN, json={"name": "Err-KB"})
+    kb_id = r.json()["id"]
+    r = await client.post(f"/api/kb/{kb_id}/subtags", headers=ADMIN, json={"name": "S"})
+    sub_id = r.json()["id"]
+
+    SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with SessionLocal() as s:
+        await s.execute(
+            text(
+                "INSERT INTO kb_documents (kb_id, subtag_id, filename, mime_type, "
+                "ingest_status, error_message, uploaded_by, chunk_count) "
+                "VALUES (:kb, :sub, 'broken.pdf', 'application/pdf', 'failed', "
+                "'OCR timeout after 90s', '1', 0)"
+            ),
+            {"kb": kb_id, "sub": sub_id},
+        )
+        await s.execute(
+            text(
+                "INSERT INTO kb_documents (kb_id, subtag_id, filename, mime_type, "
+                "ingest_status, uploaded_by, chunk_count) "
+                "VALUES (:kb, :sub, 'fine.pdf', 'application/pdf', 'done', '1', 12)"
+            ),
+            {"kb": kb_id, "sub": sub_id},
+        )
+        await s.commit()
+
+    r = await client.get(f"/api/kb/{kb_id}/documents", headers=ADMIN)
+    items = r.json()["items"]
+    failed = [d for d in items if d["filename"] == "broken.pdf"][0]
+    assert failed["ingest_status"] == "failed"
+    assert failed["error_message"] == "OCR timeout after 90s"
+    fine = [d for d in items if d["filename"] == "fine.pdf"][0]
+    # Live docs report error_message=None — schema-required.
+    assert fine["error_message"] is None
+
+
+@pytest.mark.asyncio
+async def test_list_documents_paginated(client, engine):
+    """H2: documents listing supports limit/offset and returns total_count."""
+    r = await client.post("/api/kb", headers=ADMIN, json={"name": "Doc-Page-KB"})
+    kb_id = r.json()["id"]
+    r = await client.post(f"/api/kb/{kb_id}/subtags", headers=ADMIN, json={"name": "S"})
+    sub_id = r.json()["id"]
+
+    # Seed 6 documents directly so we don't depend on the upload pipeline.
+    SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with SessionLocal() as s:
+        for i in range(6):
+            await s.execute(
+                text(
+                    "INSERT INTO kb_documents (kb_id, subtag_id, filename, mime_type, "
+                    "ingest_status, uploaded_by, chunk_count) "
+                    "VALUES (:kb, :sub, :fn, 'text/plain', 'done', '1', 5)"
+                ),
+                {"kb": kb_id, "sub": sub_id, "fn": f"f{i}.txt"},
+            )
+        await s.commit()
+
+    r = await client.get(f"/api/kb/{kb_id}/documents", headers=ADMIN)
+    body = r.json()
+    assert body["total_count"] == 6
+    assert len(body["items"]) == 6
+
+    r = await client.get(
+        f"/api/kb/{kb_id}/documents?limit=3&offset=0", headers=ADMIN,
+    )
+    body = r.json()
+    assert body["total_count"] == 6
+    assert len(body["items"]) == 3

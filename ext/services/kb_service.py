@@ -7,7 +7,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Iterable, List, Optional
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -53,15 +53,48 @@ async def get_kb(session: AsyncSession, *, kb_id: int) -> Optional[KnowledgeBase
 
 
 async def list_kbs(
-    session: AsyncSession, *, kb_ids: Optional[Iterable[int]] = None
+    session: AsyncSession,
+    *,
+    kb_ids: Optional[Iterable[int]] = None,
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
 ) -> List[KnowledgeBase]:
+    """List live (non-soft-deleted) KBs.
+
+    H2: ``limit``/``offset`` accept None for backwards compatibility
+    (callers that want every row pass nothing); when set, the rows are
+    sorted by id DESC for stable pagination across pages. Pair with
+    :func:`count_kbs` to get total_count for the client.
+    """
     stmt = select(KnowledgeBase).where(KnowledgeBase.deleted_at.is_(None))
     if kb_ids is not None:
         ids = list(kb_ids)
         if not ids:
             return []
         stmt = stmt.where(KnowledgeBase.id.in_(ids))
+    if limit is not None or offset is not None:
+        # Stable order so pages don't shuffle when rows are added/removed.
+        stmt = stmt.order_by(KnowledgeBase.id.desc())
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        if offset is not None:
+            stmt = stmt.offset(offset)
     return list((await session.execute(stmt)).scalars().all())
+
+
+async def count_kbs(
+    session: AsyncSession, *, kb_ids: Optional[Iterable[int]] = None,
+) -> int:
+    """Count live KBs (H2 pagination total)."""
+    stmt = select(func.count(KnowledgeBase.id)).where(
+        KnowledgeBase.deleted_at.is_(None)
+    )
+    if kb_ids is not None:
+        ids = list(kb_ids)
+        if not ids:
+            return 0
+        stmt = stmt.where(KnowledgeBase.id.in_(ids))
+    return int((await session.execute(stmt)).scalar() or 0)
 
 
 async def update_kb(

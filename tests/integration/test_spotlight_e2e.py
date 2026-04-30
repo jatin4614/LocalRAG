@@ -164,7 +164,12 @@ async def _upload_injection_doc(
             headers=headers,
         )
         if rs.status_code == 200:
-            for d in rs.json():
+            payload = rs.json()
+            # H2: documents endpoint now returns {items, total_count};
+            # tolerate the legacy bare-list shape too in case this test
+            # hits an older deployment.
+            docs = payload.get("items", payload) if isinstance(payload, dict) else payload
+            for d in docs:
                 if (int(d.get("id", -1)) == doc_id
                         and d.get("ingest_status") in ("done", "ready")):
                     return doc_id, fname

@@ -126,6 +126,12 @@ class KBOut(BaseModel):
     admin_id: str
 
 
+class KBListOut(BaseModel):
+    """Paginated KB list response (H2)."""
+    items: list[KBOut]
+    total_count: int
+
+
 def _to_out(kb) -> KBOut:
     return KBOut(id=kb.id, name=kb.name, description=kb.description, admin_id=kb.admin_id)
 
@@ -164,13 +170,24 @@ async def create_kb(
     return _to_out(kb)
 
 
-@router.get("", response_model=list[KBOut])
+@router.get("", response_model=KBListOut)
 async def list_kbs(
     user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(_get_session),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
 ):
-    kbs = await kb_service.list_kbs(session)
-    return [_to_out(k) for k in kbs]
+    """H2: paginated KB listing.
+
+    Response shape: ``{items: [KBOut, ...], total_count: int}``.
+    ``limit`` is bounded [1, 1000]; ``offset`` is non-negative. The
+    total_count is a separate COUNT(*) query — it reflects all live KBs
+    regardless of the current page so the UI can render "showing 1-100 of
+    347" indicators.
+    """
+    kbs = await kb_service.list_kbs(session, limit=limit, offset=offset)
+    total = await kb_service.count_kbs(session)
+    return KBListOut(items=[_to_out(k) for k in kbs], total_count=total)
 
 
 @router.get("/{kb_id}", response_model=KBOut)
@@ -462,21 +479,52 @@ class DocOut(BaseModel):
     mime_type: Optional[str]
     ingest_status: str
     chunk_count: int
+    # H10 — surface ingest failure cause to the admin UI so operators can
+    # see "OCR timeout" / "tokenizer not loaded" without grepping logs.
+    # Always None for live (status != failed) docs.
+    error_message: Optional[str] = None
 
 
-@router.get("/{kb_id}/documents", response_model=list[DocOut])
+class DocListOut(BaseModel):
+    """Paginated documents list response (H2)."""
+    items: list[DocOut]
+    total_count: int
+
+
+@router.get("/{kb_id}/documents", response_model=DocListOut)
 async def list_documents(
     kb_id: int,
     user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(_get_session),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
 ):
+    """H2: paginated document listing.
+
+    Returns ``{items, total_count}`` so the UI can render
+    "showing 1-100 of N" and trigger fetch-next-page when the user
+    scrolls past the visible list.
+    """
+    from sqlalchemy import func as _f
+    base_where = (KBDocument.kb_id == kb_id, KBDocument.deleted_at.is_(None))
     rows = (await session.execute(
-        select(KBDocument).where(KBDocument.kb_id == kb_id, KBDocument.deleted_at.is_(None))
+        select(KBDocument).where(*base_where)
         .order_by(KBDocument.id.desc())
+        .limit(limit)
+        .offset(offset)
     )).scalars().all()
-    return [DocOut(id=d.id, kb_id=d.kb_id, subtag_id=d.subtag_id, filename=d.filename,
-                   mime_type=d.mime_type, ingest_status=d.ingest_status, chunk_count=d.chunk_count)
-            for d in rows]
+    total = int((await session.execute(
+        select(_f.count(KBDocument.id)).where(*base_where)
+    )).scalar() or 0)
+    items = [
+        DocOut(
+            id=d.id, kb_id=d.kb_id, subtag_id=d.subtag_id, filename=d.filename,
+            mime_type=d.mime_type, ingest_status=d.ingest_status,
+            chunk_count=d.chunk_count, error_message=d.error_message,
+        )
+        for d in rows
+    ]
+    return DocListOut(items=items, total_count=total)
 
 
 @router.delete("/{kb_id}/documents/{doc_id}", status_code=status.HTTP_204_NO_CONTENT)
