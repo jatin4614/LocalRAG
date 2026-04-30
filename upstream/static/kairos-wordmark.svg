@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 160" fill="none">
+  <defs>
+    <linearGradient id="g2" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#6366F1"/>
+      <stop offset="50%" stop-color="#8B5CF6"/>
+      <stop offset="100%" stop-color="#EC4899"/>
+    </linearGradient>
+  </defs>
+  <style>
+    .wm-text { fill: #1f2937; }
+    @media (prefers-color-scheme: dark) {
+      .wm-text { fill: #f3f4f6; }
+    }
+  </style>
+  <rect x="0" y="16" width="128" height="128" rx="30" fill="url(#g2)"/>
+  <g transform="translate(64,80)" fill="#FFFFFF">
+    <path d="M-19 -33 L-7 -33 L-7 -2 L17 -33 L31 -33 L5 1 L33 33 L17 33 L-7 5 L-7 33 L-19 33 Z"/>
+  </g>
+  <text x="160" y="108" font-family="'Inter', 'Segoe UI', system-ui, sans-serif" font-size="88" font-weight="700" class="wm-text">Kairos</text>
+</svg>
