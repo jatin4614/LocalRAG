@@ -181,12 +181,27 @@ def validate_config(raw: Mapping[str, Any]) -> dict[str, Any]:
                 # both); at validate time we only reject absurd values.
                 if coerced < 0 or coerced > 1000:
                     continue
+            # H5 bounds for retrieval-side knobs. Out-of-range silently
+            # drops the key so the KB inherits process defaults instead
+            # of running with a corrupt config.
+            if key == "rerank_top_k" and not (1 <= coerced <= 1000):
+                continue
+            if key == "context_expand_window" and not (0 <= coerced <= 100):
+                continue
+            if key == "hyde_n" and not (1 <= coerced <= 10):
+                continue
             out[key] = coerced
         elif key in VALID_FLOAT_KEYS:
             try:
-                out[key] = float(value)
+                coerced_float = float(value)
             except (TypeError, ValueError):
                 continue
+            # H5: mmr_lambda is a convex-combination weight; values
+            # outside [0, 1] don't make sense and would skew the
+            # reranker's diversity-vs-relevance balance.
+            if key == "mmr_lambda" and not (0.0 <= coerced_float <= 1.0):
+                continue
+            out[key] = coerced_float
     return out
 
 
