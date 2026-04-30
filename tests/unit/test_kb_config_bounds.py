@@ -109,3 +109,40 @@ class TestBoundsCoexistWithOtherValidKeys:
         })
         assert out == {"rerank": True, "mmr_lambda": 0.7}
         assert "rerank_top_k" not in out
+
+
+# ---------------------------------------------------------------------------
+# Top-level test functions matching the names the Agent C spec asks for —
+# 1.5 dropped, -0.1 dropped, 0.7 kept, etc. The TestValidateConfig*
+# classes above provide the granular assertions; these are the exact
+# named tests so a search-by-test-name lookup hits a single function.
+# ---------------------------------------------------------------------------
+
+def test_validate_config_clamps_mmr_lambda() -> None:
+    """1.5 dropped, -0.1 dropped, 0.7 kept."""
+    assert kb_config.validate_config({"mmr_lambda": 1.5}) == {}
+    assert kb_config.validate_config({"mmr_lambda": -0.1}) == {}
+    assert kb_config.validate_config({"mmr_lambda": 0.7}) == {"mmr_lambda": 0.7}
+
+
+def test_validate_config_clamps_rerank_top_k() -> None:
+    """0 dropped, 100000 dropped, 50 kept."""
+    assert kb_config.validate_config({"rerank_top_k": 0}) == {}
+    assert kb_config.validate_config({"rerank_top_k": 100000}) == {}
+    assert kb_config.validate_config({"rerank_top_k": 50}) == {"rerank_top_k": 50}
+
+
+def test_validate_config_clamps_context_expand_window() -> None:
+    """-1 dropped, 200 dropped, 5 kept."""
+    assert kb_config.validate_config({"context_expand_window": -1}) == {}
+    assert kb_config.validate_config({"context_expand_window": 200}) == {}
+    assert kb_config.validate_config({"context_expand_window": 5}) == {
+        "context_expand_window": 5,
+    }
+
+
+def test_validate_config_clamps_hyde_n() -> None:
+    """0 dropped, 11 dropped, 3 kept."""
+    assert kb_config.validate_config({"hyde_n": 0}) == {}
+    assert kb_config.validate_config({"hyde_n": 11}) == {}
+    assert kb_config.validate_config({"hyde_n": 3}) == {"hyde_n": 3}
