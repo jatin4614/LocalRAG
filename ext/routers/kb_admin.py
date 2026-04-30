@@ -6,11 +6,12 @@ import os
 from collections import Counter
 from typing import Any, AsyncGenerator, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from pydantic import BaseModel, constr
 from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from ..services import kb_service
 from ..db.models import KBAccess, KBDocument, KnowledgeBase
@@ -74,6 +75,14 @@ async def _invalidate_rbac_cache_for_grant(
         log.warning(
             "rbac cache: invalidate failed for users %s: %s", affected, exc
         )
+        # M7: record the failure so operators can alarm on a non-zero
+        # rate (TTL is the only thing now keeping users from stale
+        # grants; investigate Redis health).
+        try:
+            from ..services.metrics import RAG_RBAC_CACHE_INVAL_FAILED
+            RAG_RBAC_CACHE_INVAL_FAILED.inc()
+        except Exception:
+            pass
 
 router = APIRouter(prefix="/api/kb", tags=["kb-admin"])
 
@@ -103,13 +112,19 @@ async def _get_session() -> AsyncGenerator[AsyncSession, None]:
 
 
 class KBIn(BaseModel):
-    name: str
-    description: Optional[str] = None
+    # H3: enforce name bounds at the API edge so a 256-char string can
+    # never slip through to the DB (knowledge_bases.name is VARCHAR(255)).
+    # ``strip_whitespace`` ensures ``"   "`` collapses to ``""`` and is
+    # rejected by the min_length=1 floor.
+    name: constr(min_length=1, max_length=255, strip_whitespace=True)
+    description: Optional[constr(max_length=2000)] = None
 
 
 class KBPatch(BaseModel):
-    name: Optional[str] = None
-    description: Optional[str] = None
+    # H4: same constraints as KBIn but Optional so PATCH bodies can
+    # update only ``description`` without touching ``name``.
+    name: Optional[constr(min_length=1, max_length=255, strip_whitespace=True)] = None
+    description: Optional[constr(max_length=2000)] = None
 
 
 class KBOut(BaseModel):
@@ -117,6 +132,12 @@ class KBOut(BaseModel):
     name: str
     description: Optional[str]
     admin_id: str
+
+
+class KBListOut(BaseModel):
+    """Paginated KB list response (H2)."""
+    items: list[KBOut]
+    total_count: int
 
 
 def _to_out(kb) -> KBOut:
@@ -129,22 +150,52 @@ async def create_kb(
     user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(_get_session),
 ):
+    """H8: catch IntegrityError specifically (concurrent same-name insert
+    races past kb_service's pre-check) and ValueError from the service-
+    layer pre-check; both surface as 409 with sanitized messages. Other
+    exceptions propagate to the standard 500 with full server-side
+    logging — they indicate a real bug, not a benign user error.
+    """
     try:
-        kb = await kb_service.create_kb(session, name=body.name, description=body.description, admin_id=user.id)
+        kb = await kb_service.create_kb(
+            session, name=body.name, description=body.description, admin_id=user.id,
+        )
         await session.commit()
-    except Exception as e:
+    except ValueError as e:
+        # Service-layer pre-check ("kb name already in use: ...")
         await session.rollback()
         raise HTTPException(status.HTTP_409_CONFLICT, detail=str(e)) from e
+    except IntegrityError as e:
+        await session.rollback()
+        log.warning("create_kb: integrity error name=%r: %s", body.name, e)
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, detail="name already in use",
+        ) from e
+    except Exception as e:
+        await session.rollback()
+        log.exception("create_kb: unexpected error")
+        raise
     return _to_out(kb)
 
 
-@router.get("", response_model=list[KBOut])
+@router.get("", response_model=KBListOut)
 async def list_kbs(
     user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(_get_session),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
 ):
-    kbs = await kb_service.list_kbs(session)
-    return [_to_out(k) for k in kbs]
+    """H2: paginated KB listing.
+
+    Response shape: ``{items: [KBOut, ...], total_count: int}``.
+    ``limit`` is bounded [1, 1000]; ``offset`` is non-negative. The
+    total_count is a separate COUNT(*) query — it reflects all live KBs
+    regardless of the current page so the UI can render "showing 1-100 of
+    347" indicators.
+    """
+    kbs = await kb_service.list_kbs(session, limit=limit, offset=offset)
+    total = await kb_service.count_kbs(session)
+    return KBListOut(items=[_to_out(k) for k in kbs], total_count=total)
 
 
 @router.get("/{kb_id}", response_model=KBOut)
@@ -228,14 +279,19 @@ async def patch_rag_config(
         )
 
     # Coerce to the expected Python types; any key whose value fails
-    # coercion is silently dropped by validate_config, so we compare back
-    # to detect bad types and raise 400.
+    # coercion OR violates H5 bounds is silently dropped by
+    # validate_config, so we compare back to detect bad input and
+    # raise 400. The error message intentionally says "bad value (type
+    # or out of range)" since both reasons surface here — admins
+    # debugging a rejected key should check both.
     cleaned = validate_config(body)
-    bad_types = [k for k in body if k in VALID_KEYS and k not in cleaned]
-    if bad_types:
+    bad_keys = [k for k in body if k in VALID_KEYS and k not in cleaned]
+    if bad_keys:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
-            detail=f"bad value type for: {sorted(bad_types)}",
+            detail=(
+                f"bad value (type or out of range) for: {sorted(bad_keys)}"
+            ),
         )
 
     kb = await kb_service.get_kb(session, kb_id=kb_id)
@@ -261,33 +317,34 @@ async def delete_kb(
     user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(_get_session),
 ) -> Response:
-    """Delete a KB end-to-end.
+    """Delete a KB end-to-end with cascade cleanup.
 
     Soft-deletes the row (preserves audit history via ``deleted_at``), then
-    runs cascade cleanup so a delete + recreate-with-same-name flow leaves
-    no dangling state:
+    cascades cleanup so a delete + recreate-with-same-name flow leaves no
+    dangling state:
 
-      1. Capture the kb_access grants BEFORE mutation so we can invalidate
-         the right RBAC cache entries afterward.
+      1. Capture kb_access grants BEFORE mutation so the right RBAC cache
+         entries can be invalidated afterward.
       2. Soft-delete the ``knowledge_bases`` row.
-      3. Hard-delete ``kb_access`` grants for this KB (no purpose post-delete).
+      3. Hard-delete ``kb_access`` grants (no purpose post-delete).
       4. Soft-delete ``kb_documents`` (mirrors the KB's ``deleted_at``).
-      5. Drop Qdrant collections ``kb_{id}`` and ``kb_{id}_v4`` so future
-         retrieval can't surface chunks from the deleted KB.
+      5. Drop Qdrant collections ``kb_{id}`` and ``kb_{id}_v4``.
       6. Invalidate cached ``allowed_kb_ids`` for every user the deleted
          grants touched.
 
-    Migration 013 (partial unique index ``uq_kb_name_live``) is what
-    actually unblocks the recreate-same-name flow; this handler ensures
-    everything *else* stays consistent. Cleanup runs best-effort: a Qdrant
-    or Redis failure logs at WARNING but does not roll back the DB
-    soft-delete (DB is the source of truth, secondary stores converge).
+    Migration 013 (partial unique index) unblocks the recreate-same-name
+    flow; this handler keeps everything *else* consistent. Cleanup is
+    best-effort: a Qdrant/Redis failure logs WARNING but does not roll
+    back (DB is source of truth, secondary stores converge).
+
+    M10 — distinguishes 'never existed' (404) from 'already deleted' (410)
+    via a follow-up SELECT when ``soft_delete_kb`` returns False.
     """
     from datetime import datetime, timezone
     from sqlalchemy import delete as sql_delete, update as sql_update
 
-    # 1. Capture grants before any mutation so we can build the user
-    #    invalidation set even after the kb_access rows are gone.
+    # 1. Capture grants before any mutation so the user invalidation set is
+    #    knowable even after the kb_access rows are gone.
     grants_before = (await session.execute(
         select(KBAccess).where(KBAccess.kb_id == kb_id)
     )).scalars().all()
@@ -299,10 +356,15 @@ async def delete_kb(
         except Exception as e:  # noqa: BLE001
             log.warning("delete_kb: users_affected_by_grant failed: %s", e)
 
-    # 2. Soft-delete the KB row. 404 if it was already gone.
+    # 2. Soft-delete the KB row. Disambiguate 404 vs 410 on miss.
     ok = await kb_service.soft_delete_kb(session, kb_id=kb_id)
     if not ok:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="kb not found")
+        row = (await session.execute(
+            select(KnowledgeBase.deleted_at).where(KnowledgeBase.id == kb_id)
+        )).first()
+        if row is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="kb not found")
+        raise HTTPException(status.HTTP_410_GONE, detail="kb already deleted")
 
     # 3. Hard-delete kb_access grants — no purpose post-delete.
     await session.execute(sql_delete(KBAccess).where(KBAccess.kb_id == kb_id))
@@ -316,9 +378,9 @@ async def delete_kb(
 
     await session.commit()
 
-    # 5. Drop Qdrant collections — both the legacy single-shard and the
-    #    Plan B Phase 5 custom-sharded form. ``delete_collection`` swallows
-    #    "not found", so this is a no-op when the KB never had any chunks.
+    # 5. Drop Qdrant collections — both legacy single-shard and Plan B
+    #    Phase 5 custom-sharded forms. ``delete_collection`` swallows
+    #    "not found" so this is a no-op for empty KBs.
     if _VS is not None:
         for coll in (f"kb_{kb_id}", f"kb_{kb_id}_v4"):
             try:
@@ -367,9 +429,22 @@ async def create_subtag(
     try:
         sub = await kb_service.create_subtag(session, kb_id=kb_id, name=body.name, description=body.description)
         await session.commit()
-    except Exception as e:
+    except IntegrityError as e:
+        # H8: subtags have UNIQUE(kb_id, name) — duplicate name within
+        # the same KB violates the index.
         await session.rollback()
-        raise HTTPException(status.HTTP_409_CONFLICT, detail=str(e)) from e
+        log.warning(
+            "create_subtag: integrity error kb=%s name=%r: %s",
+            kb_id, body.name, e,
+        )
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail="subtag name already in use within this KB",
+        ) from e
+    except Exception:
+        await session.rollback()
+        log.exception("create_subtag: unexpected error kb=%s", kb_id)
+        raise
     return SubtagOut(id=sub.id, kb_id=sub.kb_id, name=sub.name, description=sub.description)
 
 
@@ -389,11 +464,149 @@ async def delete_subtag(
     user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(_get_session),
 ) -> Response:
-    ok = await kb_service.delete_subtag(session, kb_id=kb_id, subtag_id=subtag_id)
+    """H7: cascade Qdrant chunk delete + soft-delete docs + soft-delete subtag.
+
+    Order of operations:
+      1. List live (deleted_at IS NULL) docs in this subtag.
+      2. For each doc, best-effort ``VectorStore.delete_by_doc(...)``;
+         log failures but don't abort — the docs / subtag get soft-
+         deleted regardless so they stop appearing in admin lists.
+      3. Soft-delete the docs (UPDATE deleted_at = NOW()).
+      4. Soft-delete the subtag itself.
+
+    Cross-agent dep: this assumes ``kb_subtags.deleted_at`` exists
+    (Agent B's migration). The route uses
+    :func:`kb_service.soft_delete_subtag` which falls back gracefully
+    when the column isn't there yet (returns False), surfacing as a
+    404 — operators will know the migration hasn't been applied.
+    """
+    # 1) Find live docs in this subtag.
+    doc_rows = (await session.execute(
+        select(KBDocument).where(
+            KBDocument.kb_id == kb_id,
+            KBDocument.subtag_id == subtag_id,
+            KBDocument.deleted_at.is_(None),
+        )
+    )).scalars().all()
+
+    # 2) Best-effort Qdrant cascade. Failures don't abort the soft-delete.
+    if _VS is not None and doc_rows:
+        collection = f"kb_{kb_id}"
+        for doc in doc_rows:
+            try:
+                await _VS.delete_by_doc(collection, doc.id)
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "delete_subtag: vector cascade failed kb=%s sub=%s "
+                    "doc=%s err=%s",
+                    kb_id, subtag_id, doc.id, e,
+                )
+
+    # 3) Soft-delete the docs in one UPDATE. Idempotent: rows with
+    #    deleted_at already set are excluded by the WHERE clause.
+    from sqlalchemy import text as _text
+    await session.execute(
+        _text(
+            "UPDATE kb_documents SET deleted_at = NOW() "
+            "WHERE kb_id = :kb AND subtag_id = :sid "
+            "AND deleted_at IS NULL"
+        ),
+        {"kb": kb_id, "sid": subtag_id},
+    )
+
+    # 4) Soft-delete the subtag itself.
+    ok = await kb_service.soft_delete_subtag(
+        session, kb_id=kb_id, subtag_id=subtag_id,
+    )
     if not ok:
+        await session.rollback()
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="subtag not found")
     await session.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# ---------------------------------------------------------------------------
+# M6 — Subtag rename + move-docs
+# ---------------------------------------------------------------------------
+
+class SubtagPatch(BaseModel):
+    name: constr(min_length=1, max_length=255, strip_whitespace=True)
+
+
+@router.patch(
+    "/{kb_id}/subtags/{subtag_id}",
+    response_model=SubtagOut,
+)
+async def rename_subtag(
+    kb_id: int, subtag_id: int, body: SubtagPatch,
+    user: CurrentUser = Depends(require_admin),
+    session: AsyncSession = Depends(_get_session),
+):
+    """M6: rename a subtag. 404 if subtag not in this KB; 409 on name
+    collision within the same KB (UNIQUE(kb_id, name) violation).
+    """
+    try:
+        sub = await kb_service.rename_subtag(
+            session, kb_id=kb_id, subtag_id=subtag_id, new_name=body.name,
+        )
+        if sub is None:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, detail="subtag not found",
+            )
+        await session.commit()
+    except IntegrityError as e:
+        await session.rollback()
+        log.warning(
+            "rename_subtag: integrity error kb=%s sub=%s name=%r: %s",
+            kb_id, subtag_id, body.name, e,
+        )
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail="subtag name already in use within this KB",
+        ) from e
+    return SubtagOut(id=sub.id, kb_id=sub.kb_id, name=sub.name, description=sub.description)
+
+
+class MoveDocsIn(BaseModel):
+    doc_ids: list[int]
+    target_subtag_id: int
+
+
+class MoveDocsOut(BaseModel):
+    moved: int
+
+
+@router.post(
+    "/{kb_id}/subtags/{subtag_id}/move-docs",
+    response_model=MoveDocsOut,
+)
+async def move_docs_to_subtag(
+    kb_id: int, subtag_id: int, body: MoveDocsIn,
+    user: CurrentUser = Depends(require_admin),
+    session: AsyncSession = Depends(_get_session),
+):
+    """M6: move ``doc_ids`` from this subtag to ``target_subtag_id``.
+
+    Validates:
+      * source and target both exist (live) in this KB
+      * doc_ids are filtered to those that match (kb_id, source_subtag_id);
+        any id that doesn't match is silently skipped (idempotent — a
+        doc already moved won't error)
+    """
+    try:
+        moved = await kb_service.move_docs_to_subtag(
+            session,
+            kb_id=kb_id,
+            source_subtag_id=subtag_id,
+            target_subtag_id=body.target_subtag_id,
+            doc_ids=body.doc_ids,
+        )
+        await session.commit()
+    except ValueError as e:
+        await session.rollback()
+        # 404 when the source/target subtag isn't in this KB.
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    return MoveDocsOut(moved=moved)
 
 
 # ---------------------------------------------------------------------------
@@ -429,9 +642,21 @@ async def grant_access(
     except ValueError as e:
         await session.rollback()
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
-    except Exception as e:
+    except IntegrityError as e:
+        # H8: kb_access has CHECK constraint (exactly-one user XOR group)
+        # plus FK/duplicate constraints. Map to 409 with sanitized text.
         await session.rollback()
-        raise HTTPException(status.HTTP_409_CONFLICT, detail=str(e)) from e
+        log.warning(
+            "grant_access: integrity error kb=%s user=%s group=%s: %s",
+            kb_id, body.user_id, body.group_id, e,
+        )
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, detail="constraint violation",
+        ) from e
+    except Exception:
+        await session.rollback()
+        log.exception("grant_access: unexpected error kb=%s", kb_id)
+        raise
     # Phase 1.5 — invalidate cached allowed_kb_ids for every user this
     # grant affects (direct user grant -> 1 user; group grant -> all
     # current group members). Fail-open: a cache miss falls through to
@@ -483,21 +708,52 @@ class DocOut(BaseModel):
     mime_type: Optional[str]
     ingest_status: str
     chunk_count: int
+    # H10 — surface ingest failure cause to the admin UI so operators can
+    # see "OCR timeout" / "tokenizer not loaded" without grepping logs.
+    # Always None for live (status != failed) docs.
+    error_message: Optional[str] = None
 
 
-@router.get("/{kb_id}/documents", response_model=list[DocOut])
+class DocListOut(BaseModel):
+    """Paginated documents list response (H2)."""
+    items: list[DocOut]
+    total_count: int
+
+
+@router.get("/{kb_id}/documents", response_model=DocListOut)
 async def list_documents(
     kb_id: int,
     user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(_get_session),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
 ):
+    """H2: paginated document listing.
+
+    Returns ``{items, total_count}`` so the UI can render
+    "showing 1-100 of N" and trigger fetch-next-page when the user
+    scrolls past the visible list.
+    """
+    from sqlalchemy import func as _f
+    base_where = (KBDocument.kb_id == kb_id, KBDocument.deleted_at.is_(None))
     rows = (await session.execute(
-        select(KBDocument).where(KBDocument.kb_id == kb_id, KBDocument.deleted_at.is_(None))
+        select(KBDocument).where(*base_where)
         .order_by(KBDocument.id.desc())
+        .limit(limit)
+        .offset(offset)
     )).scalars().all()
-    return [DocOut(id=d.id, kb_id=d.kb_id, subtag_id=d.subtag_id, filename=d.filename,
-                   mime_type=d.mime_type, ingest_status=d.ingest_status, chunk_count=d.chunk_count)
-            for d in rows]
+    total = int((await session.execute(
+        select(_f.count(KBDocument.id)).where(*base_where)
+    )).scalar() or 0)
+    items = [
+        DocOut(
+            id=d.id, kb_id=d.kb_id, subtag_id=d.subtag_id, filename=d.filename,
+            mime_type=d.mime_type, ingest_status=d.ingest_status,
+            chunk_count=d.chunk_count, error_message=d.error_message,
+        )
+        for d in rows
+    ]
+    return DocListOut(items=items, total_count=total)
 
 
 @router.delete("/{kb_id}/documents/{doc_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -620,18 +876,36 @@ async def reembed_document(
 # Phase 4 — KB health endpoint
 # ---------------------------------------------------------------------------
 
+#: Sentinel returned by :func:`compute_drift_pct` when Postgres expects
+#: zero chunks but Qdrant still has points (orphans). 999.0 was chosen
+#: so it sorts at the top of any "drift > N" alert and is unmistakable
+#: in dashboards — no real KB will ever drift 999% in normal operation.
+ORPHAN_DRIFT_SENTINEL = 999.0
+
+
 def compute_drift_pct(expected: int, observed: int) -> float:
     """Return absolute-value drift between expected and observed counts.
 
     ``drift_pct = |observed - expected| / expected * 100``. When ``expected``
-    is 0 (empty KB) the drift is defined as 0 regardless of observed —
-    we would never want alarms on newly-created KBs whose chunks are still
-    ingesting, and a freshly-emptied KB (expected==0, observed==0) is also
-    clean.
+    is 0 AND ``observed`` is also 0 the drift is 0.0 (clean empty KB). When
+    ``expected`` is 0 but ``observed`` is positive the function returns
+    :data:`ORPHAN_DRIFT_SENTINEL` (``999.0``) and logs a WARNING — Qdrant
+    holds chunks for a KB whose Postgres truth says it's empty, which is
+    the orphan-cleanup signal operators want surfaced loudly. ``expected``
+    < 0 (corrupt rows) is treated as 0 expected.
 
-    Pure function. Must be import-safe (no DB / Qdrant access).
+    Pure function. Must be import-safe (no DB / Qdrant access). Logging
+    is intentional — the warning is only emitted when the sentinel
+    fires, so steady-state KBs make no log noise.
     """
     if expected <= 0:
+        if int(observed) > 0:
+            log.warning(
+                "compute_drift_pct: orphan chunks detected — expected=%s "
+                "observed=%s; returning sentinel %.0f",
+                expected, observed, ORPHAN_DRIFT_SENTINEL,
+            )
+            return ORPHAN_DRIFT_SENTINEL
         return 0.0
     diff = abs(int(observed) - int(expected))
     return (diff / float(expected)) * 100.0
@@ -643,6 +917,22 @@ class FailedDoc(BaseModel):
 
 
 class KBHealthOut(BaseModel):
+    """Operational health snapshot for one KB.
+
+    drift_pct semantics
+    -------------------
+    Normally ``|observed - expected| / expected * 100``. Two special
+    values:
+
+    * ``0.0`` — the KB is clean OR empty-and-clean (expected==0,
+      observed==0).
+    * ``999.0`` — orphan sentinel (M9). expected==0 but Qdrant still
+      has points for this KB. Means either a previous KB deletion left
+      Qdrant chunks behind, or an ingest ran but the Postgres row was
+      never committed. Operators should investigate; the sentinel was
+      chosen so it sorts at the top of any "drift > N" alert and is
+      unmistakable in dashboards.
+    """
     kb_id: int
     postgres_doc_count: int
     qdrant_point_count: int

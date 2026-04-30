@@ -224,3 +224,81 @@ async def test_patch_all_valid_keys_round_trip(client):
     cfg = r.json()["rag_config"]
     for k, v in body.items():
         assert cfg[k] == v, f"{k}: expected {v}, got {cfg.get(k)}"
+
+
+# ---------------------------------------------------------------------------
+# H5 / M5 — out-of-range values rejected with clear error
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_patch_rejects_mmr_lambda_out_of_range(client):
+    kb_id = await _mk_kb(client)
+    r = await client.patch(
+        f"/api/kb/{kb_id}/config", headers=ADMIN, json={"mmr_lambda": 1.5},
+    )
+    assert r.status_code == 400
+    assert "mmr_lambda" in r.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_patch_rejects_rerank_top_k_out_of_range(client):
+    kb_id = await _mk_kb(client)
+    r = await client.patch(
+        f"/api/kb/{kb_id}/config", headers=ADMIN, json={"rerank_top_k": 0},
+    )
+    assert r.status_code == 400
+    assert "rerank_top_k" in r.json()["detail"]
+    r = await client.patch(
+        f"/api/kb/{kb_id}/config", headers=ADMIN, json={"rerank_top_k": 100000},
+    )
+    assert r.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_patch_rejects_context_expand_window_out_of_range(client):
+    kb_id = await _mk_kb(client)
+    r = await client.patch(
+        f"/api/kb/{kb_id}/config", headers=ADMIN,
+        json={"context_expand_window": -1},
+    )
+    assert r.status_code == 400
+    r = await client.patch(
+        f"/api/kb/{kb_id}/config", headers=ADMIN,
+        json={"context_expand_window": 200},
+    )
+    assert r.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_patch_rejects_hyde_n_out_of_range(client):
+    kb_id = await _mk_kb(client)
+    r = await client.patch(
+        f"/api/kb/{kb_id}/config", headers=ADMIN, json={"hyde_n": 0},
+    )
+    assert r.status_code == 400
+    r = await client.patch(
+        f"/api/kb/{kb_id}/config", headers=ADMIN, json={"hyde_n": 100},
+    )
+    assert r.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_patch_accepts_in_range_for_new_bounds(client):
+    """Boundary acceptance: each H5 lower + upper bound is admitted."""
+    kb_id = await _mk_kb(client)
+    body = {
+        "mmr_lambda": 0.0,
+        "rerank_top_k": 1,
+        "context_expand_window": 0,
+        "hyde_n": 1,
+    }
+    r = await client.patch(f"/api/kb/{kb_id}/config", headers=ADMIN, json=body)
+    assert r.status_code == 200
+    body = {
+        "mmr_lambda": 1.0,
+        "rerank_top_k": 1000,
+        "context_expand_window": 100,
+        "hyde_n": 10,
+    }
+    r = await client.patch(f"/api/kb/{kb_id}/config", headers=ADMIN, json=body)
+    assert r.status_code == 200

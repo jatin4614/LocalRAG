@@ -156,6 +156,19 @@ rbac_denied_total = Counter(
     labelnames=("route",),
 )
 
+# M7 — RBAC cache invalidation failure counter.
+#
+# Incremented when the kb_admin router fails to publish an
+# rbac:invalidate pub/sub message after a kb_access mutation. A non-zero
+# rate means the TTL safety net (default 30s) is the only thing
+# preventing stale grants from being visible — operators should
+# investigate Redis health (server reachable? subscriber alive?).
+RAG_RBAC_CACHE_INVAL_FAILED = Counter(
+    f"{_NS}_rbac_cache_inval_failed_total",
+    "RBAC cache invalidation publish failures (TTL is now the only "
+    "safety net for affected users)",
+)
+
 # Active sessions gauge — incremented on chat-request entry, decremented
 # on exit (try/finally in ``chat_rag_bridge``). Useful for capacity
 # planning and spotting leaks.

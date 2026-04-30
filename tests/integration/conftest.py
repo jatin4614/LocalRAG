@@ -121,39 +121,12 @@ async def engine(pg):
         """)
         for mig in _all_migration_paths():
             await _raw_exec(conn, mig.read_text())
-        # Production has drifted from migration 001: the SQLAlchemy
-        # model declares ``admin_id``, ``uploaded_by``, ``user_id``
-        # as VARCHAR(255) (upstream's user.id is a UUID string) and
-        # ``group_id`` as TEXT, but migration 001 still says BIGINT.
-        # Live production was bootstrapped via SQLAlchemy
-        # ``create_all`` which respects the model types — production
-        # schema is the source of truth.
+        # Migration 001 now declares the column types that match
+        # production (admin_id / uploaded_by / kb_access.user_id as
+        # VARCHAR(255), kb_access.group_id as TEXT, no FKs to upstream
+        # users/groups). The post-migration ALTER hack that previously
+        # lived here is no longer required.
         #
-        # ALTER the columns post-migration so SQLAlchemy can round-
-        # trip model-typed values. asyncpg silently coerces ``int`` ->
-        # ``str`` for VARCHAR, so legacy test fixtures that pass
-        # ``admin_id=1`` keep working.
-        await _raw_exec(conn, """
-            ALTER TABLE knowledge_bases
-              DROP CONSTRAINT IF EXISTS knowledge_bases_admin_id_fkey;
-            ALTER TABLE knowledge_bases
-              ALTER COLUMN admin_id TYPE VARCHAR(255) USING admin_id::text;
-
-            ALTER TABLE kb_documents
-              DROP CONSTRAINT IF EXISTS kb_documents_uploaded_by_fkey;
-            ALTER TABLE kb_documents
-              ALTER COLUMN uploaded_by TYPE VARCHAR(255) USING uploaded_by::text;
-
-            ALTER TABLE kb_access
-              DROP CONSTRAINT IF EXISTS kb_access_user_id_fkey;
-            ALTER TABLE kb_access
-              ALTER COLUMN user_id TYPE VARCHAR(255) USING user_id::text;
-
-            ALTER TABLE kb_access
-              DROP CONSTRAINT IF EXISTS kb_access_group_id_fkey;
-            ALTER TABLE kb_access
-              ALTER COLUMN group_id TYPE TEXT USING group_id::text;
-        """)
         # Upstream Open WebUI uses singular ``"user"`` and
         # ``group_member`` table names with UUID-keyed ids;
         # ``ext.services.rbac.get_allowed_kb_ids`` queries them
