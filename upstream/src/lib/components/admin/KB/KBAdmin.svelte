@@ -47,7 +47,9 @@
 	// KB CRUD
 	async function loadKBs() {
 		try {
-			kbs = await api('/api/kb');
+			const resp = await api('/api/kb');
+			// H2: list_kbs now returns {items, total_count}; tolerate legacy list.
+			kbs = Array.isArray(resp) ? resp : (resp && resp.items) || [];
 		} catch (e) {
 			kbs = [];
 		}
@@ -186,7 +188,9 @@
 	// Documents
 	async function loadDocuments() {
 		try {
-			documents = await api(`/api/kb/${selectedKB.id}/documents`);
+			const resp = await api(`/api/kb/${selectedKB.id}/documents`);
+			// H2: list_documents now returns {items, total_count}; tolerate legacy list.
+			documents = Array.isArray(resp) ? resp : (resp && resp.items) || [];
 			detailError = '';
 		} catch (e) {
 			documents = [];
