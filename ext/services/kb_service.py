@@ -91,10 +91,16 @@ async def delete_subtag(session: AsyncSession, *, kb_id: int, subtag_id: int) ->
 
 
 async def grant_access(
-    session: AsyncSession, *, kb_id: int, user_id: Optional[int],
-    group_id: Optional[int], access_type: str = "read",
+    session: AsyncSession, *, kb_id: int, user_id: Optional[str],
+    group_id: Optional[str], access_type: str = "read",
 ) -> KBAccess:
-    """Grant read/write on a KB to either a user or a group (never both, never neither)."""
+    """Grant read/write on a KB to either a user or a group (never both, never neither).
+
+    Note: ``user_id`` is a string (upstream Open WebUI uses UUID-string user
+    ids, mirrored to ``kb_access.user_id`` VARCHAR(255)); ``group_id`` is also
+    a string (TEXT column). The previous ``Optional[int]`` typing was a
+    historical mistake from before the upstream-UUID migration.
+    """
     if (user_id is None) == (group_id is None):
         raise ValueError("grant_access requires exactly one of user_id or group_id")
     grant = KBAccess(kb_id=kb_id, user_id=user_id, group_id=group_id, access_type=access_type)
