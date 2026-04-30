@@ -1,6 +1,7 @@
 """Upload routes — KB documents (admin) and private chat docs (chat owner)."""
 from __future__ import annotations
 
+import datetime as _dt
 import os
 import pathlib
 from typing import AsyncGenerator, Optional
@@ -20,6 +21,53 @@ from ..services.metrics import upload_bytes_total
 from ..services.obs import inject_context_into_headers, span
 from ..services.pipeline_version import current_version
 from ..services.vector_store import CHAT_PRIVATE_COLLECTION, VectorStore
+
+
+def _sharding_enabled() -> bool:
+    """Mirror ext.services.ingest._sharding_enabled — read each call.
+
+    Kept inline here to avoid a circular import (ingest imports from
+    routers via worker side). RAG_SHARDING_ENABLED=1 flips on Plan B
+    Phase 5 temporal sharding for new collections.
+    """
+    return os.environ.get("RAG_SHARDING_ENABLED", "0") == "1"
+
+
+def _current_month_shard_key() -> str:
+    today = _dt.date.today()
+    return f"{today.year:04d}-{today.month:02d}"
+
+
+async def _ensure_kb_collection(vs: VectorStore, kb_id: int) -> None:
+    """Create the per-KB Qdrant collection.
+
+    When ``RAG_SHARDING_ENABLED=1`` the collection is created with custom
+    temporal sharding (one shard per ``YYYY-MM`` month bucket) so the
+    ingest worker's ``upsert_temporal`` calls succeed. Otherwise the
+    legacy single-shard form is used (byte-identical to before).
+
+    Always honors ``RAG_COLBERT`` — when on, the collection includes the
+    colbert named multivector slot so all three retrieval methods
+    (dense + bm25 sparse + colbert late-interaction) work uniformly
+    across every KB. Without this, a new KB silently degrades to 2-of-3
+    methods because the read path skips colbert when the slot is absent.
+    """
+    name = f"kb_{kb_id}"
+    with_colbert = os.environ.get("RAG_COLBERT", "0") == "1"
+    if _sharding_enabled():
+        # Seed with the current month so the collection has at least one
+        # shard_key. The worker's upsert_temporal lazily creates
+        # additional month buckets as documents land in different months.
+        await vs.ensure_collection_temporal(
+            name,
+            shard_keys=[_current_month_shard_key()],
+            with_sparse=True,
+            with_colbert=with_colbert,
+        )
+    else:
+        await vs.ensure_collection(
+            name, with_sparse=True, with_colbert=with_colbert,
+        )
 
 
 router = APIRouter(tags=["upload"])
@@ -185,7 +233,7 @@ async def upload_kb_doc(
         if RAG_SYNC_INGEST:
             try:
                 with span("upload.ensure_collection", collection=f"kb_{kb_id}"):
-                    await _VS.ensure_collection(f"kb_{kb_id}", with_sparse=True)
+                    await _ensure_kb_collection(_VS, kb_id)
                 with span("upload.ingest_sync", collection=f"kb_{kb_id}", size_bytes=len(data)):
                     n = await ingest_bytes(
                         data=data,
@@ -216,7 +264,7 @@ async def upload_kb_doc(
         with span("upload.blob_write", size_bytes=len(data)):
             store = BlobStore(os.environ.get("INGEST_BLOB_ROOT", "/var/ingest"))
             sha = store.write(data)
-        await _VS.ensure_collection(f"kb_{kb_id}", with_sparse=True)
+        await _ensure_kb_collection(_VS, kb_id)
         with span("upload.enqueue_celery", collection=f"kb_{kb_id}"):
             # Propagate trace context to the Celery worker via task headers.
             task_headers = inject_context_into_headers({})
@@ -238,6 +286,10 @@ async def upload_kb_doc(
                 ),
                 headers=task_headers,
             )
+        # Persist blob_sha so recovery from a failed/lost task can
+        # re-enqueue the same blob without a re-upload (the sha is the
+        # filename inside ``INGEST_BLOB_ROOT``). Previously left empty.
+        doc.blob_sha = sha
         doc.ingest_status = "queued"
         await session.commit()
         return UploadResult(status="queued", chunks=0, doc_id=doc.id, task_id=task.id, sha=sha)

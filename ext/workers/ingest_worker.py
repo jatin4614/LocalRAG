@@ -202,11 +202,35 @@ def ingest_blob(
         except Exception:
             pass
 
+        # Pull KB id out of the collection name once for progress events.
+        # Format is always ``kb_{int}`` for KB ingests; private chat docs
+        # use ``chat_{id}`` and skip progress emit (no admin UI subscribes).
+        _kb_id_for_progress: int | None = None
+        if collection.startswith("kb_"):
+            try:
+                _kb_id_for_progress = int(collection.split("_", 1)[1])
+            except (ValueError, IndexError):
+                _kb_id_for_progress = None
+
+        from ext.services.ingest_progress import emit_sync as _emit_progress
+
+        if _kb_id_for_progress is not None:
+            _emit_progress(_kb_id_for_progress, {
+                "doc_id": _doc_id,
+                "filename": filename,
+                "stage": "processing",
+            })
+
         store = _store()
         if not store.exists(sha):
             # Permanent failure — blob the producer promised us was never written
             # (or was GC'd). Reject without requeue → DLQ.
             log.error("ingest: blob missing sha=%s collection=%s", sha, collection)
+            if _kb_id_for_progress is not None:
+                _emit_progress(_kb_id_for_progress, {
+                    "doc_id": _doc_id, "filename": filename,
+                    "stage": "failed", "error": "blob missing",
+                })
             raise Reject(reason=f"blob missing: {sha}", requeue=False)
 
         try:
@@ -227,6 +251,11 @@ def ingest_blob(
                 asyncio.run(_update_doc_status(_doc_id, "failed"))
             except Exception:  # noqa: BLE001 — best-effort
                 pass
+            if _kb_id_for_progress is not None:
+                _emit_progress(_kb_id_for_progress, {
+                    "doc_id": _doc_id, "filename": filename,
+                    "stage": "failed", "error": str(exc)[:200],
+                })
             raise Reject(reason=str(exc), requeue=False)
 
         # Success: best-effort blob cleanup (idempotent).
@@ -242,6 +271,12 @@ def ingest_blob(
             asyncio.run(_update_doc_status(_doc_id, "done", chunk_count=int(n)))
         except Exception:  # noqa: BLE001 — best-effort
             pass
+
+        if _kb_id_for_progress is not None:
+            _emit_progress(_kb_id_for_progress, {
+                "doc_id": _doc_id, "filename": filename,
+                "stage": "done", "chunks": int(n),
+            })
 
         try:
             if _sp is not None:

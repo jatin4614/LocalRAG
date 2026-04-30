@@ -12,7 +12,7 @@ from fastapi.responses import HTMLResponse
 
 from .config import clear_settings_cache, get_settings
 from .db.session import make_engine, make_sessionmaker
-from .routers import kb_admin, kb_retrieval, rag, rag_stream, upload
+from .routers import ingest_stream, kb_admin, kb_retrieval, rag, rag_stream, upload
 from .services.budget import preflight_tokenizer
 from .services.embedder import TEIEmbedder
 from .services.logging_setup import configure_json_logging
@@ -164,6 +164,8 @@ def build_app() -> FastAPI:
     app.include_router(rag.router)
     # P3.0 — SSE progress stream for the RAG pipeline.
     app.include_router(rag_stream.router)
+    # SSE progress stream for KB document ingest (per-KB).
+    app.include_router(ingest_stream.router)
 
     # P2.5 — Prometheus metrics. Fail-open if prometheus_client missing.
     _mount_metrics(app)
@@ -178,7 +180,7 @@ def build_ext_routers():
     """
     from .config import clear_settings_cache, get_settings
     from .db.session import make_engine, make_sessionmaker
-    from .routers import kb_admin, kb_retrieval, rag, rag_stream, upload
+    from .routers import ingest_stream, kb_admin, kb_retrieval, rag, rag_stream, upload
     from .services import auth as auth_svc
     from .services.embedder import TEIEmbedder
     from .services.vector_store import VectorStore
@@ -305,4 +307,5 @@ def build_ext_routers():
         upload.router,
         rag.router,
         rag_stream.router,  # P3.0 — SSE progress stream
+        ingest_stream.router,  # SSE progress for KB ingest
     ]
