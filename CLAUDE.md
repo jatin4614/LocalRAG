@@ -2,7 +2,7 @@
 
 **Project type:** Self-hosted, air-gapped, multi-user ChatGPT-style assistant for organizations
 **Status:** Plan A + Plan B both merged to `main` (2026-04-26 commit `d1aa862` no-ff). Production live; soak fixes ongoing.
-**Repo strategy:** Thin fork of Open WebUI; org-specific code lives under `ext/` and `compose/`, upstream tracked via the `upstream/` git submodule and small patches in `patches/`.
+**Repo strategy:** Thin fork of Open WebUI; org-specific code lives under `ext/` and `compose/`. Upstream Open WebUI is **vendored** under `upstream/` (was a git submodule pre-2026-04-30; collapsed into the parent repo so cloning produces a self-contained, offline-deployable system). Frontend patches in `patches/` are now pre-applied in the vendored tree and kept as historical reference.
 **Hardware (deploy host):** Single box with **GPU 0: RTX 6000 Ada 48 GB** (vllm-chat) + **GPU 1: RTX PRO 4000 Blackwell 24 GB** (TEI, vllm-qu, reranker, fastembed). 125 GB RAM, 2.7 TB disk, Linux 6.8, CUDA 13.0.
 **Deploy mode:** `docker-compose` on a single host. Air-gapped after first model download (`HF_HUB_OFFLINE=1` everywhere).
 
@@ -67,7 +67,7 @@ make eval-evolution
 | Qdrant schema constants | `ext/db/qdrant_schema.py` |
 | Celery worker | `ext/workers/{celery_app,ingest_worker,scheduled_eval,blob_gc_task}.py` |
 | Compose | `compose/docker-compose.yml` (+ `docker-compose.observability.yml` overlay) |
-| Frontend patches | `patches/0001…0004` applied over `upstream/` submodule |
+| Frontend patches | `patches/0001…0004` pre-applied in vendored `upstream/` (kept as historical reference) |
 | Operator scripts | `scripts/*.py` (reshard, reingest, backfill, soak, eval) |
 
 ---
@@ -630,7 +630,7 @@ Default backend `tesseract` — baked into open-webui + celery-worker images, no
 
 ## 8. Frontend (Open WebUI patches)
 
-Upstream Open WebUI is tracked as a git submodule under `upstream/`; org-specific changes are 4 surgical patches in `patches/` applied at image build (`scripts/apply_patches.sh`):
+Upstream Open WebUI is vendored under `upstream/` (was a git submodule pre-2026-04-30; collapsed for self-contained offline deployment). Org-specific changes were 4 surgical patches in `patches/` — these are now pre-applied in the vendored tree. The patch files are kept for historical reference and for re-deriving deltas when Open WebUI is next upgraded:
 
 | Patch | Purpose |
 |---|---|
@@ -823,7 +823,7 @@ LocalRAG/
 │   └── .env.example                    Template
 ├── observability/                      LGTM stack docker-compose + configs
 ├── Dockerfile.openwebui.cu128          Open WebUI image, cu128 + torch ≥ 2.7
-├── upstream/                           Open WebUI git submodule
+├── upstream/                           Open WebUI vendored source (was submodule pre-2026-04-30)
 ├── patches/                            0001…0004 + vllm/gemma4_mm.py
 ├── scripts/                            Operator + maintenance scripts
 ├── tests/

@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
+# DEPRECATED (2026-04-30): upstream/ is now vendored, not a submodule. The
+# patches in patches/*.patch are already applied in the vendored source
+# tree; bootstrap.sh no longer calls this script. It is kept only for
+# re-deriving deltas if/when Open WebUI is upgraded — initialize a temporary
+# git repo inside upstream/ in that case.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 UP="$ROOT/upstream"
 
 if ! git -C "$UP" rev-parse --git-dir &>/dev/null; then
-  echo "!! upstream submodule not initialized — run: git submodule update --init upstream" >&2
+  echo "!! upstream/ is no longer a git repo (vendored 2026-04-30)." >&2
+  echo "   Patches are pre-applied. To re-derive patches against an upgraded" >&2
+  echo "   upstream, init a temporary git repo inside upstream/, commit the" >&2
+  echo "   pristine v0.X.Y, then apply your changes and 'git format-patch'." >&2
   exit 1
 fi
 

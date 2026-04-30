@@ -66,8 +66,10 @@ fi
 say "Step 2/6: generate self-signed cert (idempotent)"
 do_run "bash scripts/gen_self_signed_cert.sh"
 
-say "Step 3/6: apply upstream patches"
-do_run "bash scripts/apply_patches.sh"
+say "Step 3/6: upstream patches (vendored — no-op since 2026-04-30)"
+say "  upstream/ is now a vendored directory; patches are pre-applied in the source."
+say "  scripts/apply_patches.sh is kept only for re-deriving patches if/when"
+say "  upstream Open WebUI is upgraded; it is not part of the bootstrap path."
 
 say "Step 4/6: docker compose up -d"
 do_run "docker compose -f compose/docker-compose.yml --env-file compose/.env up -d"
