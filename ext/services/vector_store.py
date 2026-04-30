@@ -147,6 +147,10 @@ _PAYLOAD_FIELDS = [
     # tag (``"doc_summary"``). Required in the allowlist so retriever
     # post-filters on ``level`` actually see the field.
     "level", "kind",
+    # Phase 2.2 — temporal shard provenance. Returned so observability
+    # logging + the bridge's per-shard hit-count metric can label which
+    # monthly bucket a hit came from. Not load-bearing for ranking.
+    "shard_key", "shard_key_origin",
 ]
 
 # Name of the named dense vector when a collection is created with sparse vectors
@@ -191,9 +195,13 @@ class VectorStore:
         # the Qdrant root endpoint via a fresh httpx client (the qdrant-client
         # itself doesn't expose a cheap "is the server up?" call).
         self._url = url
+        # Plan B Phase 6 followup (2026-04-28): bumped from 30s to 120s.
+        # Large ColBERT-laden upserts (multi-vector ~400 KB per chunk) plus
+        # Qdrant under memory pressure can blow past 30s. RAG_QDRANT_TIMEOUT
+        # env override lets ops dial up further without code change.
         self._client = AsyncQdrantClient(
             url=url,
-            timeout=30.0,
+            timeout=float(os.environ.get("RAG_QDRANT_TIMEOUT", "120.0")),
             pool_size=_env_int("RAG_QDRANT_MAX_CONNS", 32),
         )
         self._vector_size = vector_size
@@ -683,6 +691,14 @@ class VectorStore:
             colbert=use_colbert,
         ):
             _t = _perf_counter()
+            # Plan B Phase 6 followup (2026-04-28): batch upserts. ColBERT
+            # multi-vectors at ~400 KB per chunk push all-in-one payloads to
+            # 100 MB+, and Qdrant under memory pressure can't respond within
+            # httpx timeout — manifests as ReadError and ingest task
+            # rejection (see ARMY CYBER SECURITY POLICY 2023.pdf failure
+            # 2026-04-28 06:04). Default batch=16 keeps payload <10 MB; env
+            # override lets ops tune.
+            _batch = max(1, int(os.environ.get("RAG_UPSERT_BATCH", "16")))
             try:
                 if not use_sparse and not use_colbert and not force_named:
                     # Legacy path — byte-identical to pre-hybrid behavior.
@@ -694,10 +710,13 @@ class VectorStore:
                         )
                         for p in points
                     ]
-                    await self._client.upsert(
-                        collection_name=name, points=pts, wait=True,
-                        **upsert_extra,
-                    )
+                    for _i in range(0, len(pts), _batch):
+                        await self._client.upsert(
+                            collection_name=name,
+                            points=pts[_i:_i + _batch],
+                            wait=True,
+                            **upsert_extra,
+                        )
                     return
 
                 # Named-vector path — pack dense under _DENSE_NAME, sparse
@@ -726,10 +745,19 @@ class VectorStore:
                     pts.append(
                         qm.PointStruct(id=p["id"], vector=vec_map, payload=p.get("payload", {}))
                     )
-                await self._client.upsert(
-                    collection_name=name, points=pts, wait=True,
-                    **upsert_extra,
-                )
+                if len(pts) > _batch:
+                    import logging as _log
+                    _log.getLogger("orgchat.vector_store").info(
+                        "upsert: collection=%s n_points=%d batches=%d batch_size=%d",
+                        name, len(pts), (len(pts) + _batch - 1) // _batch, _batch,
+                    )
+                for _i in range(0, len(pts), _batch):
+                    await self._client.upsert(
+                        collection_name=name,
+                        points=pts[_i:_i + _batch],
+                        wait=True,
+                        **upsert_extra,
+                    )
             finally:
                 try:
                     qdrant_upsert_latency_seconds.observe(_perf_counter() - _t)
@@ -744,6 +772,7 @@ class VectorStore:
         owner_user_id: Optional[int | str] = None,
         chat_id: Optional[int | str] = None,
         level: Optional[str] = None,
+        shard_keys: Optional[list[str]] = None,
     ) -> qm.Filter:
         """Build the standard Qdrant filter for every read path.
 
@@ -800,6 +829,18 @@ class VectorStore:
                     match=qm.MatchValue(value=chat_id),
                 )
             )
+        # Phase 2.2 — temporal shard filter. Restricts the candidate set to
+        # the named monthly buckets. Mirrors what the temporal RAPTOR /
+        # specific_date intent already does internally; exposed here so
+        # multi-month queries (months: [2,5,7,12]) can ride the standard
+        # search() path with N shards in a single MatchAny.
+        if shard_keys:
+            must_conditions.append(
+                qm.FieldCondition(
+                    key="shard_key",
+                    match=qm.MatchAny(any=list(shard_keys)),
+                )
+            )
         must_not_conditions = [
             qm.FieldCondition(key="deleted", match=qm.MatchValue(value=True))
         ]
@@ -834,6 +875,7 @@ class VectorStore:
         chat_id: Optional[int | str] = None,
         level: Optional[str] = None,
         rescore: Optional[bool] = None,
+        shard_keys: Optional[list[str]] = None,
     ) -> List[Hit]:
         """Dense-only search.
 
@@ -865,6 +907,7 @@ class VectorStore:
             owner_user_id=owner_user_id,
             chat_id=chat_id,
             level=level,
+            shard_keys=shard_keys,
         )
         # Warm the sparse cache lazily (cheap, cached on first call) so legacy
         # callers that only use dense still route correctly against hybrid collections.
@@ -924,6 +967,7 @@ class VectorStore:
         chat_id: Optional[int | str] = None,
         level: Optional[str] = None,
         rescore: Optional[bool] = None,
+        shard_keys: Optional[list[str]] = None,
     ) -> List[Hit]:
         """Server-side RRF fusion of dense + BM25 sparse (+ optional ColBERT) results.
 
@@ -962,6 +1006,7 @@ class VectorStore:
             owner_user_id=owner_user_id,
             chat_id=chat_id,
             level=level,
+            shard_keys=shard_keys,
         )
         indices, values = embed_sparse_query(query_text)
         # P2.4 + P3.2: SearchParams carries hnsw_ef AND (when rescore is on)
@@ -1043,8 +1088,24 @@ class VectorStore:
 
         Tries int match first (new canonical form, enforced in ingest.py and
         by scripts/normalize_doc_ids.py), falls back to string match for any
-        legacy rows that haven't been normalised yet. Returns 1 on success,
-        0 on any error (best-effort — caller should log).
+        legacy rows that haven't been normalised yet. Returns the number of
+        Qdrant operations issued (1 for non-sharded; 1 per shard touched for
+        custom-sharded). Returns 0 if the doc had no matching points.
+
+        Custom-sharded collections (Plan B Phase 5: ``kb_*_v4``) require an
+        explicit ``shard_key_selector`` on every write — Qdrant rejects bare
+        deletes with ``"Shard key not specified"``. Before Phase 5 followup,
+        the bare-delete path silently returned 0 (caught by the bare ``except``)
+        which left the doc's chunks orphaned in Qdrant even though the
+        ``kb_documents`` row was soft-deleted. The retrieval filter has
+        ``deleted=true`` as ``must_not`` but soft-deleted DB rows do NOT
+        propagate ``deleted=true`` into the existing Qdrant payloads, so
+        orphaned chunks were still retrievable until a manual GC sweep.
+
+        Fix: scroll the collection (filtered by doc_id) to discover which
+        shard_keys hold points for this doc, then issue one per-shard delete.
+        Cost: one extra scroll round-trip per delete; negligible compared to
+        the actual point delete (which is a payload-index lookup).
         """
         candidates: list[int | str] = []
         try:
@@ -1053,15 +1114,63 @@ class VectorStore:
             pass
         candidates.append(str(doc_id))
 
+        flt = qm.Filter(should=[
+            qm.FieldCondition(key="doc_id", match=qm.MatchValue(value=v))
+            for v in candidates
+        ])
+
+        # Discover the shard_keys that hold this doc's points. On a non-
+        # sharded collection ``shard_key`` payloads are absent and we get
+        # one bucket of ``None`` — we then issue a single bare delete.
+        shard_keys: set[str] = set()
+        try:
+            offset = None
+            while True:
+                points, offset = await self._client.scroll(
+                    collection_name=collection,
+                    scroll_filter=flt,
+                    limit=256,
+                    offset=offset,
+                    with_payload=["shard_key"],
+                    with_vectors=False,
+                )
+                for p in points:
+                    sk = (p.payload or {}).get("shard_key")
+                    if isinstance(sk, str):
+                        shard_keys.add(sk)
+                if offset is None or not points:
+                    break
+        except Exception:
+            # If the scroll itself fails, fall back to a bare delete attempt
+            # below — best-effort. The custom-sharded case will then return
+            # 0 (current behaviour) and surface the issue via the caller's
+            # log.warning.
+            pass
+
+        ops = 0
+        if shard_keys and await self._is_custom_sharded(collection):
+            for sk in sorted(shard_keys):
+                try:
+                    await self._client.delete(
+                        collection_name=collection,
+                        points_selector=qm.FilterSelector(filter=flt),
+                        wait=True,
+                        shard_key_selector=sk,
+                    )
+                    ops += 1
+                except Exception:
+                    # Per-shard failure is logged via the operation count
+                    # asymmetry; don't bail out — try the remaining shards
+                    # so a single transient error doesn't strand most of
+                    # the points.
+                    continue
+            return ops
+
+        # Non-sharded path (or scroll discovered no points to constrain by).
         try:
             await self._client.delete(
                 collection_name=collection,
-                points_selector=qm.FilterSelector(
-                    filter=qm.Filter(should=[
-                        qm.FieldCondition(key="doc_id", match=qm.MatchValue(value=v))
-                        for v in candidates
-                    ])
-                ),
+                points_selector=qm.FilterSelector(filter=flt),
                 wait=True,
             )
             return 1
@@ -1213,6 +1322,12 @@ class VectorStore:
         Caller must ensure all points belong to the named shard. Mixing
         shards in one call is a Qdrant constraint violation.
 
+        If the target shard_key doesn't exist yet on a custom-sharded
+        collection, Qdrant returns 400 ``Shard key "X" not found``. We
+        catch that, create the shard_key on-demand (idempotent) and
+        retry once. Lets ingest of new monthly buckets work without
+        operator intervention each time a calendar month rolls over.
+
         Plan B Phase 5.1; Phase 5.9 added per-shard latency observation.
         Plan B Phase 5 followup (2026-04-26): delegate to ``upsert`` so the
         named-vector dispatch (sparse / colbert) and the schema-aware encoding
@@ -1226,9 +1341,20 @@ class VectorStore:
         from .metrics import RAG_SHARD_UPSERT_LATENCY
         _start = _t.monotonic()
         try:
-            await self.upsert(
-                collection, points, shard_key_selector=shard_key,
-            )
+            try:
+                await self.upsert(
+                    collection, points, shard_key_selector=shard_key,
+                )
+            except Exception as e:
+                msg = str(e)
+                # Qdrant 400 body: 'Wrong input: Shard key "2026-04" not found'
+                if "Shard key" in msg and "not found" in msg:
+                    await self._create_shard_key_idempotent(collection, shard_key)
+                    await self.upsert(
+                        collection, points, shard_key_selector=shard_key,
+                    )
+                else:
+                    raise
         finally:
             try:
                 RAG_SHARD_UPSERT_LATENCY.labels(
@@ -1236,6 +1362,44 @@ class VectorStore:
                 ).observe(_t.monotonic() - _start)
             except Exception:
                 pass
+
+    async def _create_shard_key_idempotent(
+        self, collection: str, shard_key: str,
+    ) -> None:
+        """Create a shard_key on a custom-sharded collection.
+
+        Idempotent: ``already exists`` (Qdrant 409) is treated as success.
+        Used by ``upsert_temporal`` to lazily create month buckets when
+        the calendar advances (and by ``upload.py`` to seed the first
+        month at collection-create time).
+        """
+        # Discover peer ids — required for create_shard_key in cluster
+        # mode. Single-peer dev mode still needs explicit placement;
+        # otherwise Qdrant returns 400 "Distributed mode disabled". The
+        # cluster API exposes this via raw HTTP only.
+        peer_ids: list[int] = []
+        try:
+            import httpx as _httpx
+            qdrant_url = (
+                self._url.rstrip("/")
+                if hasattr(self, "_url") else "http://qdrant:6333"
+            )
+            async with _httpx.AsyncClient(timeout=5.0) as _http:
+                r = await _http.get(f"{qdrant_url}/cluster")
+                if r.status_code == 200:
+                    peers = r.json().get("result", {}).get("peers", {}) or {}
+                    peer_ids = [int(pid) for pid in peers.keys()]
+        except Exception:
+            peer_ids = []
+        try:
+            await self._client.create_shard_key(
+                collection_name=collection,
+                shard_key=shard_key,
+                placement=peer_ids or None,
+            )
+        except Exception as e:
+            if "exists" not in str(e).lower():
+                raise
 
     # ------------------------------------------------------------------
     # Plan B Phase 5.3 — tiered storage (hot/warm/cold)

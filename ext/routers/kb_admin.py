@@ -434,23 +434,94 @@ async def delete_document(
     user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(_get_session),
 ):
-    # Soft-delete the DB row
-    from datetime import datetime, timezone
-    from sqlalchemy import update
-    r = await session.execute(
-        update(KBDocument).where(KBDocument.id == doc_id, KBDocument.kb_id == kb_id)
-        .values(deleted_at=datetime.now(timezone.utc))
-    )
-    if r.rowcount == 0:
+    """Hard-delete a doc end-to-end: Qdrant points first, then DB row.
+
+    Order of operations matters. Previously this endpoint soft-deleted the DB
+    row, then best-effort attempted the Qdrant delete and swallowed any
+    failure — which left Qdrant points orphaned on custom-sharded collections
+    (where the bare ``delete(filter=...)`` call returns "Shard key not
+    specified"). Retrieval still surfaced the orphaned chunks because the
+    ``deleted=true`` payload bit is only stamped at ingest time, not on a
+    soft-delete.
+
+    New behaviour:
+      1. Look up the doc row first; 404 if missing.
+      2. Issue the Qdrant per-shard delete via :meth:`VectorStore.delete_by_doc`,
+         which scrolls to discover ``shard_key`` then deletes per shard.
+      3. If Qdrant returns ``0`` (no shards touched and no fallback delete
+         succeeded) AND the doc previously had chunks, return HTTP 500 so the
+         admin retries instead of seeing a green tick on a half-finished
+         delete.
+      4. Hard-delete the ``kb_documents`` row only after the Qdrant side is
+         clean. Cascade cleans subtag links via FK ``ON DELETE CASCADE``;
+         the blob (if any) is reclaimed by ``blob_gc`` on its next sweep.
+
+    Falls open on the "doc had 0 chunks" edge case: we don't fail when the
+    Qdrant delete touches 0 shards if the row's ``chunk_count`` is also 0
+    (incomplete ingest, or a queued doc that never embedded).
+    """
+    from sqlalchemy import delete as sql_delete
+
+    doc = (await session.execute(
+        select(KBDocument).where(
+            KBDocument.id == doc_id, KBDocument.kb_id == kb_id,
+        )
+    )).scalar_one_or_none()
+    if doc is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="doc not found")
 
-    # Delete vectors from Qdrant for this doc_id (prevents retrieval of deleted doc's chunks).
+    expected_chunks = int(doc.chunk_count or 0)
+
     if _VS is not None:
         try:
-            await _VS.delete_by_doc(f"kb_{kb_id}", doc_id)
+            ops = await _VS.delete_by_doc(f"kb_{kb_id}", doc_id)
         except Exception as e:
-            log.warning("failed to delete vectors for doc %s from kb_%s: %s", doc_id, kb_id, e)
+            log.error(
+                "delete_document: vector delete raised kb=%s doc=%s err=%s",
+                kb_id, doc_id, e,
+            )
+            raise HTTPException(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"qdrant delete raised: {e!s:.200}",
+            ) from e
+        if ops == 0 and expected_chunks > 0:
+            log.error(
+                "delete_document: vector delete touched 0 shards for "
+                "doc=%s kb=%s but expected %d chunks — orphan risk; "
+                "DB row left intact for retry",
+                doc_id, kb_id, expected_chunks,
+            )
+            raise HTTPException(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="qdrant delete failed (0 ops, expected chunks > 0); "
+                       "DB row left intact for retry",
+            )
 
+    # Optional blob cleanup: only relevant when the doc was queued but
+    # never finished ingesting (status != done). The blob_store delete is
+    # best-effort and idempotent — a missing blob is not an error.
+    blob_sha = getattr(doc, "blob_sha", None)
+    if blob_sha and (doc.ingest_status or "") in ("queued", "embedding", "chunking"):
+        try:
+            from ext.services.blob_store import BlobStore
+            import os as _os
+            BlobStore(
+                _os.environ.get("INGEST_BLOB_ROOT", "/var/ingest")
+            ).delete(blob_sha)
+        except Exception as e:
+            log.warning(
+                "delete_document: blob cleanup failed sha=%s doc=%s: %s",
+                blob_sha, doc_id, e,
+            )
+
+    # Hard-delete the row (cascade FKs do the rest).
+    r = await session.execute(
+        sql_delete(KBDocument).where(
+            KBDocument.id == doc_id, KBDocument.kb_id == kb_id,
+        )
+    )
+    if r.rowcount == 0:  # racy concurrent delete; treat as already-gone
+        log.info("delete_document: row already gone kb=%s doc=%s", kb_id, doc_id)
     await session.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
