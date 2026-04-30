@@ -175,21 +175,88 @@ def _blocks_csv(data: bytes) -> list[ExtractedBlock]:
 
 
 def _blocks_pdf(data: bytes) -> list[ExtractedBlock]:
-    from pypdf import PdfReader
-
-    reader = PdfReader(io.BytesIO(data))
-    blocks: list[ExtractedBlock] = []
-    for i, page in enumerate(reader.pages, start=1):
-        t = page.extract_text() or ""
-        if not t.strip():
-            # Empty / image-only page — skip rather than emit an empty block.
-            # Flat extractor still preserves "\n\n" separators for parity.
-            continue
-        blocks.append(ExtractedBlock(text=t, page=i))
-    return blocks
+    """Extract text per page. Prefer pymupdf when available — it deduplicates
+    overlay/watermark text streams that pypdf returns verbatim, which on
+    stamped/scanned policy PDFs (e.g. ARMY CYBER SECURITY POLICY 2023) caused
+    the same page text to appear twice in every chunk (~59% chunks duplicated,
+    measured 2026-04-28). pypdf path retained as the import-failure fallback.
+    """
+    try:
+        import pymupdf  # type: ignore
+        doc = pymupdf.open(stream=data, filetype="pdf")
+        try:
+            blocks: list[ExtractedBlock] = []
+            for i in range(doc.page_count):
+                page = doc.load_page(i)
+                t = page.get_text() or ""
+                t = _dedup_overlay_text(t)
+                if not t.strip():
+                    continue
+                blocks.append(ExtractedBlock(text=t, page=i + 1))
+            return blocks
+        finally:
+            doc.close()
+    except ImportError:
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(data))
+        blocks = []
+        for i, page in enumerate(reader.pages, start=1):
+            t = page.extract_text() or ""
+            t = _dedup_overlay_text(t)
+            if not t.strip():
+                continue
+            blocks.append(ExtractedBlock(text=t, page=i))
+        return blocks
 
 
 _HEADING_RE = re.compile(r"^Heading\s+([1-9])$", re.IGNORECASE)
+
+
+def _dedup_overlay_text(text: str) -> str:
+    """Strip duplicate-content artifacts that some stamped/watermarked PDFs
+    embed per page. Observed pattern: ``A + W + A`` where ``A`` is the real
+    page text and ``W`` is a one-line stamp (e.g. ``IP / TIMESTAMP``); both
+    pypdf and pymupdf faithfully extract the doubled content.
+
+    Algorithm: take the first 80 stripped chars as a fingerprint; search for
+    them past the first third of ``text``; if char-match between the leading
+    half and the candidate duplicate exceeds 85%, truncate at the duplicate
+    boundary, returning ``A + W`` (the stamp is harmless context). Returns
+    input unchanged when no duplication found — conservative; won't fire on
+    pages with merely overlapping vocabulary or short repeated phrases.
+
+    Set ``RAG_PDF_DEDUP=0`` to disable. Default on. (Plan B Phase 6 followup
+    2026-04-28 — kb_3 ARMY CYBER SECURITY POLICY 2023.pdf showed 58 % chunks
+    duplicated; this helper drops that to ~0 %.)
+    """
+    import os
+    if os.environ.get("RAG_PDF_DEDUP", "1") != "1":
+        return text
+    if not text or len(text) < 200:
+        return text
+    stripped = text.lstrip()
+    if len(stripped) < 200:
+        return text
+    head_len = min(80, len(stripped) // 3)
+    if head_len < 30:
+        return text
+    head = stripped[:head_len]
+    second = text.find(head, len(text) // 3)
+    if second < 0:
+        return text
+    a, b = text[:second], text[second:]
+    # Skip if the fingerprint reappears past its own leading occurrence in b —
+    # that's a 3+x repeat (legitimate content like a TOC or chorus), not the
+    # binary A+W+A artifact we're trying to fix.
+    if head in b[len(head):]:
+        return text
+    common = min(len(a), len(b))
+    if common < 30:
+        return text
+    matches = sum(1 for x, y in zip(a[:common], b[:common]) if x == y)
+    if matches / common > 0.85:
+        return text[:second].rstrip()
+    return text
 
 
 def _blocks_docx(data: bytes) -> list[ExtractedBlock]:
