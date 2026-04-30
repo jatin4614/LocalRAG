@@ -17,6 +17,26 @@ from ..db.models import KnowledgeBase, KBSubtag, KBAccess
 async def create_kb(
     session: AsyncSession, *, name: str, description: Optional[str], admin_id: int
 ) -> KnowledgeBase:
+    """Create a knowledge base.
+
+    Pre-checks for an existing live KB with the same name and raises
+    :class:`ValueError` so the router can map it to a 409 with a clean,
+    sanitized message ("kb name already in use: ..."). This avoids
+    relying solely on the DB unique-constraint violation, which surfaces
+    as a generic IntegrityError that's harder to render to admins.
+
+    The pre-check + flush together is racy under concurrent inserts —
+    the DB unique index is the ultimate truth, and the router catches
+    :class:`sqlalchemy.exc.IntegrityError` and maps it to 409 too.
+    """
+    existing = (await session.execute(
+        select(KnowledgeBase.id).where(
+            KnowledgeBase.name == name,
+            KnowledgeBase.deleted_at.is_(None),
+        )
+    )).scalar_one_or_none()
+    if existing is not None:
+        raise ValueError(f"kb name already in use: {name}")
     kb = KnowledgeBase(name=name, description=description, admin_id=admin_id)
     session.add(kb)
     await session.flush()
