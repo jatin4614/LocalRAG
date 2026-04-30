@@ -108,6 +108,12 @@ class KBDocument(Base):
     # legacy rows and for sync-ingest uploads (no blob persisted). Used by
     # ext/services/blob_gc.py to free the blob after soft-delete retention.
     blob_sha: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Migration 008: Tier 1 per-doc summary. Mirror of the ``level=doc``
+    # Qdrant point text. Populated by ext.services.ingest at ingest time
+    # (when RAG_DOC_SUMMARIES=1) or retroactively by
+    # scripts/backfill_doc_summaries.py. Read by global-intent retrieval
+    # to dedupe one chunk per doc.
+    doc_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     kb: Mapped[KnowledgeBase] = relationship(back_populates="documents")
 
