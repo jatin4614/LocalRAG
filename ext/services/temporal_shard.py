@@ -46,6 +46,53 @@ _MONTH_NUM: dict[str, int] = {
     "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
 }
 
+# Month-year-only filename pattern (no day) — matches things like
+# "Jan 23.docx", "feB 23.docx", "March 2023 report.pdf". Used for
+# monthly-report archives where each filename is one whole month.
+# extract_date_tuple in query_intent rejects this case because day-less
+# dates are ambiguous in free text; for filenames the convention is
+# unambiguous so we accept it here.
+_FILENAME_MONTH_YEAR_RE = re.compile(
+    r"(?P<month>jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|"
+    r"jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|"
+    r"nov(?:ember)?|dec(?:ember)?)"
+    r"[\s_\-/\.]+"
+    r"(?P<year>\d{2}|\d{4})"
+    r"(?=$|[\s_\-/\.\(\)])",
+    re.IGNORECASE,
+)
+
+_FILE_EXT_TAILS = (
+    ".docx", ".doc", ".pdf", ".txt", ".md", ".html", ".htm",
+    ".xlsx", ".xls", ".pptx", ".ppt", ".csv", ".rtf",
+)
+
+
+def _strip_known_ext(name: str) -> str:
+    low = name.lower()
+    for ext in _FILE_EXT_TAILS:
+        if low.endswith(ext):
+            return name[: -len(ext)]
+    return name
+
+
+def _normalize_year_short(raw: str) -> int:
+    """Expand 2-digit year using the standard pivot: <70 → 20xx, ≥70 → 19xx."""
+    n = int(raw)
+    if len(raw) == 2:
+        return 1900 + n if n >= 70 else 2000 + n
+    return n
+
+
+def _month_token_to_num(tok: str) -> int | None:
+    """Map any month spelling (full or 3-letter prefix) to its 1–12 number."""
+    key = tok.strip().lower()[:3]
+    short = {
+        "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+        "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+    }
+    return short.get(key)
+
 
 def _date_to_shard_key(year: int, month: int) -> str:
     return f"{year:04d}-{month:02d}"
@@ -58,15 +105,32 @@ def extract_shard_key(
 
     Pure function — no I/O. Always returns a valid shard_key string.
     """
-    # 1. Filename
+    # 1. Filename — strip known extensions first so a "23.docx" tail
+    # doesn't confuse the month-year regex (the dot+digits look like a
+    # day-of-month).
     if filename:
-        tup = extract_date_tuple(filename)
+        stem = _strip_known_ext(filename)
+
+        # 1a. Strict day-month-year (most specific) via the shared parser.
+        tup = extract_date_tuple(stem)
         if tup is not None:
             day, month_str, year = tup
             return (
                 _date_to_shard_key(year, _MONTH_NUM[month_str]),
                 ShardKeyOrigin.FILENAME,
             )
+
+        # 1b. Filename-only "MONTH YEAR" (no day), e.g. "Jan 23",
+        # "feB 23", "March 2023 report". 2-digit year pivots at 70.
+        m = _FILENAME_MONTH_YEAR_RE.search(stem)
+        if m:
+            mn = _month_token_to_num(m.group("month"))
+            if mn is not None:
+                year = _normalize_year_short(m.group("year"))
+                return (
+                    _date_to_shard_key(year, mn),
+                    ShardKeyOrigin.FILENAME,
+                )
 
     # 2. YAML frontmatter
     if body:

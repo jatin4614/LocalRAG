@@ -222,6 +222,19 @@ async def _summarize_one(
             "sheet": None,
             "block_type": "prose",
         })
+        # Stamp the temporal shard_key so upsert into a custom-sharded
+        # collection works (the chunk-tier upsert at ingest time already
+        # stamps this; backfill must mirror that behavior).
+        if os.environ.get("RAG_SHARDING_ENABLED", "0") == "1":
+            try:
+                from ext.services.temporal_shard import extract_shard_key as _extract_sk
+                body_sample = chunks[0] if chunks else ""
+                _sk, _sk_origin = _extract_sk(filename=filename, body=body_sample)
+                summary_payload["shard_key"] = _sk
+                summary_payload["shard_key_origin"] = _sk_origin.value
+            except Exception as _e:
+                print(f"  [doc_id={doc_id}] shard_key derivation failed: {_e}", file=sys.stderr)
+                return "error", 0
         point_id = str(uuid.uuid5(_POINT_NS, f"doc:{doc_id}:doc_summary"))
         point: dict = {"id": point_id, "vector": vec, "payload": summary_payload}
         if sparse_vec is not None:

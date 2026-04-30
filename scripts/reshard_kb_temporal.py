@@ -97,6 +97,19 @@ async def main() -> int:
         action="store_true",
         help="enumerate but do not write target",
     )
+    parser.add_argument(
+        "--add-colbert",
+        action="store_true",
+        help="compute colbert vectors from each point's text payload during "
+             "migration (useful when source has only dense+sparse and you "
+             "want to upgrade to dense+sparse+colbert)",
+    )
+    parser.add_argument(
+        "--colbert-batch",
+        type=int,
+        default=8,
+        help="batch size for colbert embed (small — multivectors are large)",
+    )
     args = parser.parse_args()
 
     qc = AsyncQdrantClient(url=args.qdrant_url, timeout=300.0)
@@ -152,18 +165,66 @@ async def main() -> int:
         return 0
 
     # Pass 2: create target collection
+    target_has_colbert = has_colbert or args.add_colbert
     shard_keys = sorted(buckets.keys())
-    log.info("creating target %s with %d shard keys", args.target, len(shard_keys))
+    log.info(
+        "creating target %s with %d shard keys (colbert=%s, source had colbert=%s)",
+        args.target, len(shard_keys), target_has_colbert, has_colbert,
+    )
     await vs.ensure_collection_temporal(
         args.target,
         shard_keys=shard_keys,
         with_sparse=has_sparse,
-        with_colbert=has_colbert,
+        with_colbert=target_has_colbert,
     )
+
+    # Pass 2.5: synthesize colbert vectors from each point's text payload
+    # when --add-colbert was passed and source has none. fastembed loads the
+    # ColBERT model lazily on first call — preload once here so the timing
+    # log in pass 3 reflects steady-state per-batch latency.
+    if args.add_colbert and not has_colbert:
+        log.info("computing colbert vectors for %d points (batch=%d)",
+                 total, args.colbert_batch)
+        from ext.services.embedder import colbert_embed  # noqa: E402
+        # Flatten + collect texts; remember (sk, idx) so we can write back.
+        flat: list[tuple[str, int, str]] = []
+        for sk in shard_keys:
+            for i, ps in enumerate(buckets[sk]):
+                txt = (ps.payload or {}).get("text", "") or ""
+                flat.append((sk, i, txt))
+        log.info("computing colbert: %d texts in batches of %d",
+                 len(flat), args.colbert_batch)
+        cb_done = 0
+        for batch_start in range(0, len(flat), args.colbert_batch):
+            batch = flat[batch_start:batch_start + args.colbert_batch]
+            texts = [t for (_, _, t) in batch]
+            try:
+                cb_vecs = colbert_embed(texts)
+            except Exception as e:
+                log.error("colbert_embed failed at batch %d: %s",
+                          batch_start, repr(e)[:300])
+                raise
+            for (sk, idx, _), cb_vec in zip(batch, cb_vecs):
+                ps = buckets[sk][idx]
+                # Source had a single unnamed dense vector — promote to
+                # named dict so we can attach colbert alongside.
+                if isinstance(ps.vector, list):
+                    new_vec = {"dense": ps.vector, "colbert": cb_vec}
+                elif isinstance(ps.vector, dict):
+                    new_vec = dict(ps.vector)
+                    new_vec["colbert"] = cb_vec
+                else:
+                    new_vec = {"dense": list(ps.vector), "colbert": cb_vec}
+                buckets[sk][idx] = PointStruct(
+                    id=ps.id, vector=new_vec, payload=ps.payload,
+                )
+            cb_done += len(batch)
+            if cb_done % (args.colbert_batch * 50) == 0 or cb_done == len(flat):
+                log.info("colbert progress: %d/%d", cb_done, len(flat))
 
     # Pass 3: upsert per shard, chunked to avoid 400s on large requests.
     # ColBERT multi-vectors blow up the request body — keep batches small.
-    UPSERT_CHUNK = 64
+    UPSERT_CHUNK = 32 if target_has_colbert else 64
     for sk in shard_keys:
         points = buckets[sk]
         log.info("upserting shard_key=%s (%d points, chunk=%d)",

@@ -46,6 +46,16 @@ log = logging.getLogger("orgchat.qu")
 # JSON schema fed to vLLM's guided_json. Keep this in lockstep with
 # :class:`QueryUnderstanding` below — tests in
 # ``test_query_understanding_schema.py`` enforce the shape.
+#
+# Phase 2.1 update: ``temporal_constraint`` now carries ``months`` and
+# ``years`` arrays alongside the legacy singular ``year``/``quarter``/
+# ``month`` fields. The LLM is instructed (see _PROMPT_TEMPLATE) to use
+# the arrays whenever the query mentions multiple months or years
+# ("activities in May, July, December and February 2023" → months:[2,5,7,12],
+# years:[2023]). Single-month queries may use either form. Readers
+# (retriever._filter_by_temporal_constraint) prefer the arrays when
+# non-empty and fall back to the singular fields otherwise, so existing
+# single-month behaviour is byte-equivalent.
 QU_OUTPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -72,7 +82,9 @@ QU_OUTPUT_SCHEMA: dict[str, Any] = {
                 {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["year", "quarter", "month"],
+                    "required": [
+                        "year", "quarter", "month", "months", "years",
+                    ],
                     "properties": {
                         "year": {
                             "anyOf": [
@@ -91,6 +103,24 @@ QU_OUTPUT_SCHEMA: dict[str, Any] = {
                                 {"type": "integer", "minimum": 1, "maximum": 12},
                                 {"type": "null"},
                             ],
+                        },
+                        "months": {
+                            "type": "array",
+                            "items": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 12,
+                            },
+                            "maxItems": 12,
+                        },
+                        "years": {
+                            "type": "array",
+                            "items": {
+                                "type": "integer",
+                                "minimum": 1900,
+                                "maximum": 2100,
+                            },
+                            "maxItems": 20,
                         },
                     },
                 },
@@ -150,14 +180,39 @@ Your task:
    - metadata: enumeration / catalog questions ("list documents", "what files do I have")
    - global: aggregation / coverage across the corpus ("compare", "trends", "summarize all")
    - specific: single-document or content-anchored question
-   - specific_date: question pinpointing a date or month
+   - specific_date: question pinpointing one or more dates / months / quarters / years
 2. Resolve the query into a standalone form. Replace pronouns ("it", "that") with
    their antecedents from history. Replace relative time ("last quarter", "yesterday")
    with absolute dates relative to today.
-3. Extract a temporal_constraint object {{year, quarter, month}} if any is implied;
-   otherwise null. quarter is 1-4 (Q1=Jan-Mar). month is 1-12.
-4. List the named entities (products, places, people) referenced in the query.
+3. Extract a temporal_constraint object. Populate fields based on what the query says:
+   - "months": list of month numbers (1-12) when ANY months are mentioned. Use this
+     for multi-month queries: "May, July, December and February 2023" -> months: [2,5,7,12].
+     For a single month, "months" may have one element OR set "month" alone.
+   - "years": list of year numbers (1900-2100) when ANY years are mentioned. Same
+     pattern: multi-year goes in the array, single-year may use either form.
+   - "month", "quarter", "year": singular legacy fields. Set to null if the array
+     form is populated, OR if no temporal anchor is mentioned. Quarter is 1-4 (Q1=Jan-Mar).
+   - When the query has NO temporal anchor at all, set temporal_constraint = null.
+   - When "since 2020", "from 2021 to 2023", or similar ranges appear, expand into
+     the full years list (e.g. "2021 to 2023" -> years: [2021, 2022, 2023]).
+   - Always include both "months" and "years" arrays in the object (use [] when
+     not applicable) — required by the schema.
+   Multi-temporal queries are common ("activities in May, Jul, Dec, Feb 2023",
+   "compare Q1 and Q3 of 2023") — prefer the array form for those.
+4. List the named entities (products, places, people, units, brigades) referenced.
 5. Output your confidence in [0.0, 1.0].
+
+Examples of temporal_constraint shape:
+  - "What happened in February 2023?" ->
+    {{"year": 2023, "quarter": null, "month": 2, "months": [], "years": []}}
+  - "Activities in May, July, Dec, Feb 2023" ->
+    {{"year": null, "quarter": null, "month": null,
+      "months": [2,5,7,12], "years": [2023]}}
+  - "Compare 2022 and 2023" ->
+    {{"year": null, "quarter": null, "month": null,
+      "months": [], "years": [2022, 2023]}}
+  - "Summarize the entire corpus" ->
+    null
 
 Respond with JSON ONLY, conforming to the provided schema."""
 
@@ -212,6 +267,24 @@ def parse_qu_response(raw: str) -> QueryUnderstanding:
     tc = data.get("temporal_constraint")
     if tc is not None and not isinstance(tc, dict):
         raise ValueError("temporal_constraint must be null or object")
+    # Phase 2.1 — soft-validate the new arrays. The schema enforces the
+    # bounds on the LLM side; this is defense-in-depth for the
+    # occasional pre-V1 guided_json escape. Coerce to empty list on any
+    # type drift so downstream filter helpers don't have to special-case.
+    if isinstance(tc, dict):
+        for k in ("months", "years"):
+            v = tc.get(k)
+            if v is None:
+                tc[k] = []
+                continue
+            if not isinstance(v, list):
+                tc[k] = []
+                continue
+            tc[k] = [int(x) for x in v if isinstance(x, (int, float))]
+        # Cap months to 1..12 / years to 1900..2100 — the schema says so
+        # but a non-strict guided_json can land out-of-bounds values.
+        tc["months"] = [m for m in tc["months"] if 1 <= m <= 12]
+        tc["years"] = [y for y in tc["years"] if 1900 <= y <= 2100]
 
     entities = data.get("entities") or []
     if not isinstance(entities, list):
@@ -286,34 +359,68 @@ async def analyze_query(
         },
     }
 
+    # P3.1 — single retry on transient failures (timeout / connect /
+    # read). Schema violations and HTTP 4xx do NOT retry: those are
+    # deterministic. The retry uses HALF the per-call timeout so the
+    # total wall-clock stays bounded by ~1.5×timeout_ms even when both
+    # attempts fail. Caught: ~5% of QU calls were timing out at 600ms,
+    # falling back to regex and dropping all temporal extraction.
     _t0 = _time.monotonic()
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.post(f"{qu_url}/chat/completions", json=payload)
-            r.raise_for_status()
-            data = r.json()
-            raw = data["choices"][0]["message"]["content"]
-            try:
-                return parse_qu_response(raw)
-            except ValueError:
-                # Schema violation — bump the dedicated counter so the
-                # alert in observability/prometheus/alerts-qu.yml fires.
+    _last_exc: Exception | None = None
+    for _attempt in (1, 2):
+        try:
+            _per_attempt_timeout = (
+                timeout if _attempt == 1 else max(timeout / 2.0, 0.001)
+            )
+            async with httpx.AsyncClient(timeout=_per_attempt_timeout) as client:
+                r = await client.post(f"{qu_url}/chat/completions", json=payload)
+                r.raise_for_status()
+                data = r.json()
+                raw = data["choices"][0]["message"]["content"]
                 try:
-                    rag_qu_schema_violations.inc()
+                    return parse_qu_response(raw)
+                except ValueError:
+                    # Schema violation — bump the dedicated counter so the
+                    # alert in observability/prometheus/alerts-qu.yml fires.
+                    try:
+                        rag_qu_schema_violations.inc()
+                    except Exception:
+                        pass
+                    raise
+        except (asyncio.TimeoutError, httpx.TimeoutException) as e:
+            _last_exc = e
+            if _attempt == 1:
+                log.info(
+                    "QU LLM timed out after %dms (attempt 1/2) — retrying",
+                    int(_per_attempt_timeout * 1000),
+                )
+                continue
+            log.warning(
+                "QU LLM timed out twice (budget %dms); falling back to regex",
+                timeout_ms,
+            )
+        except (httpx.ConnectError, httpx.ReadError) as e:
+            _last_exc = e
+            if _attempt == 1:
+                log.info(
+                    "QU LLM transport error (attempt 1/2): %s — retrying", e,
+                )
+                continue
+            log.warning("QU LLM transport error twice: %s; falling back", e)
+        except (httpx.HTTPError, KeyError, IndexError, ValueError) as e:
+            log.warning("QU LLM error: %s; falling back to regex", e)
+            try:
+                rag_qu_latency.observe(_time.monotonic() - _t0)
+            except Exception:
+                pass
+            return None
+        finally:
+            if _attempt == 2 or _last_exc is None:
+                try:
+                    rag_qu_latency.observe(_time.monotonic() - _t0)
                 except Exception:
                     pass
-                raise
-    except (asyncio.TimeoutError, httpx.TimeoutException):
-        log.warning("QU LLM timed out after %dms; falling back to regex", timeout_ms)
-        return None
-    except (httpx.HTTPError, KeyError, IndexError, ValueError) as e:
-        log.warning("QU LLM error: %s; falling back to regex", e)
-        return None
-    finally:
-        try:
-            rag_qu_latency.observe(_time.monotonic() - _t0)
-        except Exception:
-            pass
+    return None
 
 
 __all__ = [

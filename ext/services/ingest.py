@@ -769,6 +769,18 @@ async def _emit_doc_summary_point(
     summary_payload.setdefault("heading_path", [])
     summary_payload.setdefault("sheet", None)
 
+    # Stamp the same shard_key the chunk points used so this doc-summary
+    # point lands in the correct temporal shard. Without this, upsert
+    # into a custom-sharded collection raises "every point's payload
+    # must include a 'shard_key'". Body sample reuses the first chunk
+    # which mirrors what the chunk-side derivation does.
+    if _sharding_enabled():
+        from .temporal_shard import extract_shard_key as _extract_sk
+        body_sample = chunks_texts[0] if chunks_texts else ""
+        _sk, _sk_origin = _extract_sk(filename=filename, body=body_sample)
+        summary_payload["shard_key"] = _sk
+        summary_payload["shard_key_origin"] = _sk_origin.value
+
     point_id = str(_uuid.uuid5(_POINT_NS, f"doc:{doc_id}:doc_summary"))
     point = {"id": point_id, "vector": summary_vec, "payload": summary_payload}
 

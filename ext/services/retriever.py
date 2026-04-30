@@ -141,6 +141,7 @@ async def retrieve(
     owner_user_id: Optional[int | str] = None,
     level_filter: Optional[str] = None,
     doc_ids: Optional[list[int]] = None,
+    temporal_constraint: Optional[dict] = None,
 ) -> List[Hit]:
     """Run parallel searches against each selected KB and an optional chat namespace.
 
@@ -221,12 +222,28 @@ async def retrieve(
                     for c in cached
                 ][:total_limit]
 
+    # Phase 2.2 — derive shard_keys once from the temporal_constraint.
+    # Only honored when RAG_TEMPORAL_LEVELS is on AND the collection is
+    # custom-sharded; vector_store.search/hybrid_search adds the
+    # MatchAny(shard_key) filter at query time. KB collections may or
+    # may not be sharded — non-sharded collections silently ignore the
+    # shard_key filter (no point has a shard_key payload value, so the
+    # MatchAny falls through). Chat-private collection is not sharded.
+    _shard_keys: Optional[list[str]] = None
+    if (
+        temporal_constraint is not None
+        and os.environ.get("RAG_TEMPORAL_LEVELS", "0") == "1"
+    ):
+        sks = _shard_keys_for_constraint(temporal_constraint)
+        _shard_keys = sks or None
+
     async def _search_one(
         collection: str,
         subtag_ids: Optional[list[int]] = None,
         *,
         owner_filter: Optional[int | str] = None,
         chat_filter: Optional[int | str] = None,
+        shard_keys: Optional[list[str]] = None,
     ) -> List[Hit]:
         use_hybrid = False
         if hybrid:
@@ -265,6 +282,7 @@ async def retrieve(
                         owner_user_id=owner_filter,
                         chat_id=chat_filter,
                         level=level_filter,
+                        shard_keys=shard_keys,
                     )
                 return await vector_store.search(
                     collection, qvec, limit=per_kb_limit, subtag_ids=subtag_ids,
@@ -272,6 +290,7 @@ async def retrieve(
                     owner_user_id=owner_filter,
                     chat_id=chat_filter,
                     level=level_filter,
+                    shard_keys=shard_keys,
                 )
         except Exception:
             return []
@@ -288,7 +307,9 @@ async def retrieve(
         kb_id = cfg["kb_id"]
         subtag_ids = cfg.get("subtag_ids") or None
         # KB collections are shared — do NOT filter by owner_user_id.
-        hits = await _search_one(f"kb_{kb_id}", subtag_ids=subtag_ids)
+        hits = await _search_one(
+            f"kb_{kb_id}", subtag_ids=subtag_ids, shard_keys=_shard_keys,
+        )
         # Tier 1/2: when level_filter is set (e.g. "doc" for global-intent
         # queries) keep only points whose payload carries that level tag.
         # Post-filter in Python so the default path (level_filter=None)
@@ -481,37 +502,79 @@ async def _fetch_temporal_levels(
     return out
 
 
+def _shard_keys_for_constraint(constraint: Optional[dict]) -> list[str]:
+    """Expand a temporal_constraint into the list of matching shard_keys.
+
+    Phase 2.1: prefers the new ``months`` / ``years`` arrays. Falls back to
+    the legacy singular ``month`` / ``quarter`` / ``year`` fields when the
+    arrays are absent or empty so existing single-month behaviour is
+    byte-equivalent.
+
+    Returns ``[]`` if the constraint doesn't constrain any shard (no fields
+    set or unsupported combination). Caller decides whether ``[]`` means
+    "no filter" or "no match".
+
+    Cross-product when both arrays are populated: months [2, 5] × years
+    [2022, 2023] → 4 shard_keys (2022-02, 2022-05, 2023-02, 2023-05).
+    """
+    if not constraint:
+        return []
+    months: list[int] = list(constraint.get("months") or [])
+    years: list[int] = list(constraint.get("years") or [])
+
+    # Backfill arrays from the singular fields when the LLM populated only
+    # those (or when an old call site builds the dict by hand).
+    if not months:
+        m = constraint.get("month")
+        if isinstance(m, int) and 1 <= m <= 12:
+            months = [m]
+    if not years:
+        y = constraint.get("year")
+        if isinstance(y, int) and 1900 <= y <= 2100:
+            years = [y]
+
+    quarter = constraint.get("quarter")
+    if not months and isinstance(quarter, int) and 1 <= quarter <= 4:
+        first = (quarter - 1) * 3 + 1
+        months = [first + i for i in range(3)]
+
+    # Year-only "what happened in 2023" → all 12 months of that year.
+    if years and not months:
+        months = list(range(1, 13))
+
+    sks: list[str] = []
+    for y in years:
+        for m in months:
+            sks.append(f"{int(y):04d}-{int(m):02d}")
+    # Dedup while preserving order — month/year arrays may come in any
+    # order from the LLM.
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for s in sks:
+        if s not in seen:
+            seen.add(s)
+            deduped.append(s)
+    return deduped
+
+
 def _filter_by_temporal_constraint(constraint: Optional[dict]):
     """Build a Qdrant filter that narrows to matching shard_keys.
 
-    Plan B Phase 5.6.
+    Plan B Phase 5.6 + Phase 2.1 multi-month extension.
     """
-    if not constraint:
+    sks = _shard_keys_for_constraint(constraint)
+    if not sks:
         return None
     from qdrant_client.http.models import (
         FieldCondition, Filter, MatchAny, MatchValue,
     )
-    year = constraint.get("year")
-    month = constraint.get("month")
-    quarter = constraint.get("quarter")
-
-    if month and year:
-        sk = f"{year:04d}-{month:02d}"
+    if len(sks) == 1:
         return Filter(must=[
-            FieldCondition(key="shard_key", match=MatchValue(value=sk)),
+            FieldCondition(key="shard_key", match=MatchValue(value=sks[0])),
         ])
-    if quarter and year:
-        first_month = (quarter - 1) * 3 + 1
-        sks = [f"{year:04d}-{first_month + i:02d}" for i in range(3)]
-        return Filter(must=[
-            FieldCondition(key="shard_key", match=MatchAny(any=sks)),
-        ])
-    if year:
-        sks = [f"{year:04d}-{m:02d}" for m in range(1, 13)]
-        return Filter(must=[
-            FieldCondition(key="shard_key", match=MatchAny(any=sks)),
-        ])
-    return None
+    return Filter(must=[
+        FieldCondition(key="shard_key", match=MatchAny(any=sks)),
+    ])
 
 
 async def retrieve_for_kb(
