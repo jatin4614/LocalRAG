@@ -162,6 +162,87 @@ async def delete_subtag(session: AsyncSession, *, kb_id: int, subtag_id: int) ->
     return r.rowcount > 0
 
 
+async def get_subtag(
+    session: AsyncSession, *, kb_id: int, subtag_id: int,
+) -> Optional[KBSubtag]:
+    """Return a live subtag row if it exists in the given KB, else None.
+
+    Filters out soft-deleted rows when the column exists (forward-compat
+    with Agent B's migration). Used by the M6 rename / move-docs
+    endpoints to validate that the subtag belongs to ``kb_id``.
+    """
+    deleted_at = getattr(KBSubtag, "deleted_at", None)
+    stmt = select(KBSubtag).where(
+        KBSubtag.id == subtag_id, KBSubtag.kb_id == kb_id,
+    )
+    if deleted_at is not None:
+        stmt = stmt.where(deleted_at.is_(None))
+    return (await session.execute(stmt)).scalar_one_or_none()
+
+
+async def rename_subtag(
+    session: AsyncSession, *, kb_id: int, subtag_id: int, new_name: str,
+) -> Optional[KBSubtag]:
+    """Rename a subtag in place. Returns the updated row or None if not found.
+
+    Raises :class:`sqlalchemy.exc.IntegrityError` (caller catches) when
+    the new name collides with an existing subtag in the same KB
+    (UNIQUE(kb_id, name) index).
+    """
+    sub = await get_subtag(session, kb_id=kb_id, subtag_id=subtag_id)
+    if sub is None:
+        return None
+    sub.name = new_name
+    await session.flush()
+    return sub
+
+
+async def move_docs_to_subtag(
+    session: AsyncSession,
+    *,
+    kb_id: int,
+    source_subtag_id: int,
+    target_subtag_id: int,
+    doc_ids: Iterable[int],
+) -> int:
+    """Move documents from ``source_subtag_id`` to ``target_subtag_id``.
+
+    Validates that:
+      * the source and target subtags both exist in ``kb_id`` (live)
+      * each ``doc_id`` matches ``(kb_id, source_subtag_id)`` (else skipped)
+
+    Performs a single bulk UPDATE so the move is atomic from the DB's
+    perspective. Returns the number of rows actually moved (asyncpg
+    rowcount). Raises ValueError if the target subtag is missing or
+    not in the same KB.
+    """
+    if source_subtag_id == target_subtag_id:
+        raise ValueError("source and target subtag must differ")
+    target = await get_subtag(session, kb_id=kb_id, subtag_id=target_subtag_id)
+    if target is None:
+        raise ValueError("target subtag not found in this KB")
+    source = await get_subtag(session, kb_id=kb_id, subtag_id=source_subtag_id)
+    if source is None:
+        raise ValueError("source subtag not found in this KB")
+
+    ids = list(doc_ids)
+    if not ids:
+        return 0
+
+    from ..db.models import KBDocument
+    r = await session.execute(
+        update(KBDocument)
+        .where(
+            KBDocument.kb_id == kb_id,
+            KBDocument.subtag_id == source_subtag_id,
+            KBDocument.deleted_at.is_(None),
+            KBDocument.id.in_(ids),
+        )
+        .values(subtag_id=target_subtag_id)
+    )
+    return int(getattr(r, "rowcount", 0) or 0)
+
+
 async def soft_delete_subtag(
     session: AsyncSession, *, kb_id: int, subtag_id: int,
 ) -> bool:

@@ -300,6 +300,141 @@ async def test_list_kbs_pagination_bounds_enforced(client):
     assert r.status_code == 422
 
 
+# ---------------------------------------------------------------------------
+# M6 — subtag rename + move-docs
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_subtag_rename_endpoint(client):
+    r = await client.post("/api/kb", headers=ADMIN, json={"name": "M6-Rename-KB"})
+    kb_id = r.json()["id"]
+    r = await client.post(f"/api/kb/{kb_id}/subtags", headers=ADMIN, json={"name": "Old-Name"})
+    sub_id = r.json()["id"]
+    r = await client.patch(
+        f"/api/kb/{kb_id}/subtags/{sub_id}",
+        headers=ADMIN, json={"name": "New-Name"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["name"] == "New-Name"
+    assert body["id"] == sub_id
+
+    # Verify via list
+    r = await client.get(f"/api/kb/{kb_id}/subtags", headers=ADMIN)
+    assert any(s["name"] == "New-Name" for s in r.json())
+
+
+@pytest.mark.asyncio
+async def test_subtag_rename_404_when_wrong_kb(client):
+    r = await client.post("/api/kb", headers=ADMIN, json={"name": "KB-A"})
+    kb_a = r.json()["id"]
+    r = await client.post("/api/kb", headers=ADMIN, json={"name": "KB-B"})
+    kb_b = r.json()["id"]
+    r = await client.post(f"/api/kb/{kb_a}/subtags", headers=ADMIN, json={"name": "Sub"})
+    sub_a = r.json()["id"]
+
+    # Try renaming via KB-B's URL
+    r = await client.patch(
+        f"/api/kb/{kb_b}/subtags/{sub_a}",
+        headers=ADMIN, json={"name": "Hijack"},
+    )
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_subtag_rename_409_on_name_collision(client):
+    r = await client.post("/api/kb", headers=ADMIN, json={"name": "M6-Collide-KB"})
+    kb_id = r.json()["id"]
+    r = await client.post(f"/api/kb/{kb_id}/subtags", headers=ADMIN, json={"name": "Alpha"})
+    a_id = r.json()["id"]
+    r = await client.post(f"/api/kb/{kb_id}/subtags", headers=ADMIN, json={"name": "Beta"})
+    b_id = r.json()["id"]
+
+    # Rename Beta -> Alpha (already taken)
+    r = await client.patch(
+        f"/api/kb/{kb_id}/subtags/{b_id}",
+        headers=ADMIN, json={"name": "Alpha"},
+    )
+    assert r.status_code == 409, r.text
+    assert "already in use" in r.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_subtag_rename_rejects_empty_name(client):
+    r = await client.post("/api/kb", headers=ADMIN, json={"name": "M6-Empty-KB"})
+    kb_id = r.json()["id"]
+    r = await client.post(f"/api/kb/{kb_id}/subtags", headers=ADMIN, json={"name": "Sub"})
+    sub_id = r.json()["id"]
+
+    r = await client.patch(
+        f"/api/kb/{kb_id}/subtags/{sub_id}",
+        headers=ADMIN, json={"name": ""},
+    )
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_subtag_move_docs_endpoint(client, engine):
+    r = await client.post("/api/kb", headers=ADMIN, json={"name": "M6-Move-KB"})
+    kb_id = r.json()["id"]
+    r = await client.post(f"/api/kb/{kb_id}/subtags", headers=ADMIN, json={"name": "Source"})
+    src_id = r.json()["id"]
+    r = await client.post(f"/api/kb/{kb_id}/subtags", headers=ADMIN, json={"name": "Target"})
+    tgt_id = r.json()["id"]
+
+    # Seed 3 docs into source.
+    SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    doc_ids: list[int] = []
+    async with SessionLocal() as s:
+        for i in range(3):
+            r = await s.execute(
+                text(
+                    "INSERT INTO kb_documents (kb_id, subtag_id, filename, mime_type, "
+                    "ingest_status, uploaded_by, chunk_count) "
+                    "VALUES (:kb, :sub, :fn, 'text/plain', 'done', '1', 5) "
+                    "RETURNING id"
+                ),
+                {"kb": kb_id, "sub": src_id, "fn": f"f{i}.txt"},
+            )
+            doc_ids.append(r.scalar_one())
+        await s.commit()
+
+    r = await client.post(
+        f"/api/kb/{kb_id}/subtags/{src_id}/move-docs",
+        headers=ADMIN,
+        json={"doc_ids": doc_ids, "target_subtag_id": tgt_id},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json() == {"moved": 3}
+
+    # Verify all 3 now point at target.
+    async with SessionLocal() as s:
+        rows = (await s.execute(
+            text("SELECT subtag_id FROM kb_documents WHERE id = ANY(:ids)"),
+            {"ids": doc_ids},
+        )).scalars().all()
+        assert all(r == tgt_id for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_subtag_move_docs_404_target_not_in_kb(client, engine):
+    r = await client.post("/api/kb", headers=ADMIN, json={"name": "M6-MoveX-KB"})
+    kb_id = r.json()["id"]
+    r = await client.post(f"/api/kb/{kb_id}/subtags", headers=ADMIN, json={"name": "Src"})
+    src = r.json()["id"]
+    r = await client.post("/api/kb", headers=ADMIN, json={"name": "M6-MoveX-OtherKB"})
+    other_kb = r.json()["id"]
+    r = await client.post(f"/api/kb/{other_kb}/subtags", headers=ADMIN, json={"name": "Target"})
+    other_sub = r.json()["id"]
+
+    r = await client.post(
+        f"/api/kb/{kb_id}/subtags/{src}/move-docs",
+        headers=ADMIN,
+        json={"doc_ids": [], "target_subtag_id": other_sub},
+    )
+    assert r.status_code == 404
+
+
 @pytest.mark.skip(reason="cross-agent dep on B's deleted_at column; see integration step")
 @pytest.mark.asyncio
 async def test_subtag_delete_drops_qdrant_chunks(client, engine, monkeypatch):

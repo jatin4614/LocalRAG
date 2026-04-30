@@ -461,6 +461,90 @@ async def delete_subtag(
 
 
 # ---------------------------------------------------------------------------
+# M6 — Subtag rename + move-docs
+# ---------------------------------------------------------------------------
+
+class SubtagPatch(BaseModel):
+    name: constr(min_length=1, max_length=255, strip_whitespace=True)
+
+
+@router.patch(
+    "/{kb_id}/subtags/{subtag_id}",
+    response_model=SubtagOut,
+)
+async def rename_subtag(
+    kb_id: int, subtag_id: int, body: SubtagPatch,
+    user: CurrentUser = Depends(require_admin),
+    session: AsyncSession = Depends(_get_session),
+):
+    """M6: rename a subtag. 404 if subtag not in this KB; 409 on name
+    collision within the same KB (UNIQUE(kb_id, name) violation).
+    """
+    try:
+        sub = await kb_service.rename_subtag(
+            session, kb_id=kb_id, subtag_id=subtag_id, new_name=body.name,
+        )
+        if sub is None:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, detail="subtag not found",
+            )
+        await session.commit()
+    except IntegrityError as e:
+        await session.rollback()
+        log.warning(
+            "rename_subtag: integrity error kb=%s sub=%s name=%r: %s",
+            kb_id, subtag_id, body.name, e,
+        )
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail="subtag name already in use within this KB",
+        ) from e
+    return SubtagOut(id=sub.id, kb_id=sub.kb_id, name=sub.name, description=sub.description)
+
+
+class MoveDocsIn(BaseModel):
+    doc_ids: list[int]
+    target_subtag_id: int
+
+
+class MoveDocsOut(BaseModel):
+    moved: int
+
+
+@router.post(
+    "/{kb_id}/subtags/{subtag_id}/move-docs",
+    response_model=MoveDocsOut,
+)
+async def move_docs_to_subtag(
+    kb_id: int, subtag_id: int, body: MoveDocsIn,
+    user: CurrentUser = Depends(require_admin),
+    session: AsyncSession = Depends(_get_session),
+):
+    """M6: move ``doc_ids`` from this subtag to ``target_subtag_id``.
+
+    Validates:
+      * source and target both exist (live) in this KB
+      * doc_ids are filtered to those that match (kb_id, source_subtag_id);
+        any id that doesn't match is silently skipped (idempotent — a
+        doc already moved won't error)
+    """
+    try:
+        moved = await kb_service.move_docs_to_subtag(
+            session,
+            kb_id=kb_id,
+            source_subtag_id=subtag_id,
+            target_subtag_id=body.target_subtag_id,
+            doc_ids=body.doc_ids,
+        )
+        await session.commit()
+    except ValueError as e:
+        await session.rollback()
+        # 404 when the source/target subtag isn't in this KB.
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    return MoveDocsOut(moved=moved)
+
+
+# ---------------------------------------------------------------------------
 # Access (RBAC) endpoints
 # ---------------------------------------------------------------------------
 
