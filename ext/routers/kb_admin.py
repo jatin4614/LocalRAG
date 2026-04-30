@@ -261,10 +261,82 @@ async def delete_kb(
     user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(_get_session),
 ) -> Response:
+    """Delete a KB end-to-end.
+
+    Soft-deletes the row (preserves audit history via ``deleted_at``), then
+    runs cascade cleanup so a delete + recreate-with-same-name flow leaves
+    no dangling state:
+
+      1. Capture the kb_access grants BEFORE mutation so we can invalidate
+         the right RBAC cache entries afterward.
+      2. Soft-delete the ``knowledge_bases`` row.
+      3. Hard-delete ``kb_access`` grants for this KB (no purpose post-delete).
+      4. Soft-delete ``kb_documents`` (mirrors the KB's ``deleted_at``).
+      5. Drop Qdrant collections ``kb_{id}`` and ``kb_{id}_v4`` so future
+         retrieval can't surface chunks from the deleted KB.
+      6. Invalidate cached ``allowed_kb_ids`` for every user the deleted
+         grants touched.
+
+    Migration 013 (partial unique index ``uq_kb_name_live``) is what
+    actually unblocks the recreate-same-name flow; this handler ensures
+    everything *else* stays consistent. Cleanup runs best-effort: a Qdrant
+    or Redis failure logs at WARNING but does not roll back the DB
+    soft-delete (DB is the source of truth, secondary stores converge).
+    """
+    from datetime import datetime, timezone
+    from sqlalchemy import delete as sql_delete, update as sql_update
+
+    # 1. Capture grants before any mutation so we can build the user
+    #    invalidation set even after the kb_access rows are gone.
+    grants_before = (await session.execute(
+        select(KBAccess).where(KBAccess.kb_id == kb_id)
+    )).scalars().all()
+    affected_user_ids: set[str] = set()
+    for g in grants_before:
+        try:
+            for uid in await users_affected_by_grant(session, g):
+                affected_user_ids.add(uid)
+        except Exception as e:  # noqa: BLE001
+            log.warning("delete_kb: users_affected_by_grant failed: %s", e)
+
+    # 2. Soft-delete the KB row. 404 if it was already gone.
     ok = await kb_service.soft_delete_kb(session, kb_id=kb_id)
     if not ok:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="kb not found")
+
+    # 3. Hard-delete kb_access grants — no purpose post-delete.
+    await session.execute(sql_delete(KBAccess).where(KBAccess.kb_id == kb_id))
+
+    # 4. Soft-delete kb_documents to mirror the KB's deleted_at.
+    await session.execute(
+        sql_update(KBDocument)
+        .where(KBDocument.kb_id == kb_id, KBDocument.deleted_at.is_(None))
+        .values(deleted_at=datetime.now(timezone.utc))
+    )
+
     await session.commit()
+
+    # 5. Drop Qdrant collections — both the legacy single-shard and the
+    #    Plan B Phase 5 custom-sharded form. ``delete_collection`` swallows
+    #    "not found", so this is a no-op when the KB never had any chunks.
+    if _VS is not None:
+        for coll in (f"kb_{kb_id}", f"kb_{kb_id}_v4"):
+            try:
+                await _VS.delete_collection(coll)
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "delete_kb: Qdrant delete %s failed: %s", coll, e,
+                )
+
+    # 6. Invalidate cached allowed_kb_ids for affected users (fail-open;
+    #    the 30s TTL is the safety net if Redis hiccups).
+    if affected_user_ids:
+        try:
+            cache = get_shared_cache(redis=_redis_client())
+            await cache.invalidate(user_ids=list(affected_user_ids))
+        except Exception as e:  # noqa: BLE001
+            log.warning("delete_kb: RBAC cache invalidate failed: %s", e)
+
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
