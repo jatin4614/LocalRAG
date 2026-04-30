@@ -201,7 +201,12 @@ async function createSubtag() {
   const n=document.getElementById('subtag-name').value.trim(); if(!n) return;
   try{await api(`/api/kb/${curKB}/subtags`,{method:'POST',body:JSON.stringify({name:n})}); document.getElementById('subtag-name').value=''; toast('Subtag added'); loadSubtags();}catch(e){toast(e.message,false);}
 }
-async function deleteSubtag(id) { try{await api(`/api/kb/${curKB}/subtags/${id}`,{method:'DELETE'}); toast('Deleted'); loadSubtags();}catch(e){toast(e.message,false);} }
+async function deleteSubtag(id) {
+  // M2 — confirm before destructive subtag delete; existing docs lose
+  // their subtag_id (filter falls back to the parent KB).
+  if (!confirm('Delete subtag and unassign its documents?')) return;
+  try{await api(`/api/kb/${curKB}/subtags/${id}`,{method:'DELETE'}); toast('Deleted'); loadSubtags();}catch(e){toast(e.message,false);}
+}
 
 // Documents
 async function loadDocs() {
