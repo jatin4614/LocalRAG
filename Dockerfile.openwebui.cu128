@@ -50,15 +50,35 @@ RUN uv pip install --system --no-cache-dir --index-url https://download.pytorch.
 # Versions bumped for torch 2.7 compatibility:
 #   sentence-transformers >=3.3 (torch 2.7 compat)
 #   transformers          >=4.49 (torch 2.7 compat)
-#   fastembed             — unchanged (CPU-only, no torch dep)
+#   fastembed-gpu         — pulls onnxruntime-gpu w/ CUDA EP for ColBERT
+#                           + sparse BM25 on GPU 1. Needs the nvidia-*-cu12
+#                           runtime wheels installed below to resolve
+#                           libcublasLt.so.12 / libcudnn.so.9 at dlopen.
 #   prometheus-client     — unchanged
 #   scikit-learn          — unchanged (RAPTOR)
 RUN uv pip install --system --no-cache-dir \
     pyjwt pypdf tiktoken qdrant-client httpx pydantic-settings asyncpg \
     'sqlalchemy[asyncio]' argon2-cffi python-docx openpyxl \
-    fastembed prometheus-client scikit-learn \
+    'fastembed-gpu>=0.4' prometheus-client scikit-learn \
     'sentence-transformers>=3.3' 'transformers>=4.49' \
     'celery[redis]>=5.3' 'redis>=5.0'
+
+# Phase A — CUDA 12 runtime libs for onnxruntime-gpu's CUDA EP.
+# Torch (installed above) brings its own CUDA libs but they live under a
+# different path; onnxruntime probes a fixed list of names so we install
+# the nvidia-*-cu12 wheels and prepend their lib dirs to LD_LIBRARY_PATH.
+# Without this, fastembed-gpu's CUDAExecutionProvider silently fails to
+# initialize at every embed call (the openai-API logs the dlopen error
+# at WARN level then drops back to CPU).
+RUN uv pip install --system --no-cache-dir \
+    "nvidia-cublas-cu12" \
+    "nvidia-cudnn-cu12>=9.0" \
+    "nvidia-cuda-runtime-cu12" \
+    "nvidia-cuda-nvrtc-cu12" \
+    "nvidia-cufft-cu12" \
+    "nvidia-curand-cu12"
+
+ENV LD_LIBRARY_PATH=/usr/local/lib/python3.11/site-packages/nvidia/cudnn/lib:/usr/local/lib/python3.11/site-packages/nvidia/cublas/lib:/usr/local/lib/python3.11/site-packages/nvidia/cuda_runtime/lib:/usr/local/lib/python3.11/site-packages/nvidia/cuda_nvrtc/lib:/usr/local/lib/python3.11/site-packages/nvidia/cufft/lib:/usr/local/lib/python3.11/site-packages/nvidia/curand/lib:$LD_LIBRARY_PATH
 
 # Plan B Phase 6.3 — OCR fallback for scanned PDFs.
 # Tesseract apt package is installed above; pytesseract is the Python binding,
@@ -93,6 +113,33 @@ ENV TIKTOKEN_CACHE_DIR=/opt/tiktoken-cache
 RUN mkdir -p /opt/tiktoken-cache && \
     python -c "import tiktoken; tiktoken.get_encoding('cl100k_base'); tiktoken.get_encoding('o200k_base')" && \
     ls -la /opt/tiktoken-cache/
+
+# Phase A — pre-download fastembed models (ColBERT + sparse BM25) into
+# /opt/fastembed_cache. Mirrors Dockerfile.celery so worker + open-webui
+# share the same offline contract: ingest writes colbert vectors, the
+# bridge query-embeds with colbert; both code paths must work without
+# reaching HuggingFace at runtime.
+ARG HF_TOKEN=
+ENV FASTEMBED_CACHE_PATH=/opt/fastembed_cache
+RUN mkdir -p /opt/fastembed_cache && \
+    HF_TOKEN="${HF_TOKEN}" python -c "\
+from fastembed import LateInteractionTextEmbedding, SparseTextEmbedding;\
+LateInteractionTextEmbedding(model_name='colbert-ir/colbertv2.0', cache_dir='/opt/fastembed_cache');\
+SparseTextEmbedding(model_name='Qdrant/bm25', cache_dir='/opt/fastembed_cache');\
+print('fastembed cache populated')"
+
+# Phase A — offline mode flags. With tiktoken + fastembed cached above
+# AND the runtime bind-mount of /home/vogic/LocalRAG/volumes/hf-cache
+# providing the bge-reranker-v2-m3 cache, every model load happens from
+# disk. HF_HUB_OFFLINE=1 makes any escapee fail loudly at import time
+# instead of silently fetching at first use.
+#
+# NOT set: HF_HUB_OFFLINE in the build-time RUN that pre-downloads
+# fastembed (downloads happen during the same RUN above, so the model
+# is already on disk by the time these ENVs apply to subsequent layers).
+ENV HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    HF_DATASETS_OFFLINE=1
 
 # Frontend build output
 COPY --from=build /app/build /app/build

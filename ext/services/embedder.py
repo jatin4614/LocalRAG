@@ -110,6 +110,42 @@ class TEIEmbedder:
 # query time. The write path here just produces JSON-serialisable lists;
 # read-side fusion lands in Task 3.5.
 
+def _fastembed_providers() -> list[str] | None:
+    """Resolve ONNX execution providers for fastembed.
+
+    Priority order:
+      1. Explicit override via ``RAG_FASTEMBED_PROVIDERS`` (CSV, e.g.
+         ``"CUDAExecutionProvider,CPUExecutionProvider"``).
+      2. Auto-detect: if ``CUDAExecutionProvider`` is available in the
+         loaded onnxruntime, prefer it with a CPU fallback. Without GPU
+         build (only ``CPUExecutionProvider`` available) returns ``None``
+         which lets fastembed pick its own default — byte-equivalent to
+         pre-Phase-A behaviour.
+
+    fastembed accepts ``providers=[...]`` on ``LateInteractionTextEmbedding``
+    and ``SparseTextEmbedding`` constructors. CUDA-bundled distributions
+    (``onnxruntime-gpu`` + ``fastembed-gpu``) ship CUDA libs inside the
+    wheel so no host-side CUDA toolkit is required as long as the host
+    GPU driver is recent enough (550+ for CUDA 12.x).
+
+    Returns None when CPU-only — caller passes ``providers=None`` and
+    fastembed uses its built-in default. Returning an explicit ``["CPU"]``
+    list would suppress fastembed's debug log line about provider choice
+    which is useful during the GPU rollout.
+    """
+    override = os.environ.get("RAG_FASTEMBED_PROVIDERS", "").strip()
+    if override:
+        return [p.strip() for p in override.split(",") if p.strip()]
+    try:
+        import onnxruntime as ort
+        avail = set(ort.get_available_providers())
+        if "CUDAExecutionProvider" in avail:
+            return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    except Exception:
+        pass
+    return None
+
+
 @lru_cache(maxsize=1)
 def _colbert_model():
     """Lazy singleton fastembed LateInteractionTextEmbedding.
@@ -120,6 +156,12 @@ def _colbert_model():
     session itself isn't free to spin up, and we don't want N concurrent
     ingest workers each holding their own copy.
 
+    GPU acceleration: when ``onnxruntime-gpu`` is installed (typically
+    via the ``fastembed-gpu`` distribution), :func:`_fastembed_providers`
+    returns ``["CUDAExecutionProvider", "CPUExecutionProvider"]`` and the
+    model runs on GPU. CPU-only installs return ``None`` and fastembed
+    silently falls back. Set ``RAG_FASTEMBED_PROVIDERS`` to override.
+
     Failures (model missing, ONNX runtime issue, fastembed not
     installed) propagate to the caller; ``colbert_embed`` does not
     swallow them. Ingest sites wrap colbert_embed in a try/except so a
@@ -128,7 +170,11 @@ def _colbert_model():
     from fastembed import LateInteractionTextEmbedding
 
     model_name = os.environ.get("RAG_COLBERT_MODEL", "colbert-ir/colbertv2.0")
-    return LateInteractionTextEmbedding(model_name=model_name)
+    providers = _fastembed_providers()
+    kwargs = {"model_name": model_name}
+    if providers is not None:
+        kwargs["providers"] = providers
+    return LateInteractionTextEmbedding(**kwargs)
 
 
 def colbert_embed(texts: list[str]) -> list[list[list[float]]]:

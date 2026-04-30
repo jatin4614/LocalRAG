@@ -114,13 +114,31 @@ async def set_chat_kb_config(
                             detail=f"subtag_id={sid} does not belong to kb_id={entry.kb_id}",
                         )
 
-    # Guard 2: kb_config is locked once the chat has any user message (design §2.4).
-    # Upstream stores messages as a dict at chat.chat['history']['messages'], keyed by
-    # message_id; each message carries a 'role'. We count role=='user' entries.
+    # Guard 2: kb_config is locked once it is already set AND the chat has
+    # any user message (design §2.4 — "no mid-conversation KB changes").
+    #
+    # The previous form rejected ANY PUT after the first user message, even
+    # the very first persistence write. That broke the new auto-open picker
+    # flow: the client picks KBs before chat exists → first message creates
+    # the chat row → reactive watcher fires PUT, races against the message
+    # write, and gets 409 leaving chat.meta with no kb_config. The body-side
+    # kb_config in the chat-completion request keeps retrieval working, but
+    # refreshes lost the selection. So we now accept the first set and
+    # only block subsequent CHANGES to an already-persisted kb_config.
+    existing_kb_config = None
+    if isinstance(row[1], dict):
+        existing_kb_config = row[1].get("kb_config")
+    elif isinstance(row[1], str):
+        try:
+            existing_kb_config = json.loads(row[1]).get("kb_config")
+        except (ValueError, TypeError):
+            existing_kb_config = None
+
     chat_blob = (await session.execute(
         text('SELECT chat FROM chat WHERE id = :cid'),
         {"cid": chat_id},
     )).scalar()
+    has_user_message = False
     if chat_blob:
         if isinstance(chat_blob, str):
             try:
@@ -132,11 +150,11 @@ async def set_chat_kb_config(
             isinstance(m, dict) and m.get("role") == "user"
             for m in messages_map.values()
         )
-        if has_user_message:
-            raise HTTPException(
-                status.HTTP_409_CONFLICT,
-                detail="chat already has messages; kb_config is locked",
-            )
+    if has_user_message and existing_kb_config is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail="chat already has messages; kb_config is locked",
+        )
 
     # Store in chat.meta JSON column
     current_meta = row[1] if row[1] else {}

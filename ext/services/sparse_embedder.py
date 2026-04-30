@@ -42,8 +42,16 @@ def _get_model():
                 "fastembed not installed — run `pip install 'fastembed>=0.4'` "
                 "or `pip install '.[hybrid]'`"
             ) from e
+        # GPU support mirrors the colbert embedder's resolution. BM25 is
+        # cheap on CPU but the same fastembed-gpu install benefits both,
+        # so honour the same env knob to keep operator config tidy.
+        from .embedder import _fastembed_providers
         model_name = os.environ.get("RAG_SPARSE_MODEL", "Qdrant/bm25")
-        _MODEL = SparseTextEmbedding(model_name=model_name)
+        providers = _fastembed_providers()
+        kwargs = {"model_name": model_name}
+        if providers is not None:
+            kwargs["providers"] = providers
+        _MODEL = SparseTextEmbedding(**kwargs)
         return _MODEL
 
 

@@ -43,8 +43,27 @@ RUN pip install \
       "pymupdf>=1.24" \
       "pytesseract>=0.3.10" \
       "pillow>=10.0" \
-      "fastembed>=0.3" \
+      "fastembed-gpu>=0.4" \
       "numpy>=1.26"
+
+# Phase A — CUDA 12 runtime libs for onnxruntime-gpu. The PyPI default
+# onnxruntime-gpu wheel expects libcublasLt.so.12 / libcudnn.so.9 on
+# LD_LIBRARY_PATH; without them fastembed silently drops to CPU and
+# logs "Failed to load library libonnxruntime_providers_cuda.so" at
+# every embed call. The nvidia-*-cu12 wheels bundle the .so files
+# inside site-packages/nvidia/<lib>/lib/, and we add that prefix to
+# LD_LIBRARY_PATH below so onnxruntime's dlopen finds them.
+RUN pip install --no-cache-dir \
+      "nvidia-cublas-cu12" \
+      "nvidia-cudnn-cu12>=9.0" \
+      "nvidia-cuda-runtime-cu12" \
+      "nvidia-cuda-nvrtc-cu12" \
+      "nvidia-cufft-cu12" \
+      "nvidia-curand-cu12"
+
+# Wire the bundled CUDA libs into LD_LIBRARY_PATH so the dynamic loader
+# resolves libcublasLt.so.12 etc. without a host-side CUDA toolkit.
+ENV LD_LIBRARY_PATH=/usr/local/lib/python3.11/site-packages/nvidia/cudnn/lib:/usr/local/lib/python3.11/site-packages/nvidia/cublas/lib:/usr/local/lib/python3.11/site-packages/nvidia/cuda_runtime/lib:/usr/local/lib/python3.11/site-packages/nvidia/cuda_nvrtc/lib:/usr/local/lib/python3.11/site-packages/nvidia/cufft/lib:/usr/local/lib/python3.11/site-packages/nvidia/curand/lib:$LD_LIBRARY_PATH
 
 # Plan B post-merge soak fix: pre-download tiktoken encoding so the offline
 # celery worker never tries to fetch openaipublic.blob.core.windows.net at
@@ -52,6 +71,34 @@ RUN pip install \
 ENV TIKTOKEN_CACHE_DIR=/opt/tiktoken-cache
 RUN mkdir -p /opt/tiktoken-cache && \
     python -c "import tiktoken; tiktoken.get_encoding('cl100k_base'); tiktoken.get_encoding('o200k_base')"
+
+# Phase A — pre-download fastembed models (colbert + bm25) into a stable
+# cache path so the worker never reaches HuggingFace at ingest time. Both
+# models are also small enough to bake into the image (colbert ~440 MB,
+# bm25 ~10 MB), removing a runtime dependency on the operator's network
+# and matching the air-gapped deploy contract.
+#
+# The token build-arg is opt-in: ``--build-arg HF_TOKEN=$(cat ~/.cache/
+# huggingface/token)`` enables the download even when the host has the
+# rate-limit gate up. Without it, fastembed downloads anonymously which
+# works for these public models.
+ARG HF_TOKEN=
+ENV FASTEMBED_CACHE_PATH=/opt/fastembed_cache
+RUN mkdir -p /opt/fastembed_cache && \
+    HF_TOKEN="${HF_TOKEN}" python -c "\
+from fastembed import LateInteractionTextEmbedding, SparseTextEmbedding;\
+LateInteractionTextEmbedding(model_name='colbert-ir/colbertv2.0', cache_dir='/opt/fastembed_cache');\
+SparseTextEmbedding(model_name='Qdrant/bm25', cache_dir='/opt/fastembed_cache');\
+print('fastembed cache populated')"
+
+# Offline mode: once the model caches above + tiktoken cache are baked
+# into the image, set HF_HUB_OFFLINE=1 so any code path that reaches for
+# huggingface_hub fails loudly instead of silently fetching at runtime.
+# TRANSFORMERS_OFFLINE covers the same for transformers-based loads
+# (none in this worker today, but cheap insurance for future imports).
+ENV HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    HF_DATASETS_OFFLINE=1
 
 # Project source. Only ext/ is needed for the worker.
 COPY ext/ /app/ext/
