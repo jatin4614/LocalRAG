@@ -76,6 +76,8 @@ class KBSubtag(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+    # Migration 014: soft-delete. NULL = live; non-NULL = tombstoned.
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
     kb: Mapped[KnowledgeBase] = relationship(back_populates="subtags")
 
