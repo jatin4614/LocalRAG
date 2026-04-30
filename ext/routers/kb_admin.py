@@ -706,18 +706,36 @@ async def reembed_document(
 # Phase 4 — KB health endpoint
 # ---------------------------------------------------------------------------
 
+#: Sentinel returned by :func:`compute_drift_pct` when Postgres expects
+#: zero chunks but Qdrant still has points (orphans). 999.0 was chosen
+#: so it sorts at the top of any "drift > N" alert and is unmistakable
+#: in dashboards — no real KB will ever drift 999% in normal operation.
+ORPHAN_DRIFT_SENTINEL = 999.0
+
+
 def compute_drift_pct(expected: int, observed: int) -> float:
     """Return absolute-value drift between expected and observed counts.
 
     ``drift_pct = |observed - expected| / expected * 100``. When ``expected``
-    is 0 (empty KB) the drift is defined as 0 regardless of observed —
-    we would never want alarms on newly-created KBs whose chunks are still
-    ingesting, and a freshly-emptied KB (expected==0, observed==0) is also
-    clean.
+    is 0 AND ``observed`` is also 0 the drift is 0.0 (clean empty KB). When
+    ``expected`` is 0 but ``observed`` is positive the function returns
+    :data:`ORPHAN_DRIFT_SENTINEL` (``999.0``) and logs a WARNING — Qdrant
+    holds chunks for a KB whose Postgres truth says it's empty, which is
+    the orphan-cleanup signal operators want surfaced loudly. ``expected``
+    < 0 (corrupt rows) is treated as 0 expected.
 
-    Pure function. Must be import-safe (no DB / Qdrant access).
+    Pure function. Must be import-safe (no DB / Qdrant access). Logging
+    is intentional — the warning is only emitted when the sentinel
+    fires, so steady-state KBs make no log noise.
     """
     if expected <= 0:
+        if int(observed) > 0:
+            log.warning(
+                "compute_drift_pct: orphan chunks detected — expected=%s "
+                "observed=%s; returning sentinel %.0f",
+                expected, observed, ORPHAN_DRIFT_SENTINEL,
+            )
+            return ORPHAN_DRIFT_SENTINEL
         return 0.0
     diff = abs(int(observed) - int(expected))
     return (diff / float(expected)) * 100.0
@@ -729,6 +747,22 @@ class FailedDoc(BaseModel):
 
 
 class KBHealthOut(BaseModel):
+    """Operational health snapshot for one KB.
+
+    drift_pct semantics
+    -------------------
+    Normally ``|observed - expected| / expected * 100``. Two special
+    values:
+
+    * ``0.0`` — the KB is clean OR empty-and-clean (expected==0,
+      observed==0).
+    * ``999.0`` — orphan sentinel (M9). expected==0 but Qdrant still
+      has points for this KB. Means either a previous KB deletion left
+      Qdrant chunks behind, or an ingest ran but the Postgres row was
+      never committed. Operators should investigate; the sentinel was
+      chosen so it sorts at the top of any "drift > N" alert and is
+      unmistakable in dashboards.
+    """
     kb_id: int
     postgres_doc_count: int
     qdrant_point_count: int

@@ -28,15 +28,34 @@ def test_drift_on_observed_deficit() -> None:
     assert math.isclose(compute_drift_pct(100, 90), 10.0, abs_tol=1e-9)
 
 
-def test_drift_empty_kb_is_zero() -> None:
-    """New or empty KB (expected=0) must never report drift."""
+def test_drift_empty_kb_with_no_orphans_is_zero() -> None:
+    """A clean empty KB (expected=0, observed=0) reports 0.0 drift."""
     assert compute_drift_pct(0, 0) == 0.0
-    assert compute_drift_pct(0, 50) == 0.0
 
 
-def test_drift_negative_expected_is_zero() -> None:
-    """Defensive: negative expected (corrupt rows) must not divide by <=0."""
-    assert compute_drift_pct(-5, 100) == 0.0
+def test_drift_empty_kb_with_orphans_returns_sentinel() -> None:
+    """M9: expected=0 but Qdrant has chunks → orphan sentinel 999.0.
+
+    A new/empty KB that somehow has Qdrant points means a previous KB
+    deletion left points behind, OR an ingest ran but the docs row
+    never got committed. Either way, operators should see this loudly
+    in their drift dashboard, not as a silent 0.0.
+    """
+    from ext.routers.kb_admin import ORPHAN_DRIFT_SENTINEL
+    assert compute_drift_pct(0, 50) == ORPHAN_DRIFT_SENTINEL
+    assert compute_drift_pct(0, 1) == ORPHAN_DRIFT_SENTINEL
+
+
+def test_drift_negative_expected_with_no_orphans_is_zero() -> None:
+    """Defensive: negative expected (corrupt rows) treated as 0; with
+    no orphan observed, drift is 0."""
+    assert compute_drift_pct(-5, 0) == 0.0
+
+
+def test_drift_negative_expected_with_orphans_returns_sentinel() -> None:
+    """Negative expected + positive observed → orphan sentinel."""
+    from ext.routers.kb_admin import ORPHAN_DRIFT_SENTINEL
+    assert compute_drift_pct(-5, 100) == ORPHAN_DRIFT_SENTINEL
 
 
 def test_drift_symmetric_on_delta() -> None:
@@ -68,3 +87,15 @@ def test_drift_accepts_string_coercible_ints() -> None:
 )
 def test_drift_known_values(expected: int, observed: int, want: float) -> None:
     assert math.isclose(compute_drift_pct(expected, observed), want, abs_tol=1e-6)
+
+
+def test_compute_drift_pct_orphan_sentinel(caplog) -> None:
+    """M9 — orphan path emits a WARNING and returns the named sentinel."""
+    from ext.routers.kb_admin import ORPHAN_DRIFT_SENTINEL
+    with caplog.at_level("WARNING", logger="orgchat.kb_admin"):
+        result = compute_drift_pct(0, 42)
+    assert result == ORPHAN_DRIFT_SENTINEL
+    assert any(
+        "orphan chunks detected" in rec.message.lower()
+        for rec in caplog.records
+    )
