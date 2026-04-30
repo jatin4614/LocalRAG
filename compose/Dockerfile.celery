@@ -44,7 +44,8 @@ RUN pip install \
       "pytesseract>=0.3.10" \
       "pillow>=10.0" \
       "fastembed-gpu>=0.4" \
-      "numpy>=1.26"
+      "numpy>=1.26" \
+      "python-pptx>=1.0"
 
 # Phase A — CUDA 12 runtime libs for onnxruntime-gpu. The PyPI default
 # onnxruntime-gpu wheel expects libcublasLt.so.12 / libcudnn.so.9 on

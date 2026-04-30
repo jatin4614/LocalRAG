@@ -18,9 +18,14 @@ structural extractors live in ``_blocks_*`` helpers.
 from __future__ import annotations
 
 import io
+import logging
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Callable, Optional
+
+
+log = logging.getLogger(__name__)
 
 
 class UnsupportedMimeType(RuntimeError):
@@ -118,6 +123,40 @@ def _extract_csv(data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+def _extract_pptx(data: bytes) -> str:
+    """Flat-string extractor for .pptx — slide-by-slide text concatenation.
+
+    Per slide: title placeholder + body text + table cells + speaker notes.
+    Slides joined with blank-line breaks so downstream tokenizers see slide
+    boundaries. Speaker notes carry the analytical content the slide image
+    only hints at, so they're included verbatim.
+    """
+    from pptx import Presentation
+
+    prs = Presentation(io.BytesIO(data))
+    parts: list[str] = []
+    for slide in prs.slides:
+        slide_parts: list[str] = []
+        for shape in slide.shapes:
+            if shape.has_text_frame:
+                for para in shape.text_frame.paragraphs:
+                    txt = "".join(run.text for run in para.runs).strip()
+                    if txt:
+                        slide_parts.append(txt)
+            if shape.has_table:
+                for row in shape.table.rows:
+                    cells = [cell.text.strip() for cell in row.cells]
+                    if any(cells):
+                        slide_parts.append("\t".join(cells))
+        if slide.has_notes_slide:
+            notes = (slide.notes_slide.notes_text_frame.text or "").strip()
+            if notes:
+                slide_parts.append(notes)
+        if slide_parts:
+            parts.append("\n".join(slide_parts))
+    return "\n\n".join(parts)
+
+
 EXTRACTORS: dict[str, Callable[[bytes], str]] = {
     "text/plain": _extract_txt,
     "text/markdown": _extract_txt,
@@ -125,6 +164,7 @@ EXTRACTORS: dict[str, Callable[[bytes], str]] = {
     "application/pdf": _extract_pdf,
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document": _extract_docx,
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": _extract_xlsx,
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": _extract_pptx,
 }
 
 
@@ -136,6 +176,7 @@ _EXT_FALLBACK = {
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     ".csv": "text/csv",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 }
 
 
@@ -325,6 +366,61 @@ def _blocks_xlsx(data: bytes) -> list[ExtractedBlock]:
     return blocks
 
 
+def _blocks_pptx(data: bytes) -> list[ExtractedBlock]:
+    """Structural extractor for .pptx — one block per slide.
+
+    Per slide: title placeholder (when present) becomes the heading_path;
+    body text + table rows + speaker notes accumulate into the slide's
+    text. The slide number lives in ``page`` (analogous to PDF page
+    numbers) so retrieval can render "see slide N" hints. Empty slides
+    are skipped.
+    """
+    from pptx import Presentation
+
+    prs = Presentation(io.BytesIO(data))
+    blocks: list[ExtractedBlock] = []
+    for slide_idx, slide in enumerate(prs.slides, start=1):
+        title: Optional[str] = None
+        body_parts: list[str] = []
+        for shape in slide.shapes:
+            if shape.has_text_frame:
+                shape_txt: list[str] = []
+                for para in shape.text_frame.paragraphs:
+                    txt = "".join(run.text for run in para.runs).strip()
+                    if txt:
+                        shape_txt.append(txt)
+                if not shape_txt:
+                    continue
+                # Title placeholder (idx == 0) becomes the slide heading.
+                if title is None and getattr(shape, "is_placeholder", False):
+                    try:
+                        ph_idx = shape.placeholder_format.idx
+                    except Exception:
+                        ph_idx = None
+                    if ph_idx == 0:
+                        title = "\n".join(shape_txt).strip()
+                        continue
+                body_parts.append("\n".join(shape_txt))
+            if shape.has_table:
+                for row in shape.table.rows:
+                    cells = [cell.text.strip() for cell in row.cells]
+                    if any(cells):
+                        body_parts.append("\t".join(cells))
+        if slide.has_notes_slide:
+            notes = (slide.notes_slide.notes_text_frame.text or "").strip()
+            if notes:
+                body_parts.append(notes)
+        body = "\n\n".join(p for p in body_parts if p).strip()
+        if not body and not title:
+            continue
+        text = body if body else (title or "")
+        heading_path = [title] if title else []
+        blocks.append(
+            ExtractedBlock(text=text, page=slide_idx, heading_path=heading_path)
+        )
+    return blocks
+
+
 _MD_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 _MD_PARA_SPLIT = re.compile(r"\n\s*\n")
 
@@ -373,16 +469,104 @@ def _blocks_md(data: bytes) -> list[ExtractedBlock]:
 
 
 # ---------------------------------------------------------------------------
+# Optional layout-aware extraction via the ``unstructured`` library.
+# ---------------------------------------------------------------------------
+
+def _blocks_unstructured(
+    data: bytes, mime: str, filename: str,
+) -> list[ExtractedBlock]:
+    """Layout-aware element extraction via ``unstructured.partition.auto``.
+
+    Opt-in via ``RAG_UNSTRUCTURED_LAYOUT=1``. When enabled, replaces the
+    legacy per-page (PDF) or per-slide (PPTX) extractors with a typed-
+    element parse — Title / Header / Text / NarrativeText / Table /
+    ListItem — that preserves reading order across multi-column layouts
+    and surfaces table structure as element-native metadata.
+
+    ``RAG_UNSTRUCTURED_STRATEGY`` selects the parser strategy:
+      * ``fast`` (default) — heuristic extraction, no extras required.
+      * ``hi_res`` — Detectron2 + LayoutParser layout reconstruction;
+        operator must install the ``unstructured[local-inference]`` extras
+        in the open-webui image (celery worker is intentionally lean and
+        does not carry the heavyweight layout deps).
+      * ``ocr_only`` — Tesseract-based OCR for scanned docs.
+
+    Mapping to ExtractedBlock:
+      * ``Title`` / ``Header`` → push onto a single-level heading stack
+        (we don't try to infer depth — unstructured doesn't expose it
+        reliably across formats).
+      * Everything else → emit as a block with the current heading_path
+        and the element's ``page_number`` (when present).
+
+    Raises ``ImportError`` if the library is missing, so callers can
+    fall back to the legacy extractor.
+    """
+    from unstructured.partition.auto import partition
+
+    strategy = os.environ.get("RAG_UNSTRUCTURED_STRATEGY", "fast")
+    elements = partition(
+        file=io.BytesIO(data),
+        content_type=mime,
+        metadata_filename=filename,
+        strategy=strategy,
+    )
+
+    blocks: list[ExtractedBlock] = []
+    heading_stack: list[str] = []
+    for el in elements:
+        text = (getattr(el, "text", None) or "").strip()
+        if not text:
+            continue
+        meta = getattr(el, "metadata", None)
+        page = getattr(meta, "page_number", None) if meta else None
+        cat = (
+            getattr(el, "category", None)
+            or el.__class__.__name__
+        )
+        if cat in ("Title", "Header"):
+            heading_stack = [text]
+            continue
+        blocks.append(ExtractedBlock(
+            text=text,
+            page=page,
+            heading_path=list(heading_stack),
+        ))
+    return blocks
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 def extract(data: bytes, mime_type: str, filename: str) -> list[ExtractedBlock]:
     """Return structural blocks for ``data``. Dispatches on ``mime_type`` with
     filename-extension fallback. Raises :class:`UnsupportedMimeType` for
-    unknown types (and legacy .doc binaries)."""
+    unknown types (and legacy .doc binaries).
+
+    Opt-in: when ``RAG_UNSTRUCTURED_LAYOUT=1`` and ``resolved`` is PDF or
+    PPTX, prefer ``unstructured.partition.auto`` for layout-aware
+    extraction. Falls back to the legacy per-format extractor on
+    ImportError (library not installed) or any partition failure.
+    """
     resolved = _resolve_mime(mime_type, filename)
     if resolved is None:
         raise UnsupportedMimeType(f"{mime_type} (filename={filename})")
+    if (
+        os.environ.get("RAG_UNSTRUCTURED_LAYOUT", "0") == "1"
+        and resolved in (
+            "application/pdf",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        )
+    ):
+        try:
+            return _blocks_unstructured(data, resolved, filename)
+        except ImportError:
+            pass
+        except Exception as e:  # noqa: BLE001 — fail-open to legacy
+            log.warning(
+                "unstructured extraction failed for %s: %s; falling back",
+                filename, e,
+            )
     if resolved == "text/markdown":
         return _blocks_md(data)
     if resolved == "text/plain":
@@ -395,6 +579,8 @@ def extract(data: bytes, mime_type: str, filename: str) -> list[ExtractedBlock]:
         return _blocks_docx(data)
     if resolved == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
         return _blocks_xlsx(data)
+    if resolved == "application/vnd.openxmlformats-officedocument.presentationml.presentation":
+        return _blocks_pptx(data)
     # _resolve_mime only returns keys present in EXTRACTORS — unreachable.
     raise UnsupportedMimeType(f"{mime_type} (filename={filename})")
 

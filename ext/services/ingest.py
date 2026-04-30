@@ -1086,12 +1086,34 @@ async def _caption_image(image_bytes: bytes) -> str:
         "messages": [
             {"role": "user", "content": [
                 {"type": "text",
-                 "text": "Describe the key information in this image in 1-2 sentences."},
+                 "text": (
+                     "Analyze this image and produce a structured description "
+                     "preserving every load-bearing detail. Cover, in this order:\n"
+                     "1. Layout — single-column / multi-column / header-body-footer / "
+                     "diagram / table / mixed; reading order.\n"
+                     "2. Text — verbatim transcription of all visible text in reading "
+                     "order. Preserve numbers, dates, IDs, and proper nouns exactly.\n"
+                     "3. Tables — render each as a Markdown table (header row + data "
+                     "rows). Preserve cell content; keep row/column count exact.\n"
+                     "4. Diagrams — name the diagram type (flowchart / sequence / "
+                     "hierarchy / network / sankey / swim-lane / state machine). "
+                     "Enumerate every node (box / circle / shape) with its label and "
+                     "every edge (arrow / line) with its direction and any edge label. "
+                     "Use Markdown bullet trees or `A -> B (label)` notation when the "
+                     "structure is graph-shaped.\n"
+                     "5. Visual hierarchy — emphasized text, headings, callouts, "
+                     "color-coded groupings.\n"
+                     "6. Charts / graphs — describe axes, scale, legend, and the 3–5 "
+                     "key data points or trends.\n\n"
+                     "Format as concise structured prose with markdown. No 'I think' / "
+                     "'this appears'. If the image is purely decorative (logo, photo, "
+                     "icon) with no informational content, say so in one line and stop."
+                 )},
                 {"type": "image_url",
                  "image_url": {"url": f"data:image/png;base64,{b64}"}},
             ]},
         ],
-        "max_tokens": 200,
+        "max_tokens": 800,
         "temperature": 0.0,
     }
     async with httpx.AsyncClient(timeout=20.0) as c:
