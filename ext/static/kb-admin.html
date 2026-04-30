@@ -10,8 +10,8 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#1a1b2e;color:#e2
 .card{background:#222340;border:1px solid #2d2d50;border-radius:12px;padding:20px;margin-bottom:16px}
 h1{font-size:1.5rem;font-weight:700}h2{font-size:1.1rem;font-weight:600;margin-bottom:12px}
 .sub{color:#94a3b8;font-size:0.85rem}
-input,select{background:#1a1b2e;border:1px solid #3d3d5c;color:#e2e8f0;padding:8px 12px;border-radius:8px;width:100%;font-size:0.9rem}
-input:focus,select:focus{outline:none;border-color:#3b82f6}
+input,select,textarea{background:#1a1b2e;border:1px solid #3d3d5c;color:#e2e8f0;padding:8px 12px;border-radius:8px;width:100%;font-size:0.9rem;font-family:inherit}
+input:focus,select:focus,textarea:focus,button:focus-visible{outline:2px solid #3b82f6;outline-offset:2px;border-color:#3b82f6}
 .btn{padding:7px 14px;border-radius:8px;font-weight:600;cursor:pointer;border:none;font-size:0.85rem;transition:0.15s}
 .btn-blue{background:#3b82f6;color:#fff}.btn-blue:hover{background:#2563eb}
 .btn-red{background:#dc2626;color:#fff;font-size:0.75rem;padding:4px 10px}.btn-red:hover{background:#b91c1c}
@@ -33,6 +33,12 @@ th{color:#64748b;font-size:0.75rem;text-transform:uppercase;font-weight:600}
 .toast-close{position:absolute;top:6px;right:8px;background:transparent;border:none;color:inherit;font-size:1.1rem;cursor:pointer;padding:0 4px;line-height:1;font-weight:600}
 .toast-close:hover{opacity:0.8}
 @keyframes slidein{from{transform:translateX(20px);opacity:0}to{transform:translateX(0);opacity:1}}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.65);display:flex;align-items:center;justify-content:center;z-index:9000;padding:16px}
+.modal-overlay.hidden{display:none}
+.modal{background:#222340;border:1px solid #3d3d5c;border-radius:12px;padding:22px;max-width:480px;width:100%;box-shadow:0 12px 48px rgba(0,0,0,0.5)}
+.modal h3{font-size:1.05rem;font-weight:600;margin-bottom:8px}
+.modal p{color:#cbd5e1;margin-bottom:14px;white-space:pre-wrap;font-size:0.9rem;line-height:1.45}
+.modal .actions{display:flex;justify-content:flex-end;gap:8px}
 .doc-row{display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid #2d2d50}
 .doc-row:last-child{border:none}
 .file-drop{border:2px dashed #3d3d5c;border-radius:10px;padding:20px;text-align:center;cursor:pointer;transition:0.2s}
@@ -45,23 +51,24 @@ th{color:#64748b;font-size:0.75rem;text-transform:uppercase;font-weight:600}
 </head>
 <body>
 <div id="toast-stack" class="toast-stack" role="status" aria-live="polite" aria-atomic="false"></div>
+<div id="modal-root" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="modal-title"></div>
 
 <div style="max-width:1000px;margin:0 auto">
   <div class="flex items-center gap-3 mb-3" style="justify-content:space-between">
     <div>
-      <h1>Knowledge Base Management</h1>
+      <h1 id="page-title">Knowledge Base Management</h1>
       <p class="sub">Create KBs, manage documents, control access</p>
     </div>
-    <a href="/" class="btn btn-gray">Back to Chat</a>
+    <a href="/" class="btn btn-gray" aria-label="Back to chat">Back to Chat</a>
   </div>
 
   <!-- Create KB -->
   <div class="card">
     <h2>Create Knowledge Base</h2>
     <div class="flex gap-2">
-      <input id="kb-name" placeholder="Name (e.g. Engineering)">
-      <input id="kb-desc" placeholder="Description">
-      <button onclick="createKB()" class="btn btn-blue" style="white-space:nowrap">Create</button>
+      <input id="kb-name" placeholder="Name (e.g. Engineering)" aria-label="New KB name">
+      <input id="kb-desc" placeholder="Description" aria-label="New KB description">
+      <button onclick="createKB()" class="btn btn-blue" style="white-space:nowrap" aria-label="Create new KB">Create</button>
     </div>
   </div>
 
@@ -69,7 +76,7 @@ th{color:#64748b;font-size:0.75rem;text-transform:uppercase;font-weight:600}
   <div class="card">
     <div class="flex items-center" style="justify-content:space-between">
       <h2 style="margin:0">Knowledge Bases</h2>
-      <button onclick="loadKBs()" class="btn btn-gray btn-sm">Refresh</button>
+      <button onclick="loadKBs()" class="btn btn-gray btn-sm" aria-label="Refresh KB list">Refresh</button>
     </div>
     <div id="kb-list" class="mt-2"><p class="sub">Loading...</p></div>
   </div>
@@ -82,8 +89,8 @@ th{color:#64748b;font-size:0.75rem;text-transform:uppercase;font-weight:600}
       <!-- Subtags -->
       <div class="mb-3">
         <div class="flex gap-2 mb-2">
-          <input id="subtag-name" placeholder="New subtag name" style="max-width:300px">
-          <button onclick="createSubtag()" class="btn btn-blue btn-sm">Add Subtag</button>
+          <input id="subtag-name" placeholder="New subtag name" style="max-width:300px" aria-label="New subtag name">
+          <button onclick="createSubtag()" class="btn btn-blue btn-sm" aria-label="Add subtag">Add Subtag</button>
         </div>
         <div id="subtag-list"></div>
       </div>
@@ -98,17 +105,17 @@ th{color:#64748b;font-size:0.75rem;text-transform:uppercase;font-weight:600}
       <div class="mb-3">
         <h2>Upload Files</h2>
         <div class="flex gap-2 mb-2">
-          <select id="upload-subtag" style="max-width:200px"></select>
+          <select id="upload-subtag" style="max-width:200px" aria-label="Target subtag for upload"></select>
         </div>
-        <div class="file-drop" id="file-drop" onclick="document.getElementById('upload-files').click()" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="this.classList.remove('dragover')" ondrop="handleDrop(event)">
+        <div class="file-drop" id="file-drop" tabindex="0" role="button" aria-label="Drop files here or press Enter to browse" onclick="document.getElementById('upload-files').click()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();document.getElementById('upload-files').click();}" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="this.classList.remove('dragover')" ondrop="handleDrop(event)">
           Drop files here or click to browse<br>
           <span class="sub">Supports: TXT, MD, PDF, DOCX, XLSX, CSV, PPTX</span>
         </div>
         <input type="file" id="upload-files" multiple accept=".txt,.md,.pdf,.docx,.doc,.xlsx,.csv,.pptx" style="display:none" onchange="addFiles(this.files)">
         <div id="file-queue" class="file-list"></div>
         <div id="upload-actions" class="hidden mt-2">
-          <button onclick="uploadAll()" class="btn btn-green">Upload All</button>
-          <button onclick="clearQueue()" class="btn btn-gray" style="margin-left:8px">Clear</button>
+          <button onclick="uploadAll()" class="btn btn-green" aria-label="Upload all queued files">Upload All</button>
+          <button onclick="clearQueue()" class="btn btn-gray" style="margin-left:8px" aria-label="Clear file queue">Clear</button>
         </div>
       </div>
 
@@ -116,12 +123,12 @@ th{color:#64748b;font-size:0.75rem;text-transform:uppercase;font-weight:600}
       <div>
         <h2>Access Control</h2>
         <div class="flex gap-2 mb-2">
-          <select id="grant-type" onchange="toggleGrantField()" style="max-width:120px">
+          <select id="grant-type" onchange="toggleGrantField()" style="max-width:120px" aria-label="Grant target type">
             <option value="user">User</option>
             <option value="group">Group</option>
           </select>
-          <input id="grant-id" placeholder="User UUID or Group ID">
-          <button onclick="grantAccess()" class="btn btn-green btn-sm">Grant Read</button>
+          <input id="grant-id" placeholder="User UUID or Group ID" aria-label="Grant target ID">
+          <button onclick="grantAccess()" class="btn btn-green btn-sm" aria-label="Grant read access">Grant Read</button>
         </div>
         <div id="grant-list"></div>
       </div>
@@ -227,6 +234,59 @@ function el(tag, opts) {
 }
 function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
 
+// L2 — Focus-trap modal helper. Used by any UI that needs a richer
+// confirmation than the native confirm() (currently a placeholder for
+// future flows; we keep native confirm() for the simple destructive
+// yes/no paths because it's screen-reader-friendliest by default).
+// Esc closes; Tab cycles focus inside the modal; focus is restored to
+// the previously-focused element on close.
+let _lastFocus = null;
+function openModal(opts) {
+  const root = document.getElementById('modal-root');
+  if (!root) return;
+  _lastFocus = document.activeElement;
+  clear(root);
+  const card = el('div', { cls: 'modal' });
+  card.appendChild(el('h3', { text: opts.title || '', attrs: { id: 'modal-title' } }));
+  if (opts.body) card.appendChild(el('p', { text: opts.body }));
+  const actBar = el('div', { cls: 'actions' });
+  for (const a of (opts.actions || [])) {
+    actBar.appendChild(el('button', {
+      text: a.label,
+      cls: `btn ${a.variant || 'btn-gray'}`,
+      attrs: { 'aria-label': a.label },
+      on: { click: () => { try { a.onClick && a.onClick(); } finally { closeModal(); } } },
+    }));
+  }
+  card.appendChild(actBar);
+  root.appendChild(card);
+  root.classList.remove('hidden');
+  const btn = card.querySelector('button');
+  if (btn) btn.focus();
+  document.addEventListener('keydown', _modalKey);
+}
+function closeModal() {
+  const root = document.getElementById('modal-root');
+  if (!root) return;
+  root.classList.add('hidden');
+  clear(root);
+  document.removeEventListener('keydown', _modalKey);
+  if (_lastFocus && _lastFocus.focus) _lastFocus.focus();
+  _lastFocus = null;
+}
+function _modalKey(e) {
+  if (e.key === 'Escape') { e.preventDefault(); closeModal(); return; }
+  if (e.key === 'Tab') {
+    const root = document.getElementById('modal-root');
+    if (!root) return;
+    const focusable = root.querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])');
+    if (!focusable.length) return;
+    const first = focusable[0], last = focusable[focusable.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  }
+}
+
 // KB
 async function loadKBs() {
   const target = document.getElementById('kb-list');
@@ -249,11 +309,13 @@ async function loadKBs() {
       actTd.appendChild(el('button', {
         text: 'Manage',
         cls: 'btn btn-blue btn-sm',
+        attrs: { 'aria-label': `Manage KB ${k.name || ''}` },
         on: { click: () => selectKB(k.id, k.name || '') },
       }));
       const delBtn = el('button', {
         text: 'Del',
         cls: 'btn btn-red',
+        attrs: { 'aria-label': `Delete KB ${k.name || ''}` },
         on: { click: () => deleteKB(k.id) },
       });
       delBtn.style.marginLeft = '4px';
@@ -300,9 +362,16 @@ async function loadSubtags() {
       for (const x of s) {
         const tag = el('span', { cls: 'tag' });
         tag.appendChild(document.createTextNode((x.name || '') + ' '));
-        const rm = el('span', { text: '×' });
+        const rm = el('span', {
+          text: '×',
+          attrs: { role: 'button', tabindex: '0', 'aria-label': `Delete subtag ${x.name || ''}` },
+        });
         rm.style.cursor = 'pointer'; rm.style.color = '#f87171';
-        rm.addEventListener('click', () => deleteSubtag(x.id));
+        const fire = () => deleteSubtag(x.id);
+        rm.addEventListener('click', fire);
+        rm.addEventListener('keydown', (ev) => {
+          if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); fire(); }
+        });
         tag.appendChild(rm);
         listEl.appendChild(tag);
       }
@@ -341,6 +410,7 @@ async function loadDocs() {
       actions.appendChild(el('button', {
         text: 'Del',
         cls: 'btn btn-red',
+        attrs: { 'aria-label': `Delete document ${d.filename || ''}` },
         on: { click: () => deleteDoc(d.id) },
       }));
       row.appendChild(actions);
@@ -374,9 +444,14 @@ function renderQueue() {
     lhs.appendChild(document.createTextNode((f.name || '') + ' '));
     lhs.appendChild(el('span', { cls: 'sub', text: `(${(f.size/1024).toFixed(1)} KB)` }));
     row.appendChild(lhs);
-    const x = el('span', { text: '×' });
+    const x = el('span', {
+      text: '×',
+      attrs: { role: 'button', tabindex: '0', 'aria-label': `Remove ${f.name || 'file'}` },
+    });
     x.style.cursor = 'pointer'; x.style.color = '#f87171';
-    x.addEventListener('click', () => removeFile(i));
+    const fire = () => removeFile(i);
+    x.addEventListener('click', fire);
+    x.addEventListener('keydown', (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); fire(); } });
     row.appendChild(x);
     target.appendChild(row);
   });
@@ -424,6 +499,7 @@ async function loadGrants() {
       actCell.appendChild(el('button', {
         text: 'Revoke',
         cls: 'btn btn-red',
+        attrs: { 'aria-label': `Revoke grant ${x.id}` },
         on: { click: () => revokeAccess(x.id) },
       }));
       tr.appendChild(actCell);
