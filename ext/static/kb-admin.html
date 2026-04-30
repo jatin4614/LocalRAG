@@ -47,6 +47,19 @@ th{color:#64748b;font-size:0.75rem;text-transform:uppercase;font-weight:600}
 .file-item{display:flex;justify-content:space-between;align-items:center;padding:3px 0}
 .progress{height:4px;background:#3d3d5c;border-radius:2px;margin-top:4px;overflow:hidden}
 .progress-bar{height:100%;background:#3b82f6;transition:width 0.3s}
+@media (max-width: 600px) {
+  body{padding:12px}
+  .grid-2{grid-template-columns:1fr}
+  .flex{flex-wrap:wrap}
+  input,select,textarea,.btn{width:100%}
+  .btn{padding:10px 14px;font-size:0.95rem}
+  .btn-sm{padding:6px 10px;font-size:0.85rem}
+  .file-drop{padding:14px}
+  table{font-size:0.78rem}
+  th,td{padding:5px 6px}
+  .toast-stack{left:12px;right:12px;max-width:none}
+  .doc-row{flex-direction:column;align-items:flex-start;gap:6px}
+}
 </style>
 </head>
 <body>
