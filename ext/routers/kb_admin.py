@@ -6,8 +6,8 @@ import os
 from collections import Counter
 from typing import Any, AsyncGenerator, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from pydantic import BaseModel, constr
 from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
 
 from sqlalchemy import select
@@ -103,13 +103,19 @@ async def _get_session() -> AsyncGenerator[AsyncSession, None]:
 
 
 class KBIn(BaseModel):
-    name: str
-    description: Optional[str] = None
+    # H3: enforce name bounds at the API edge so a 256-char string can
+    # never slip through to the DB (knowledge_bases.name is VARCHAR(255)).
+    # ``strip_whitespace`` ensures ``"   "`` collapses to ``""`` and is
+    # rejected by the min_length=1 floor.
+    name: constr(min_length=1, max_length=255, strip_whitespace=True)
+    description: Optional[constr(max_length=2000)] = None
 
 
 class KBPatch(BaseModel):
-    name: Optional[str] = None
-    description: Optional[str] = None
+    # H4: same constraints as KBIn but Optional so PATCH bodies can
+    # update only ``description`` without touching ``name``.
+    name: Optional[constr(min_length=1, max_length=255, strip_whitespace=True)] = None
+    description: Optional[constr(max_length=2000)] = None
 
 
 class KBOut(BaseModel):

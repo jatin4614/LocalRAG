@@ -123,3 +123,51 @@ async def test_access_grant_requires_exactly_one(client):
     r = await client.post(f"/api/kb/{kb_id}/access", headers=ADMIN,
                           json={"user_id": None, "group_id": None, "access_type": "read"})
     assert r.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# H3 / H4 — KB name validation at the API edge
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_create_kb_rejects_empty_name(client):
+    r = await client.post("/api/kb", headers=ADMIN, json={"name": ""})
+    # pydantic ValidationError → 422 from FastAPI body validation
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_create_kb_rejects_whitespace_name(client):
+    r = await client.post("/api/kb", headers=ADMIN, json={"name": "   "})
+    # strip_whitespace collapses to "" -> min_length violation
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_create_kb_name_max_length_256_rejected_at_api(client):
+    r = await client.post("/api/kb", headers=ADMIN, json={"name": "a" * 256})
+    # Should never reach the DB; rejected at the pydantic edge.
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_create_kb_name_max_length_255_accepted(client):
+    """Boundary: exactly 255 chars (column max) MUST be accepted."""
+    r = await client.post("/api/kb", headers=ADMIN, json={"name": "a" * 255})
+    assert r.status_code == 201, r.text
+
+
+@pytest.mark.asyncio
+async def test_patch_kb_rejects_empty_name(client):
+    r = await client.post("/api/kb", headers=ADMIN, json={"name": "Has a Name"})
+    kb_id = r.json()["id"]
+    r = await client.patch(f"/api/kb/{kb_id}", headers=ADMIN, json={"name": ""})
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_patch_kb_rejects_overlong_name(client):
+    r = await client.post("/api/kb", headers=ADMIN, json={"name": "Short"})
+    kb_id = r.json()["id"]
+    r = await client.patch(f"/api/kb/{kb_id}", headers=ADMIN, json={"name": "x" * 256})
+    assert r.status_code == 422
