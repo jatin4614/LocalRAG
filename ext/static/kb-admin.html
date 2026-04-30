@@ -25,7 +25,14 @@ table{width:100%;border-collapse:collapse;font-size:0.85rem}th,td{padding:6px 10
 th{color:#64748b;font-size:0.75rem;text-transform:uppercase;font-weight:600}
 .success{color:#4ade80}.error{color:#f87171}
 .hidden{display:none}
-#toast{position:fixed;top:16px;right:16px;padding:10px 18px;border-radius:8px;font-weight:500;z-index:9999;display:none;font-size:0.9rem}
+.toast-stack{position:fixed;top:16px;right:16px;display:flex;flex-direction:column;gap:8px;z-index:9999;max-width:360px}
+.toast{padding:10px 38px 10px 18px;border-radius:8px;font-weight:500;font-size:0.9rem;color:#fff;position:relative;box-shadow:0 4px 14px rgba(0,0,0,0.4);animation:slidein 0.18s ease-out}
+.toast.ok{background:#166534}
+.toast.err{background:#991b1b}
+.toast.warn{background:#854d0e}
+.toast-close{position:absolute;top:6px;right:8px;background:transparent;border:none;color:inherit;font-size:1.1rem;cursor:pointer;padding:0 4px;line-height:1;font-weight:600}
+.toast-close:hover{opacity:0.8}
+@keyframes slidein{from{transform:translateX(20px);opacity:0}to{transform:translateX(0);opacity:1}}
 .doc-row{display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid #2d2d50}
 .doc-row:last-child{border:none}
 .file-drop{border:2px dashed #3d3d5c;border-radius:10px;padding:20px;text-align:center;cursor:pointer;transition:0.2s}
@@ -37,7 +44,7 @@ th{color:#64748b;font-size:0.75rem;text-transform:uppercase;font-weight:600}
 </style>
 </head>
 <body>
-<div id="toast"></div>
+<div id="toast-stack" class="toast-stack" role="status" aria-live="polite" aria-atomic="false"></div>
 
 <div style="max-width:1000px;margin:0 auto">
   <div class="flex items-center gap-3 mb-3" style="justify-content:space-between">
@@ -150,10 +157,46 @@ const T = (function pullToken() {
 let curKB = null;
 let fileQueue = [];
 
-function toast(m, ok=true) {
-  const t = document.getElementById('toast');
-  t.textContent = m; t.style.background = ok?'#166534':'#991b1b'; t.style.display='block';
-  setTimeout(()=>t.style.display='none', 3000);
+// L1 — Toast stack with 5s TTL and a × close button. Replaces the
+// previous global single-element toast that flashed for 3s with no
+// way to dismiss; users couldn't read longer messages or stack
+// multiple results from a batch upload. Each toast appends to the
+// stack; the user can dismiss any one or wait for auto-removal.
+//
+// Backwards-compatible signature: toast(msg) or toast(msg, false) for
+// errors. New 3rd arg accepts {ttl} in ms.
+let _toastSeq = 0;
+function toast(message, ok, opts) {
+  // Map legacy boolean second arg to status string.
+  let status;
+  if (ok === false) status = 'err';
+  else if (ok === 'err' || ok === 'warn' || ok === 'ok') status = ok;
+  else status = 'ok';
+  const cls = status;
+  const stack = document.getElementById('toast-stack');
+  if (!stack) return;
+  const t = document.createElement('div');
+  t.className = `toast ${cls}`;
+  t.setAttribute('role', cls === 'err' ? 'alert' : 'status');
+  // textContent (not innerHTML) — even an attacker-controlled KB name
+  // surfacing through e.message can't break out into HTML.
+  t.textContent = message || '';
+  const close = document.createElement('button');
+  close.type = 'button';
+  close.className = 'toast-close';
+  close.setAttribute('aria-label', 'Dismiss notification');
+  close.textContent = '×';
+  let timer = null;
+  const remove = () => {
+    if (timer) clearTimeout(timer);
+    if (t.parentNode) t.parentNode.removeChild(t);
+  };
+  close.onclick = remove;
+  t.appendChild(close);
+  stack.appendChild(t);
+  const ttl = (opts && Number.isFinite(opts.ttl)) ? opts.ttl : 5000;
+  timer = setTimeout(remove, ttl);
+  return ++_toastSeq;
 }
 async function api(p, o={}) {
   const h = {'Authorization':`Bearer ${T}`,'Content-Type':'application/json',...(o.headers||{})};
