@@ -242,7 +242,7 @@ async def test_kb_soft_delete_preserves_audit_row(client, engine):
         assert row[2] is not None, "deleted_at must be populated"
 
     r = await client.get("/api/kb", headers=ADMIN)
-    names = [kb["name"] for kb in r.json()]
+    names = [kb["name"] for kb in r.json()["items"]]
     assert "Auditable" not in names
 
 
@@ -624,7 +624,6 @@ async def test_subtag_move_docs_404_target_not_in_kb(client, engine):
     assert r.status_code == 404
 
 
-@pytest.mark.skip(reason="cross-agent dep on B's deleted_at column; see integration step")
 @pytest.mark.asyncio
 async def test_subtag_delete_drops_qdrant_chunks(client, engine, monkeypatch):
     """H7: deleting a subtag MUST cascade Qdrant chunk deletes for each
