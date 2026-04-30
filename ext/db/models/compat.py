@@ -34,7 +34,8 @@ class Group(Base):
 class UserGroup(Base):
     __tablename__ = "user_groups"
 
-    user_id:  Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id",  ondelete="CASCADE"), primary_key=True)
+    # ``users.id`` is a UUID string in upstream; the FK side must match.
+    user_id:  Mapped[str] = mapped_column(String, ForeignKey("users.id",  ondelete="CASCADE"), primary_key=True)
     group_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("groups.id", ondelete="CASCADE"), primary_key=True)
 
 
@@ -42,7 +43,8 @@ class Chat(Base):
     __tablename__ = "chats"
 
     id:                 Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    user_id:            Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    # ``users.id`` is a UUID string in upstream; FK side must match.
+    user_id:            Mapped[str] = mapped_column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     title:              Mapped[Optional[str]] = mapped_column(String)
     created_at:         Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     selected_kb_config: Mapped[Optional[list]] = mapped_column(JSON)  # JSONB on PG, JSON on SQLite
