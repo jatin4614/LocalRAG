@@ -88,7 +88,13 @@ def test_parse_qu_response_happy_path():
     qu = parse_qu_response(raw)
     assert qu.intent == "specific_date"
     assert qu.resolved_query == "outages on January 5 2026"
-    assert qu.temporal_constraint == {"year": 2026, "quarter": None, "month": 1}
+    # Phase 2.1 — parse_qu_response normalizes missing months/years to [].
+    # Legacy single-month input still works; the parser fills in the array
+    # fields so downstream filter helpers don't have to special-case shape.
+    assert qu.temporal_constraint == {
+        "year": 2026, "quarter": None, "month": 1,
+        "months": [], "years": [],
+    }
     assert qu.entities == ["outages"]
     assert qu.confidence == 0.92
 

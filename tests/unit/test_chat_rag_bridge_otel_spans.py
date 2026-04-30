@@ -234,7 +234,10 @@ async def test_budget_span_tags_chunks(configured_bridge):
         user_id="user-1",
     )
     sp = next(s for s in configured_bridge.spans if s.name == "rag.budget")
-    assert sp.attrs.get("max_tokens") == 5000
+    # 2026-04-29 — bumped from 5000 → 10000 (Axis 2 analyst-depth tuning).
+    # For global intent the cap is wider still (RAG_GLOBAL_BUDGET_TOKENS,
+    # default 22000); this test path uses a "specific" intent fixture.
+    assert sp.attrs.get("max_tokens") == 10000
     assert sp.attrs.get("chunks_in") == 2
     assert sp.attrs.get("chunks_kept") == 2  # passthrough budget stub
 

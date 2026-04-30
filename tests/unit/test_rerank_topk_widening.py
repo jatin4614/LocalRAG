@@ -21,7 +21,11 @@ import pytest
 from ext.services import chat_rag_bridge as bridge
 
 
-_FINAL_K = 10  # mirrors the hard-coded constant in chat_rag_bridge.py
+_FINAL_K = 12  # mirrors the hard-coded constant in chat_rag_bridge.py
+# 2026-04-29 — bumped 10 → 12 (Axis 2 analyst-depth tuning) so MMR-widened
+# rerank top_k now resolves to max(12*2, 20) = 24 instead of max(10*2, 20) = 20.
+# The legacy "widens to 20" docstrings/test names below describe the category
+# (widening above _final_k) and remain accurate as behavior descriptions.
 
 
 @dataclass

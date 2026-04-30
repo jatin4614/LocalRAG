@@ -179,13 +179,18 @@ async def test_hybrid_search_dense_prefetch_carries_search_params(monkeypatch) -
 
 
 def test_init_configures_timeout_and_pool_size() -> None:
-    """VectorStore must pass timeout=30.0 and pool_size to AsyncQdrantClient."""
+    """VectorStore must pass timeout=120.0 (default) and pool_size to AsyncQdrantClient."""
     with patch("ext.services.vector_store.AsyncQdrantClient") as mock_cls:
         VectorStore(url="http://qdrant:6333", vector_size=1024)
         mock_cls.assert_called_once()
         _, kwargs = mock_cls.call_args
         assert kwargs["url"] == "http://qdrant:6333"
-        assert kwargs["timeout"] == 30.0
+        # 2026-04-29 — bumped 30s → 120s. The 30s default was empirically
+        # too tight for cluster-mode sharded writes + ColBERT multi-vector
+        # payloads; soak fixed via batched upsert (RAG_UPSERT_BATCH=16) but
+        # the wider ceiling stays as a safety margin. Override via
+        # RAG_QDRANT_TIMEOUT.
+        assert kwargs["timeout"] == 120.0
         # Default pool_size = 32.
         assert kwargs["pool_size"] == 32
 
