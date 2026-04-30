@@ -152,8 +152,11 @@ def build_app() -> FastAPI:
     async def healthz():
         return {"status": "ok"}
 
+    from fastapi import Depends as _Depends
+    from .services.auth import require_admin as _require_admin
+
     @app.get("/api/kb/admin-ui", response_class=HTMLResponse)
-    async def kb_admin_ui():
+    async def kb_admin_ui(_user=_Depends(_require_admin)):
         html = Path(__file__).parent / "static" / "kb-admin.html"
         return HTMLResponse(html.read_text())
 
@@ -290,12 +293,13 @@ def build_ext_routers():
     vision_svc.configure(vector_store=vs, embedder=emb, sessionmaker=SessionLocal)
 
     # Admin UI page (standalone HTML — no Svelte needed)
-    from fastapi import APIRouter
+    from fastapi import APIRouter, Depends as _Depends
     from fastapi.responses import HTMLResponse as HR
+    from .services.auth import require_admin as _require_admin
     ui_router = APIRouter()
 
     @ui_router.get("/api/kb/admin-ui", response_class=HR)
-    async def _kb_admin_ui():
+    async def _kb_admin_ui(_user=_Depends(_require_admin)):
         html = Path(__file__).parent / "static" / "kb-admin.html"
         return HR(html.read_text())
 
