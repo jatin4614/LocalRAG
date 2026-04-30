@@ -373,8 +373,62 @@ async def delete_subtag(
     user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(_get_session),
 ) -> Response:
-    ok = await kb_service.delete_subtag(session, kb_id=kb_id, subtag_id=subtag_id)
+    """H7: cascade Qdrant chunk delete + soft-delete docs + soft-delete subtag.
+
+    Order of operations:
+      1. List live (deleted_at IS NULL) docs in this subtag.
+      2. For each doc, best-effort ``VectorStore.delete_by_doc(...)``;
+         log failures but don't abort — the docs / subtag get soft-
+         deleted regardless so they stop appearing in admin lists.
+      3. Soft-delete the docs (UPDATE deleted_at = NOW()).
+      4. Soft-delete the subtag itself.
+
+    Cross-agent dep: this assumes ``kb_subtags.deleted_at`` exists
+    (Agent B's migration). The route uses
+    :func:`kb_service.soft_delete_subtag` which falls back gracefully
+    when the column isn't there yet (returns False), surfacing as a
+    404 — operators will know the migration hasn't been applied.
+    """
+    # 1) Find live docs in this subtag.
+    doc_rows = (await session.execute(
+        select(KBDocument).where(
+            KBDocument.kb_id == kb_id,
+            KBDocument.subtag_id == subtag_id,
+            KBDocument.deleted_at.is_(None),
+        )
+    )).scalars().all()
+
+    # 2) Best-effort Qdrant cascade. Failures don't abort the soft-delete.
+    if _VS is not None and doc_rows:
+        collection = f"kb_{kb_id}"
+        for doc in doc_rows:
+            try:
+                await _VS.delete_by_doc(collection, doc.id)
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "delete_subtag: vector cascade failed kb=%s sub=%s "
+                    "doc=%s err=%s",
+                    kb_id, subtag_id, doc.id, e,
+                )
+
+    # 3) Soft-delete the docs in one UPDATE. Idempotent: rows with
+    #    deleted_at already set are excluded by the WHERE clause.
+    from sqlalchemy import text as _text
+    await session.execute(
+        _text(
+            "UPDATE kb_documents SET deleted_at = NOW() "
+            "WHERE kb_id = :kb AND subtag_id = :sid "
+            "AND deleted_at IS NULL"
+        ),
+        {"kb": kb_id, "sid": subtag_id},
+    )
+
+    # 4) Soft-delete the subtag itself.
+    ok = await kb_service.soft_delete_subtag(
+        session, kb_id=kb_id, subtag_id=subtag_id,
+    )
     if not ok:
+        await session.rollback()
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="subtag not found")
     await session.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

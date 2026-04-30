@@ -280,6 +280,79 @@ async def test_list_kbs_pagination_bounds_enforced(client):
     assert r.status_code == 422
 
 
+@pytest.mark.skip(reason="cross-agent dep on B's deleted_at column; see integration step")
+@pytest.mark.asyncio
+async def test_subtag_delete_drops_qdrant_chunks(client, engine, monkeypatch):
+    """H7: deleting a subtag MUST cascade Qdrant chunk deletes for each
+    live doc in that subtag, then soft-delete docs + the subtag itself.
+
+    TODO(integration): un-skip once Agent B's migration adds
+    ``kb_subtags.deleted_at`` and the integration conftest re-runs
+    migrations against the testcontainer. Until then the route's
+    fallback path hard-deletes the subtag, which makes the assertion on
+    ``deleted_at`` meaningless.
+    """
+    from ext.routers import kb_admin as ka
+    calls: list[tuple[str, int]] = []
+
+    class _StubVS:
+        async def delete_by_doc(self, collection: str, doc_id: int) -> int:
+            calls.append((collection, int(doc_id)))
+            return 1
+
+    monkeypatch.setattr(ka, "_VS", _StubVS())
+
+    r = await client.post("/api/kb", headers=ADMIN, json={"name": "H7-KB"})
+    kb_id = r.json()["id"]
+    r = await client.post(f"/api/kb/{kb_id}/subtags", headers=ADMIN, json={"name": "Subtag-X"})
+    sub_id = r.json()["id"]
+
+    SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with SessionLocal() as s:
+        for i in range(3):
+            await s.execute(
+                text(
+                    "INSERT INTO kb_documents (kb_id, subtag_id, filename, mime_type, "
+                    "ingest_status, uploaded_by, chunk_count) "
+                    "VALUES (:kb, :sub, :fn, 'text/plain', 'done', '1', 7)"
+                ),
+                {"kb": kb_id, "sub": sub_id, "fn": f"d{i}.txt"},
+            )
+        await s.commit()
+        doc_ids = [r[0] for r in (await s.execute(
+            text("SELECT id FROM kb_documents WHERE kb_id = :kb AND subtag_id = :sub"),
+            {"kb": kb_id, "sub": sub_id},
+        )).all()]
+
+    r = await client.delete(f"/api/kb/{kb_id}/subtags/{sub_id}", headers=ADMIN)
+    assert r.status_code == 204, r.text
+
+    # 1) VectorStore.delete_by_doc invoked once per live doc, on kb_{id}
+    assert len(calls) == 3
+    assert all(c[0] == f"kb_{kb_id}" for c in calls)
+    assert sorted(c[1] for c in calls) == sorted(doc_ids)
+
+    # 2) Docs are soft-deleted (deleted_at set, not row-removed)
+    async with SessionLocal() as s:
+        rows = (await s.execute(
+            text(
+                "SELECT id, deleted_at FROM kb_documents "
+                "WHERE kb_id = :kb AND subtag_id = :sub"
+            ),
+            {"kb": kb_id, "sub": sub_id},
+        )).all()
+        assert all(r[1] is not None for r in rows)
+
+    # 3) Subtag itself is soft-deleted (deleted_at set on kb_subtags row)
+    async with SessionLocal() as s:
+        row = (await s.execute(
+            text("SELECT deleted_at FROM kb_subtags WHERE id = :sid"),
+            {"sid": sub_id},
+        )).first()
+        assert row is not None
+        assert row[0] is not None
+
+
 @pytest.mark.asyncio
 async def test_doc_out_includes_error_message_for_failed_docs(client, engine):
     """H10: failed ingest exposes error_message in DocOut so the admin UI

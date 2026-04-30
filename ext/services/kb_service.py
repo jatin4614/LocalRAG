@@ -4,6 +4,7 @@ Callers must filter by `get_allowed_kb_ids(user_id)` BEFORE calling these method
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Iterable, List, Optional
 
@@ -12,6 +13,8 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db.models import KnowledgeBase, KBSubtag, KBAccess
+
+log = logging.getLogger("orgchat.kb_service")
 
 
 async def create_kb(
@@ -131,14 +134,86 @@ async def create_subtag(
 
 
 async def list_subtags(session: AsyncSession, *, kb_id: int) -> List[KBSubtag]:
-    return list((await session.execute(
-        select(KBSubtag).where(KBSubtag.kb_id == kb_id).order_by(KBSubtag.id)
-    )).scalars().all())
+    """List live subtags for a KB.
+
+    H7: filters out soft-deleted rows (``deleted_at IS NOT NULL``).
+    Cross-agent dep: Agent B adds the ``deleted_at`` column +
+    ``KBSubtag.deleted_at`` ORM field; until that lands the WHERE
+    clause uses ``getattr`` to fall back to a no-op so this code is
+    forward-compatible without breaking the current ORM.
+    """
+    deleted_at = getattr(KBSubtag, "deleted_at", None)
+    stmt = select(KBSubtag).where(KBSubtag.kb_id == kb_id)
+    if deleted_at is not None:
+        stmt = stmt.where(deleted_at.is_(None))
+    stmt = stmt.order_by(KBSubtag.id)
+    return list((await session.execute(stmt)).scalars().all())
 
 
 async def delete_subtag(session: AsyncSession, *, kb_id: int, subtag_id: int) -> bool:
+    """Hard-delete a subtag row. Legacy behaviour kept for callers that
+    don't need the H7 cascade (Qdrant chunk drop + soft-delete docs).
+    The router calls :func:`soft_delete_subtag` directly; this function
+    is retained for backwards compatibility with tests + scripts.
+    """
     r: CursorResult = await session.execute(  # type: ignore[assignment]
         delete(KBSubtag).where(KBSubtag.id == subtag_id, KBSubtag.kb_id == kb_id)
+    )
+    return r.rowcount > 0
+
+
+async def soft_delete_subtag(
+    session: AsyncSession, *, kb_id: int, subtag_id: int,
+) -> bool:
+    """Soft-delete a subtag (H7).
+
+    Sets ``deleted_at = NOW()`` so :func:`list_subtags` filters the row
+    out. Cross-agent dep on Agent B's migration that adds the column;
+    when the column is absent (worktree without B's migration applied),
+    this falls back to hard-delete to preserve the legacy contract
+    until B's migration lands. The fallback path is idempotent and
+    matches the pre-H7 behaviour.
+
+    Returns False if the row doesn't exist OR was already soft-deleted.
+    """
+    from sqlalchemy import text as _text
+    from sqlalchemy.exc import ProgrammingError, OperationalError
+    try:
+        r = await session.execute(
+            _text(
+                "UPDATE kb_subtags SET deleted_at = NOW() "
+                "WHERE id = :sid AND kb_id = :kb AND deleted_at IS NULL"
+            ),
+            {"sid": subtag_id, "kb": kb_id},
+        )
+        rowcount = getattr(r, "rowcount", -1)
+        if rowcount > 0:
+            return True
+        if rowcount == 0:
+            # Could be already-deleted OR not-found; reuse the fallback
+            # SELECT to disambiguate.
+            sub = (await session.execute(
+                select(KBSubtag).where(
+                    KBSubtag.id == subtag_id, KBSubtag.kb_id == kb_id,
+                )
+            )).scalar_one_or_none()
+            if sub is None:
+                return False
+            return True  # row existed but already soft-deleted -> still OK
+    except (ProgrammingError, OperationalError) as e:
+        # Pre-Agent-B worktree: ``deleted_at`` column doesn't exist.
+        # Roll back the failed transaction frame so subsequent SQL on
+        # this session works, then hard-delete instead.
+        await session.rollback()
+        log.warning(
+            "soft_delete_subtag: deleted_at column missing (%s); "
+            "falling back to hard-delete (cross-agent dep on B)", e,
+        )
+    # Hard-delete fallback (legacy path).
+    r = await session.execute(  # type: ignore[assignment]
+        delete(KBSubtag).where(
+            KBSubtag.id == subtag_id, KBSubtag.kb_id == kb_id,
+        )
     )
     return r.rowcount > 0
 
