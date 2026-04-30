@@ -171,7 +171,16 @@ async function createKB() {
   try { await api('/api/kb',{method:'POST',body:JSON.stringify({name:n,description:d||null})}); document.getElementById('kb-name').value=''; document.getElementById('kb-desc').value=''; toast('KB created'); loadKBs(); } catch(e){toast(e.message,false);}
 }
 async function deleteKB(id) {
-  if(!confirm('Delete?')) return;
+  // H12 — explicit cascade warning. Soft-delete in DB but the operation
+  // hard-deletes Qdrant vectors and access grants; documents are
+  // soft-deleted (recoverable from Postgres but not from Qdrant).
+  const msg = 'Delete this KB?\n\n'
+    + 'This will:\n'
+    + ' - Drop all Qdrant vectors for this collection (NOT recoverable)\n'
+    + ' - Hard-delete all access grants (users will lose access immediately)\n'
+    + ' - Soft-delete all documents in this KB (rows kept for audit)\n\n'
+    + 'This cannot be undone.';
+  if(!confirm(msg)) return;
   try{await api(`/api/kb/${id}`,{method:'DELETE'}); toast('Deleted'); if(curKB===id){document.getElementById('kb-detail').classList.add('hidden'); curKB=null;} loadKBs();}catch(e){toast(e.message,false);}
 }
 async function selectKB(id,name) {
