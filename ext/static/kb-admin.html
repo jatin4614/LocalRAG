@@ -19,6 +19,12 @@ input:focus,select:focus,textarea:focus,button:focus-visible{outline:2px solid #
 .btn-gray{background:#3d3d5c;color:#cbd5e1}.btn-gray:hover{background:#4d4d6c}
 .btn-sm{padding:4px 10px;font-size:0.78rem}
 .tag{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:6px;font-size:0.78rem;background:#1e3a5f;color:#93c5fd;margin:2px}
+.search-select{position:relative}
+.search-select-list{position:absolute;left:0;right:0;top:100%;background:#1a1b2e;border:1px solid #3d3d5c;border-top:none;border-radius:0 0 8px 8px;max-height:240px;overflow-y:auto;z-index:50}
+.search-select-list .item{padding:6px 12px;cursor:pointer;border-bottom:1px solid #2d2d50;font-size:0.85rem}
+.search-select-list .item:hover,.search-select-list .item.active{background:#1e293b}
+.search-select-list .item:last-child{border-bottom:none}
+.search-select-list .item .meta{color:#64748b;font-size:0.72rem;font-family:monospace}
 .flex{display:flex}.gap-2{gap:8px}.gap-3{gap:12px}.items-center{align-items:center}.flex-1{flex:1}.mb-2{margin-bottom:8px}.mb-3{margin-bottom:12px}.mt-2{margin-top:8px}
 .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
 table{width:100%;border-collapse:collapse;font-size:0.85rem}th,td{padding:6px 10px;text-align:left;border-bottom:1px solid #2d2d50}
@@ -136,11 +142,15 @@ th{color:#64748b;font-size:0.75rem;text-transform:uppercase;font-weight:600}
       <div>
         <h2>Access Control</h2>
         <div class="flex gap-2 mb-2">
-          <select id="grant-type" onchange="toggleGrantField()" style="max-width:120px" aria-label="Grant target type">
+          <select id="grant-type" onchange="onGrantTypeChange()" style="max-width:120px" aria-label="Grant target type">
             <option value="user">User</option>
             <option value="group">Group</option>
           </select>
-          <input id="grant-id" placeholder="User UUID or Group ID" aria-label="Grant target ID">
+          <div class="search-select flex-1">
+            <input id="grant-search" placeholder="Type to search users…" autocomplete="off" aria-label="Search users or groups" oninput="onGrantSearchInput()" onfocus="onGrantSearchInput()" onblur="setTimeout(closeGrantSearchList,180)" onkeydown="onGrantSearchKey(event)">
+            <input type="hidden" id="grant-id" value="">
+            <div id="grant-search-list" class="search-select-list hidden" role="listbox"></div>
+          </div>
           <button onclick="grantAccess()" class="btn btn-green btn-sm" aria-label="Grant read access">Grant Read</button>
         </div>
         <div id="grant-list"></div>
@@ -176,6 +186,8 @@ const T = (function pullToken() {
 })();
 let curKB = null;
 let fileQueue = [];
+let _users = [];   // M3 — populated by loadUsers, consumed by grant search
+let _groups = [];  // M3 — populated by loadGroups, consumed by grant search
 
 // L1 — Toast stack with 5s TTL and a × close button. Replaces the
 // previous global single-element toast that flashed for 3s with no
@@ -523,19 +535,106 @@ async function loadGrants() {
   }catch(e){toast(e.message,false);}
 }
 async function grantAccess() {
-  const t=document.getElementById('grant-type').value, id=document.getElementById('grant-id').value.trim();
-  if (!id) {toast('Enter an ID',false); return;}
-  const body = t==='user' ? {user_id:id} : {group_id:id};
-  try{await api(`/api/kb/${curKB}/access`,{method:'POST',body:JSON.stringify(body)}); document.getElementById('grant-id').value=''; toast('Access granted'); loadGrants();}catch(e){toast(e.message,false);}
+  const t = document.getElementById('grant-type').value;
+  const id = document.getElementById('grant-id').value.trim();
+  if (!id) { toast('Pick a target from the dropdown', false); return; }
+  const body = t === 'user' ? { user_id: id } : { group_id: id };
+  try {
+    await api(`/api/kb/${curKB}/access`, { method: 'POST', body: JSON.stringify(body) });
+    document.getElementById('grant-id').value = '';
+    document.getElementById('grant-search').value = '';
+    toast('Access granted');
+    loadGrants();
+  } catch (e) { toast(e.message, false); }
 }
 async function revokeAccess(id) { try{await api(`/api/kb/${curKB}/access/${id}`,{method:'DELETE'}); toast('Revoked'); loadGrants();}catch(e){toast(e.message,false);} }
-function toggleGrantField() { document.getElementById('grant-id').placeholder = document.getElementById('grant-type').value==='user' ? 'User UUID' : 'Group ID'; }
+
+// M3 — Grant search-and-select. Replaces the previous free-text
+// "User UUID or Group ID" input that admins had to copy-paste from
+// the user/group tables below. The dropdown filters the loaded
+// _users / _groups arrays by name/email/id; selection populates
+// the hidden #grant-id with the stable id and locks the visible
+// search input to the chosen label.
+let _grantSearchActive = -1;
+function onGrantTypeChange() {
+  document.getElementById('grant-search').placeholder =
+    document.getElementById('grant-type').value === 'user' ? 'Type to search users…' : 'Type to search groups…';
+  document.getElementById('grant-search').value = '';
+  document.getElementById('grant-id').value = '';
+  closeGrantSearchList();
+}
+function onGrantSearchInput() {
+  const q = (document.getElementById('grant-search').value || '').toLowerCase().trim();
+  const t = document.getElementById('grant-type').value;
+  const items = (t === 'user' ? _users : _groups).filter(x => {
+    const hay = `${x.name || ''}|${x.email || ''}|${x.id || ''}`.toLowerCase();
+    return !q || hay.includes(q);
+  }).slice(0, 50);
+  const list = document.getElementById('grant-search-list');
+  clear(list);
+  if (!items.length) {
+    list.appendChild(el('div', { cls: 'item sub', text: 'No matches.' }));
+  } else {
+    for (const x of items) {
+      const it = el('div', { cls: 'item', attrs: { role: 'option', 'data-id': String(x.id) } });
+      it.appendChild(el('div', { text: x.name || '(unnamed)' }));
+      const metaTxt = t === 'user'
+        ? `${x.email || ''} · ${x.id}`
+        : `id ${x.id}`;
+      it.appendChild(el('div', { cls: 'meta', text: metaTxt }));
+      it.addEventListener('mousedown', (ev) => {
+        // mousedown so the click runs before the input's blur handler
+        // collapses the list.
+        ev.preventDefault();
+        _selectGrantTarget(x);
+      });
+      list.appendChild(it);
+    }
+  }
+  list.classList.remove('hidden');
+  _grantSearchActive = -1;
+}
+function _selectGrantTarget(x) {
+  const t = document.getElementById('grant-type').value;
+  const label = t === 'user' ? `${x.name || ''} (${x.email || x.id})` : `${x.name || ''} (id ${x.id})`;
+  document.getElementById('grant-search').value = label;
+  document.getElementById('grant-id').value = String(x.id);
+  closeGrantSearchList();
+}
+function closeGrantSearchList() {
+  document.getElementById('grant-search-list').classList.add('hidden');
+}
+function onGrantSearchKey(ev) {
+  const list = document.getElementById('grant-search-list');
+  if (list.classList.contains('hidden')) return;
+  const items = list.querySelectorAll('.item:not(.sub)');
+  if (ev.key === 'ArrowDown') {
+    ev.preventDefault();
+    _grantSearchActive = Math.min(items.length - 1, _grantSearchActive + 1);
+    items.forEach((n, i) => n.classList.toggle('active', i === _grantSearchActive));
+  } else if (ev.key === 'ArrowUp') {
+    ev.preventDefault();
+    _grantSearchActive = Math.max(0, _grantSearchActive - 1);
+    items.forEach((n, i) => n.classList.toggle('active', i === _grantSearchActive));
+  } else if (ev.key === 'Enter') {
+    if (_grantSearchActive >= 0 && items[_grantSearchActive]) {
+      ev.preventDefault();
+      const id = items[_grantSearchActive].getAttribute('data-id');
+      const t = document.getElementById('grant-type').value;
+      const target = (t === 'user' ? _users : _groups).find(x => String(x.id) === id);
+      if (target) _selectGrantTarget(target);
+    }
+  } else if (ev.key === 'Escape') {
+    closeGrantSearchList();
+  }
+}
 
 // Users & Groups
 async function loadUsers() {
   const target = document.getElementById('users-list');
   try {
     const u=await api('/api/v1/users');
+    _users = Array.isArray(u) ? u : [];   // M3 — feed the grant search
     clear(target);
     if (!u.length) { target.appendChild(el('p', { cls: 'sub', text: 'No users.' })); return; }
     const table = el('table');
@@ -565,6 +664,7 @@ async function loadGroups() {
   const target = document.getElementById('groups-list');
   try {
     const g=await api('/api/v1/groups');
+    _groups = Array.isArray(g) ? g : [];   // M3 — feed the grant search
     clear(target);
     if (!g.length) { target.appendChild(el('p', { cls: 'sub', text: 'No groups.' })); return; }
     const table = el('table');
