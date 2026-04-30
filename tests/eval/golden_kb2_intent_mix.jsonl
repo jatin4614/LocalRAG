@@ -1,0 +1,12 @@
+{"query":"What documents are in this knowledge base?","intent":"metadata","kb_id":2,"expected_doc_ids":[],"notes":"catalog enumeration — answers from KB catalog preamble"}
+{"query":"How many files do I have?","intent":"metadata","kb_id":2,"expected_doc_ids":[],"notes":"counting — catalog preamble"}
+{"query":"What is the date range of the corpus?","intent":"metadata","kb_id":2,"expected_doc_ids":[],"notes":"earliest-to-latest — catalog preamble"}
+{"query":"Summarize the entire 2023 corpus","intent":"global","kb_id":2,"expected_doc_ids":[155,156,157,158,159,160,161,162,163,164,165,167],"notes":"global synthesis — should hit doc-summary tier and cover all 12 months"}
+{"query":"Give me a high-level overview of every month","intent":"global","kb_id":2,"expected_doc_ids":[155,156,157,158,159,160,161,162,163,164,165,167],"notes":"global aggregation — doc-summary tier, expects all 12"}
+{"query":"What happened on 25 Feb 23?","intent":"specific_date","kb_id":2,"expected_doc_ids":[156],"notes":"single-date pin — specific_date intent, doc_id filter on feB 23.docx"}
+{"query":"What activities are listed for 80 Inf Bde Minimarg?","intent":"specific","kb_id":2,"expected_doc_ids":[156,159,161,165,167],"notes":"entity question across multiple months — should retrieve from Feb/May/Jul/Nov/Dec"}
+{"query":"What activities were reported for 80 Inf Bde in May, July, December, and February 2023?","intent":"specific_date","kb_id":2,"expected_doc_ids":[156,159,161,167],"notes":"FAILING-CASE: multi-month entity query — Phase 2 multi-shard path; expects coverage of all 4 months"}
+{"query":"How did 80 Inf Bde activity evolve from January to December 2023?","intent":"specific_date","kb_id":2,"expected_doc_ids":[155,156,157,158,159,160,161,162,163,164,165,167],"notes":"multi-month evolution — should fan out across all 12 monthly shards"}
+{"query":"Compare 75 Inf Bde and 80 Inf Bde","intent":"specific","kb_id":2,"expected_doc_ids":[],"notes":"cross-entity comparison — no specific date; hybrid+colbert should rank both"}
+{"query":"What did the Daily Int Brief of 09 Feb 23 say?","intent":"specific_date","kb_id":2,"expected_doc_ids":[156],"notes":"date-anchored quote — specific_date narrows to feB 23.docx"}
+{"query":"Summary of Q1 2023","intent":"specific_date","kb_id":2,"expected_doc_ids":[155,156,157],"notes":"quarter-anchored — Phase 2 multi-month support; Q1 expands to Jan,Feb,Mar"}
