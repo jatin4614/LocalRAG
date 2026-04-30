@@ -171,3 +171,62 @@ async def test_patch_kb_rejects_overlong_name(client):
     kb_id = r.json()["id"]
     r = await client.patch(f"/api/kb/{kb_id}", headers=ADMIN, json={"name": "x" * 256})
     assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_kb_create_duplicate_name_returns_409(client):
+    """L7: kb_service pre-check raises ValueError -> router maps to 409."""
+    r = await client.post("/api/kb", headers=ADMIN, json={"name": "Unique-1"})
+    assert r.status_code == 201, r.text
+    r = await client.post("/api/kb", headers=ADMIN, json={"name": "Unique-1"})
+    assert r.status_code == 409
+    assert "already in use" in r.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_kb_create_integrity_error_returns_409(client, engine, monkeypatch):
+    """H8: when an IntegrityError reaches the router (e.g. race past
+    pre-check), it MUST surface as 409 with a sanitized message —
+    not a 500 with raw IntegrityError text exposing constraint names.
+    """
+    from ext.services import kb_service as svc
+
+    # Bypass the pre-check by monkeypatching it to a no-op for this call.
+    # The DB unique constraint will then fire.
+    SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with SessionLocal() as s:
+        await s.execute(
+            text("INSERT INTO knowledge_bases (id, name, admin_id) VALUES (501, 'Race-Me', '1')")
+        )
+        await s.commit()
+
+    original = svc.create_kb
+
+    async def _bypass_precheck(session, *, name, description, admin_id):
+        # Skip the pre-check, go straight to insert + flush.
+        from ext.db.models import KnowledgeBase
+        kb = KnowledgeBase(name=name, description=description, admin_id=admin_id)
+        session.add(kb)
+        await session.flush()
+        return kb
+
+    monkeypatch.setattr(svc, "create_kb", _bypass_precheck)
+    try:
+        r = await client.post("/api/kb", headers=ADMIN, json={"name": "Race-Me"})
+        assert r.status_code == 409, r.text
+        # Sanitized — no raw constraint name leaked
+        assert "name already in use" in r.json()["detail"].lower()
+    finally:
+        monkeypatch.setattr(svc, "create_kb", original)
+
+
+@pytest.mark.asyncio
+async def test_subtag_create_duplicate_name_returns_409(client):
+    """H8: duplicate subtag name within same KB → 409 sanitized."""
+    r = await client.post("/api/kb", headers=ADMIN, json={"name": "S-KB"})
+    kb_id = r.json()["id"]
+    r1 = await client.post(f"/api/kb/{kb_id}/subtags", headers=ADMIN, json={"name": "Dup"})
+    assert r1.status_code == 201, r1.text
+    r2 = await client.post(f"/api/kb/{kb_id}/subtags", headers=ADMIN, json={"name": "Dup"})
+    assert r2.status_code == 409, r2.text
+    assert "already in use" in r2.json()["detail"].lower()

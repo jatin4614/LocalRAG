@@ -11,6 +11,7 @@ from pydantic import BaseModel, constr
 from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from ..services import kb_service
 from ..db.models import KBAccess, KBDocument, KnowledgeBase
@@ -135,12 +136,31 @@ async def create_kb(
     user: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(_get_session),
 ):
+    """H8: catch IntegrityError specifically (concurrent same-name insert
+    races past kb_service's pre-check) and ValueError from the service-
+    layer pre-check; both surface as 409 with sanitized messages. Other
+    exceptions propagate to the standard 500 with full server-side
+    logging — they indicate a real bug, not a benign user error.
+    """
     try:
-        kb = await kb_service.create_kb(session, name=body.name, description=body.description, admin_id=user.id)
+        kb = await kb_service.create_kb(
+            session, name=body.name, description=body.description, admin_id=user.id,
+        )
         await session.commit()
-    except Exception as e:
+    except ValueError as e:
+        # Service-layer pre-check ("kb name already in use: ...")
         await session.rollback()
         raise HTTPException(status.HTTP_409_CONFLICT, detail=str(e)) from e
+    except IntegrityError as e:
+        await session.rollback()
+        log.warning("create_kb: integrity error name=%r: %s", body.name, e)
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, detail="name already in use",
+        ) from e
+    except Exception as e:
+        await session.rollback()
+        log.exception("create_kb: unexpected error")
+        raise
     return _to_out(kb)
 
 
@@ -301,9 +321,22 @@ async def create_subtag(
     try:
         sub = await kb_service.create_subtag(session, kb_id=kb_id, name=body.name, description=body.description)
         await session.commit()
-    except Exception as e:
+    except IntegrityError as e:
+        # H8: subtags have UNIQUE(kb_id, name) — duplicate name within
+        # the same KB violates the index.
         await session.rollback()
-        raise HTTPException(status.HTTP_409_CONFLICT, detail=str(e)) from e
+        log.warning(
+            "create_subtag: integrity error kb=%s name=%r: %s",
+            kb_id, body.name, e,
+        )
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail="subtag name already in use within this KB",
+        ) from e
+    except Exception:
+        await session.rollback()
+        log.exception("create_subtag: unexpected error kb=%s", kb_id)
+        raise
     return SubtagOut(id=sub.id, kb_id=sub.kb_id, name=sub.name, description=sub.description)
 
 
@@ -363,9 +396,21 @@ async def grant_access(
     except ValueError as e:
         await session.rollback()
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
-    except Exception as e:
+    except IntegrityError as e:
+        # H8: kb_access has CHECK constraint (exactly-one user XOR group)
+        # plus FK/duplicate constraints. Map to 409 with sanitized text.
         await session.rollback()
-        raise HTTPException(status.HTTP_409_CONFLICT, detail=str(e)) from e
+        log.warning(
+            "grant_access: integrity error kb=%s user=%s group=%s: %s",
+            kb_id, body.user_id, body.group_id, e,
+        )
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, detail="constraint violation",
+        ) from e
+    except Exception:
+        await session.rollback()
+        log.exception("grant_access: unexpected error kb=%s", kb_id)
+        raise
     # Phase 1.5 — invalidate cached allowed_kb_ids for every user this
     # grant affects (direct user grant -> 1 user; group grant -> all
     # current group members). Fail-open: a cache miss falls through to
