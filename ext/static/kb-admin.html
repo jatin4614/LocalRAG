@@ -66,6 +66,7 @@ th{color:#64748b;font-size:0.75rem;text-transform:uppercase;font-weight:600}
 .adv-err{color:#f87171;font-size:0.75rem;margin-top:2px}
 .doc-row{display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid #2d2d50}
 .doc-row:last-child{border:none}
+.doc-row .err-line{color:#f87171;font-size:0.78rem;margin-top:2px;font-family:monospace}
 .file-drop{border:2px dashed #3d3d5c;border-radius:10px;padding:20px;text-align:center;cursor:pointer;transition:0.2s}
 .file-drop:hover,.file-drop.dragover{border-color:#3b82f6;background:#1e293b}
 .file-list{margin-top:8px;font-size:0.85rem}
@@ -648,6 +649,18 @@ function _renderDocRow(d) {
     text: ` ${d.mime_type || ''} · ${d.chunk_count ?? 0} chunks · ${d.ingest_status || ''}`,
   }));
   info.appendChild(top);
+
+  // H10 — render error_message inline when status is failed.
+  // Field is added by agent C as Optional[str] on DocOut. Defensive
+  // fallback: if it's missing but status is "failed", show a generic
+  // line so the row still flags the failure (instead of silently
+  // looking like a healthy doc with 0 chunks).
+  const status = (d.ingest_status || '').toLowerCase();
+  if (status === 'failed') {
+    const err = (d.error_message != null && String(d.error_message).trim())
+      || '(no error message — check celery-worker logs)';
+    info.appendChild(el('div', { cls: 'err-line', text: err }));
+  }
   row.appendChild(info);
 
   // H1 — re-embed button hidden; backend route returns 501.
