@@ -82,6 +82,13 @@ VALID_BOOL_KEYS = frozenset({
     "intent_llm",
 })
 VALID_INT_KEYS = frozenset({
+    # Pre-rerank pull cap. Overrides the intent-driven _per_kb default
+    # (10 / 30 / 50 for default / specific_date / global). Use to widen
+    # recall on KBs with many entities-per-query (military reports
+    # listing 4 brigades; legal contracts citing N parties) where the
+    # default 10-30 starves low-frequency entities into top-12 eviction.
+    # MAX merge across selected KBs.
+    "top_k",
     "rerank_top_k",
     "context_expand_window",
     # P3.3: number of hypothetical-doc generations to average. Higher N
@@ -125,6 +132,7 @@ INGEST_ONLY_KEYS = frozenset({
 _KEY_TO_ENV: dict[str, str] = {
     "rerank": "RAG_RERANK",
     "rerank_top_k": "RAG_RERANK_TOP_K",
+    "top_k": "RAG_TOP_K",
     "mmr": "RAG_MMR",
     "mmr_lambda": "RAG_MMR_LAMBDA",
     "context_expand": "RAG_CONTEXT_EXPAND",
@@ -185,6 +193,12 @@ def validate_config(raw: Mapping[str, Any]) -> dict[str, Any]:
             # drops the key so the KB inherits process defaults instead
             # of running with a corrupt config.
             if key == "rerank_top_k" and not (1 <= coerced <= 1000):
+                continue
+            # top_k caps the pre-rerank pull. 200 ceiling matches the
+            # heaviest realistic budget — anything more and the rerank
+            # cross-encoder dominates per-request latency without
+            # measurably improving recall.
+            if key == "top_k" and not (1 <= coerced <= 200):
                 continue
             if key == "context_expand_window" and not (0 <= coerced <= 100):
                 continue

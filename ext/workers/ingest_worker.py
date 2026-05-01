@@ -37,12 +37,19 @@ async def _update_doc_status(
     status: str,
     *,
     chunk_count: int | None = None,
+    error_message: str | None = None,
 ) -> None:
-    """Update ``kb_documents.ingest_status`` (and optionally chunk_count).
+    """Update ``kb_documents.ingest_status`` (and optionally chunk_count
+    or error_message).
 
     Best-effort, fire-and-forget: any DB error is logged + swallowed so a
     transient Postgres blip never causes the task itself to fail. Skips when
     doc_id is missing (private chat-scoped uploads have chat_id, not doc_id).
+
+    ``error_message`` is written when provided (typically alongside
+    ``status='failed'``) so admins can see WHY a doc failed without
+    grepping celery logs. Mirrors the sync upload path in
+    ext/routers/upload.py which also stamps error_message on failure.
     """
     if doc_id is None:
         return
@@ -58,24 +65,17 @@ async def _update_doc_status(
         from sqlalchemy.ext.asyncio import create_async_engine
         engine = create_async_engine(db_url, pool_pre_ping=True)
         try:
+            sets = ["ingest_status = :s"]
+            params: dict[str, object] = {"s": status, "i": int(doc_id)}
+            if chunk_count is not None:
+                sets.append("chunk_count = :c")
+                params["c"] = int(chunk_count)
+            if error_message is not None:
+                sets.append("error_message = :e")
+                params["e"] = error_message
+            sql = f"UPDATE kb_documents SET {', '.join(sets)} WHERE id = :i"
             async with engine.begin() as conn:
-                if chunk_count is not None:
-                    await conn.execute(
-                        _sql(
-                            "UPDATE kb_documents "
-                            "SET ingest_status = :s, chunk_count = :c "
-                            "WHERE id = :i"
-                        ),
-                        {"s": status, "c": int(chunk_count), "i": int(doc_id)},
-                    )
-                else:
-                    await conn.execute(
-                        _sql(
-                            "UPDATE kb_documents SET ingest_status = :s "
-                            "WHERE id = :i"
-                        ),
-                        {"s": status, "i": int(doc_id)},
-                    )
+                await conn.execute(_sql(sql), params)
         finally:
             await engine.dispose()
     except Exception as e:  # noqa: BLE001 — best-effort
@@ -248,7 +248,10 @@ def ingest_blob(
                 raise self.retry(exc=exc, countdown=2 ** self.request.retries)
             log.error("ingest: exhausted retries sha=%s err=%s", sha, exc)
             try:
-                asyncio.run(_update_doc_status(_doc_id, "failed"))
+                asyncio.run(_update_doc_status(
+                    _doc_id, "failed",
+                    error_message=f"{type(exc).__name__}: {exc}"[:500],
+                ))
             except Exception:  # noqa: BLE001 — best-effort
                 pass
             if _kb_id_for_progress is not None:

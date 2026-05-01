@@ -1023,6 +1023,23 @@ async def _run_pipeline(
                         _per_kb, _total = 30, 60
                     else:
                         _per_kb, _total = 10, 30
+                    # Per-KB rag_config override (option B from the
+                    # 32 Inf Bde eviction case 2026-05-01). When any
+                    # selected KB stamps top_k in its rag_config, the
+                    # value enters the request overlay as RAG_TOP_K via
+                    # config_to_env_overrides; max-merge is already
+                    # applied across selected KBs by merge_configs.
+                    # Take the larger of the intent default and the
+                    # override so an admin who set top_k=24 on a heavy
+                    # KB doesn't get *narrowed* by a stricter intent.
+                    _kb_top_k = 0
+                    try:
+                        _kb_top_k = int(flags.get("RAG_TOP_K") or 0)
+                    except (TypeError, ValueError):
+                        _kb_top_k = 0
+                    if _kb_top_k > 0:
+                        _per_kb = max(_per_kb, _kb_top_k)
+                        _total = max(_total, _kb_top_k * max(1, len(selected_kbs or [])))
                     # Phase 2.3 — multi-temporal scaling. When the QU LLM
                     # extracted N>1 distinct months/quarters/years (so the
                     # query's candidate pool is N monthly shards, not one),
