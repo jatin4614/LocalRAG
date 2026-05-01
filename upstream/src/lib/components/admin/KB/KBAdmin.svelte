@@ -26,6 +26,97 @@
 	let createError = '';
 	let detailError = '';
 
+	// Per-KB rag_config (Advanced Settings) — mirrors the M5 panel from
+	// ext/static/kb-admin.html. Schema must stay in sync with VALID_KEYS
+	// in ext/services/kb_config.py.
+	let advConfig = {};       // current values (key → coerced value or '')
+	let advOpen = false;
+	let advLoading = false;
+	let advStatus = '';
+	let advError = '';
+	const ADV_SCHEMA = [
+		{ key: 'rerank',                type: 'bool', label: 'Cross-encoder rerank', help: 'Default off; production uses bge-reranker-v2-m3.' },
+		{ key: 'mmr',                   type: 'bool', label: 'MMR diversification' },
+		{ key: 'context_expand',        type: 'bool', label: 'Context expand (siblings)' },
+		{ key: 'spotlight',             type: 'bool', label: 'Spotlight wrap' },
+		{ key: 'semcache',              type: 'bool', label: 'Semantic cache' },
+		{ key: 'hyde',                  type: 'bool', label: 'HyDE expansion' },
+		{ key: 'doc_summaries',         type: 'bool', label: 'Per-doc summaries (ingest-only)' },
+		{ key: 'intent_routing',        type: 'bool', label: 'Intent routing' },
+		{ key: 'top_k',                 type: 'int',  label: 'Top-K (pre-rerank pull)', min: 1, max: 200, help: 'Caps per-KB candidates pulled before rerank. Leave blank to inherit intent default. Bump for KBs whose queries enumerate many entities.' },
+		{ key: 'rerank_top_k',          type: 'int',  label: 'Rerank top-K (final)', min: 1, max: 1000, help: 'Final candidate count after rerank. Default 12 from RAG_RERANK_TOP_K.' },
+		{ key: 'context_expand_window', type: 'int',  label: 'Expand window', min: 0, max: 100 },
+		{ key: 'hyde_n',                type: 'int',  label: 'HyDE expansions', min: 1, max: 10 },
+		{ key: 'chunk_tokens',          type: 'int',  label: 'Chunk tokens (ingest)', min: 100, max: 2000 },
+		{ key: 'overlap_tokens',        type: 'int',  label: 'Overlap tokens (ingest)', min: 0, max: 1000 },
+		{ key: 'mmr_lambda',            type: 'float', label: 'MMR λ', min: 0, max: 1, step: 0.05, help: 'Lower = more diversity. Default 0.7 favours relevance.' }
+	];
+
+	async function loadAdvancedConfig() {
+		if (!selectedKB) return;
+		advLoading = true;
+		advStatus = '';
+		advError = '';
+		try {
+			const out = await api(`/api/kb/${selectedKB.id}/config`);
+			const cfg = (out && out.rag_config) || {};
+			advConfig = {};
+			for (const f of ADV_SCHEMA) {
+				if (cfg[f.key] != null) advConfig[f.key] = cfg[f.key];
+				else advConfig[f.key] = (f.type === 'bool') ? false : '';
+			}
+		} catch (e) {
+			advError = 'Could not load: ' + e.message;
+		}
+		advLoading = false;
+	}
+
+	async function saveAdvancedConfig() {
+		if (!selectedKB) return;
+		advError = '';
+		advStatus = 'Saving…';
+		const payload = {};
+		for (const f of ADV_SCHEMA) {
+			const v = advConfig[f.key];
+			if (f.type === 'bool') {
+				// Always send boolean state so toggling off persists.
+				payload[f.key] = !!v;
+			} else if (v === '' || v == null || (typeof v === 'string' && v.trim() === '')) {
+				// Empty numeric → omit (inherit process default).
+				continue;
+			} else {
+				payload[f.key] = (f.type === 'float') ? parseFloat(v) : parseInt(v, 10);
+			}
+		}
+		try {
+			// PATCH body is the rag_config keys directly (mirrors
+			// ext/static/kb-admin.html and ext/routers/kb_admin.py
+			// patch_rag_config — partial merge, unknown keys → 400).
+			const out = await api(`/api/kb/${selectedKB.id}/config`, {
+				method: 'PATCH',
+				body: JSON.stringify(payload)
+			});
+			const cfg = (out && out.rag_config) || {};
+			advConfig = {};
+			for (const f of ADV_SCHEMA) {
+				if (cfg[f.key] != null) advConfig[f.key] = cfg[f.key];
+				else advConfig[f.key] = (f.type === 'bool') ? false : '';
+			}
+			advStatus = 'Saved.';
+			setTimeout(() => { advStatus = ''; }, 2500);
+		} catch (e) {
+			advError = 'Save failed: ' + e.message;
+			advStatus = '';
+		}
+	}
+
+	function resetAdvancedField(key) {
+		const f = ADV_SCHEMA.find((x) => x.key === key);
+		if (!f) return;
+		advConfig[key] = (f.type === 'bool') ? false : '';
+		advConfig = advConfig;
+	}
+
 	const TOKEN = typeof localStorage !== 'undefined' ? (localStorage.token || '') : '';
 
 	async function api(path, opts = {}) {
@@ -146,8 +237,11 @@
 		subtags = [];
 		documents = [];
 		grants = [];
+		advConfig = {};
+		advStatus = '';
+		advError = '';
 		openIngestStream(kb.id);
-		await Promise.all([loadSubtags(), loadDocuments(), loadGrants()]);
+		await Promise.all([loadSubtags(), loadDocuments(), loadGrants(), loadAdvancedConfig()]);
 	}
 
 	onDestroy(closeIngestStream);
@@ -459,6 +553,105 @@
 								</div>
 								{#if detailError}
 									<p class="mt-2 text-xs text-red-500">{detailError}</p>
+								{/if}
+							</div>
+
+							<!-- Advanced Settings (per-KB rag_config). Collapsed by default. -->
+							<div class="bg-white dark:bg-gray-850 rounded-xl border border-gray-200 dark:border-gray-800">
+								<button
+									class="w-full flex items-center justify-between px-5 py-3 text-left focus:outline-none"
+									on:click={() => { advOpen = !advOpen; }}
+									aria-expanded={advOpen}
+									aria-controls="adv-section-{selectedKB.id}"
+								>
+									<span class="text-sm font-semibold flex items-center gap-2">
+										<span class="text-blue-500">{advOpen ? '▼' : '▶'}</span>
+										Advanced Settings (per-KB retrieval overrides)
+									</span>
+									<span class="text-xs text-gray-400 dark:text-gray-500">
+										{Object.values(advConfig).filter((v) => v !== '' && v !== false && v != null).length} active
+									</span>
+								</button>
+								{#if advOpen}
+									<div id="adv-section-{selectedKB.id}" class="px-5 pb-5 border-t border-gray-200 dark:border-gray-800">
+										<p class="text-xs text-gray-500 dark:text-gray-400 mt-3 mb-4">
+											Per-KB overrides for retrieval flags. Empty/unchecked = inherit process default. Saved values override env vars at request time. Schema mirrored from <code>ext/services/kb_config.py</code>.
+										</p>
+
+										{#if advLoading}
+											<p class="text-xs text-gray-400">Loading…</p>
+										{:else}
+											<div class="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-4">
+												{#each ADV_SCHEMA as f (f.key)}
+													<div class="flex flex-col gap-1">
+														{#if f.type === 'bool'}
+															<label class="inline-flex items-center gap-2 text-sm font-medium text-gray-700 dark:text-gray-300">
+																<input
+																	type="checkbox"
+																	bind:checked={advConfig[f.key]}
+																	class="rounded border-gray-300 dark:border-gray-700"
+																/>
+																{f.label}
+															</label>
+														{:else if f.type === 'int'}
+															<label class="text-xs font-medium text-gray-600 dark:text-gray-400" for="adv-{f.key}-{selectedKB.id}">
+																{f.label}
+																<span class="text-gray-400 dark:text-gray-500 font-normal">({f.min}–{f.max})</span>
+															</label>
+															<input
+																id="adv-{f.key}-{selectedKB.id}"
+																type="number"
+																min={f.min}
+																max={f.max}
+																step="1"
+																placeholder="inherit"
+																bind:value={advConfig[f.key]}
+																class="bg-gray-50 dark:bg-gray-900 border border-gray-300 dark:border-gray-700 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+															/>
+														{:else if f.type === 'float'}
+															<label class="text-xs font-medium text-gray-600 dark:text-gray-400" for="adv-{f.key}-{selectedKB.id}">
+																{f.label}
+																<span class="text-gray-400 dark:text-gray-500 font-normal">({advConfig[f.key] !== '' && advConfig[f.key] != null ? advConfig[f.key] : '—'})</span>
+															</label>
+															<input
+																id="adv-{f.key}-{selectedKB.id}"
+																type="range"
+																min={f.min}
+																max={f.max}
+																step={f.step || 0.05}
+																bind:value={advConfig[f.key]}
+																class="w-full"
+															/>
+														{/if}
+														{#if f.help}
+															<span class="text-xs text-gray-400 dark:text-gray-500">{f.help}</span>
+														{/if}
+													</div>
+												{/each}
+											</div>
+
+											<div class="flex items-center gap-3 mt-5">
+												<button
+													class="px-4 py-1.5 text-sm rounded-lg font-medium bg-blue-600 text-white hover:bg-blue-700 transition"
+													on:click={saveAdvancedConfig}
+												>
+													Save
+												</button>
+												<button
+													class="px-4 py-1.5 text-sm rounded-lg font-medium bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700 transition"
+													on:click={loadAdvancedConfig}
+												>
+													Reload
+												</button>
+												{#if advStatus}
+													<span class="text-xs text-green-600 dark:text-green-400">{advStatus}</span>
+												{/if}
+												{#if advError}
+													<span class="text-xs text-red-500">{advError}</span>
+												{/if}
+											</div>
+										{/if}
+									</div>
 								{/if}
 							</div>
 
