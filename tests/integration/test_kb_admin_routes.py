@@ -62,6 +62,51 @@ async def test_get_kb_404(client):
 
 
 @pytest.mark.asyncio
+async def test_kb_response_includes_document_count(client, engine):
+    """KB list/detail must report document_count so the admin UI's
+    "N docs" indicator is accurate. Counts only live (non-soft-deleted)
+    rows so the value matches what GET /api/kb/{id}/documents returns
+    (deleted_at IS NULL filter).
+    """
+    r = await client.post("/api/kb", headers=ADMIN, json={"name": "Counted"})
+    kb_id = r.json()["id"]
+    r = await client.post(f"/api/kb/{kb_id}/subtags", headers=ADMIN, json={"name": "main"})
+    sub_id = r.json()["id"]
+    r = await client.post("/api/kb", headers=ADMIN, json={"name": "Empty"})
+    empty_kb_id = r.json()["id"]
+
+    SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with SessionLocal() as s:
+        for i in range(3):
+            await s.execute(
+                text(
+                    "INSERT INTO kb_documents (kb_id, subtag_id, filename, uploaded_by, ingest_status) "
+                    "VALUES (:kb, :sub, :fn, '1', 'done')"
+                ),
+                {"kb": kb_id, "sub": sub_id, "fn": f"f{i}.pdf"},
+            )
+        await s.execute(
+            text(
+                "INSERT INTO kb_documents (kb_id, subtag_id, filename, uploaded_by, ingest_status, deleted_at) "
+                "VALUES (:kb, :sub, 'gone.pdf', '1', 'done', now())"
+            ),
+            {"kb": kb_id, "sub": sub_id},
+        )
+        await s.commit()
+
+    r = await client.get("/api/kb", headers=ADMIN)
+    assert r.status_code == 200
+    by_id = {k["id"]: k for k in r.json()["items"]}
+    assert by_id[kb_id]["document_count"] == 3
+    assert by_id[empty_kb_id]["document_count"] == 0
+
+    r = await client.get(f"/api/kb/{kb_id}", headers=ADMIN)
+    assert r.json()["document_count"] == 3
+    r = await client.get(f"/api/kb/{empty_kb_id}", headers=ADMIN)
+    assert r.json()["document_count"] == 0
+
+
+@pytest.mark.asyncio
 async def test_patch_kb(client):
     r = await client.post("/api/kb", headers=ADMIN, json={"name": "Old"})
     kb_id = r.json()["id"]

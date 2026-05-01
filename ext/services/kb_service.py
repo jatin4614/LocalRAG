@@ -12,7 +12,7 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..db.models import KnowledgeBase, KBSubtag, KBAccess
+from ..db.models import KnowledgeBase, KBSubtag, KBAccess, KBDocument
 
 log = logging.getLogger("orgchat.kb_service")
 
@@ -98,6 +98,27 @@ async def count_kbs(
             return 0
         stmt = stmt.where(KnowledgeBase.id.in_(ids))
     return int((await session.execute(stmt)).scalar() or 0)
+
+
+async def count_documents_by_kb(
+    session: AsyncSession, *, kb_ids: Iterable[int],
+) -> dict[int, int]:
+    """Return {kb_id: live_document_count} for the given KBs in one query.
+
+    Filter mirrors GET /api/kb/{id}/documents (deleted_at IS NULL,
+    any ingest_status) so the admin UI's per-KB "N docs" indicator
+    matches the count rendered in the document list. KBs with zero
+    live docs are absent from the dict — callers should default to 0.
+    """
+    ids = list(kb_ids)
+    if not ids:
+        return {}
+    rows = (await session.execute(
+        select(KBDocument.kb_id, func.count(KBDocument.id))
+        .where(KBDocument.kb_id.in_(ids), KBDocument.deleted_at.is_(None))
+        .group_by(KBDocument.kb_id)
+    )).all()
+    return {int(kb_id): int(n) for kb_id, n in rows}
 
 
 async def update_kb(

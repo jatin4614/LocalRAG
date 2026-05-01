@@ -132,6 +132,10 @@ class KBOut(BaseModel):
     name: str
     description: Optional[str]
     admin_id: str
+    # Live (non-soft-deleted) document count. Mirrors the filter used by
+    # GET /api/kb/{id}/documents so the admin UI's per-KB "N docs"
+    # indicator matches what the document list page shows.
+    document_count: int = 0
 
 
 class KBListOut(BaseModel):
@@ -140,8 +144,11 @@ class KBListOut(BaseModel):
     total_count: int
 
 
-def _to_out(kb) -> KBOut:
-    return KBOut(id=kb.id, name=kb.name, description=kb.description, admin_id=kb.admin_id)
+def _to_out(kb, *, document_count: int = 0) -> KBOut:
+    return KBOut(
+        id=kb.id, name=kb.name, description=kb.description,
+        admin_id=kb.admin_id, document_count=document_count,
+    )
 
 
 @router.post("", response_model=KBOut, status_code=status.HTTP_201_CREATED)
@@ -195,7 +202,11 @@ async def list_kbs(
     """
     kbs = await kb_service.list_kbs(session, limit=limit, offset=offset)
     total = await kb_service.count_kbs(session)
-    return KBListOut(items=[_to_out(k) for k in kbs], total_count=total)
+    counts = await kb_service.count_documents_by_kb(
+        session, kb_ids=[k.id for k in kbs]
+    )
+    items = [_to_out(k, document_count=counts.get(k.id, 0)) for k in kbs]
+    return KBListOut(items=items, total_count=total)
 
 
 @router.get("/{kb_id}", response_model=KBOut)
@@ -207,7 +218,8 @@ async def get_kb(
     kb = await kb_service.get_kb(session, kb_id=kb_id)
     if kb is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="kb not found")
-    return _to_out(kb)
+    counts = await kb_service.count_documents_by_kb(session, kb_ids=[kb_id])
+    return _to_out(kb, document_count=counts.get(kb_id, 0))
 
 
 @router.patch("/{kb_id}", response_model=KBOut)
@@ -221,7 +233,8 @@ async def update_kb(
     if kb is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="kb not found")
     await session.commit()
-    return _to_out(kb)
+    counts = await kb_service.count_documents_by_kb(session, kb_ids=[kb_id])
+    return _to_out(kb, document_count=counts.get(kb_id, 0))
 
 
 class RAGConfigOut(BaseModel):
