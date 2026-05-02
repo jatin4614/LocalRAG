@@ -686,6 +686,38 @@ def _build_datetime_preamble_source() -> Optional[dict]:
 # tokenizer doesn't get touched at import time. ``None`` means "tried and
 # failed" — fall back to the static estimate.
 _SYSTEM_PROMPT_TOKEN_CACHE: Optional[int] = None
+_SYSTEM_PROMPT_HASH_CACHE: Optional[str] = None
+
+
+def system_prompt_version_hash() -> str:
+    """Wave 2 (review §6.6): sha256[:12] of the analyst system prompt.
+
+    Used to label LLM telemetry (prompt_hash) and exposed as a Prometheus
+    gauge so a quality regression can be bisected to a specific prompt
+    revision (apply_analyst_config.py overwrites silently — without the
+    hash there's no audit trail). Computed once on first call; mutates
+    only when the file changes (operator must re-import to refresh).
+    """
+    global _SYSTEM_PROMPT_HASH_CACHE
+    if _SYSTEM_PROMPT_HASH_CACHE is not None:
+        return _SYSTEM_PROMPT_HASH_CACHE
+    try:
+        import hashlib
+        from pathlib import Path
+        _path = Path(__file__).resolve().parents[2] / "scripts" / "system_prompt_analyst.txt"
+        if _path.is_file():
+            digest = hashlib.sha256(_path.read_bytes()).hexdigest()[:12]
+            _SYSTEM_PROMPT_HASH_CACHE = digest
+            try:
+                from .metrics import RAG_SYSTEM_PROMPT_VERSION
+                RAG_SYSTEM_PROMPT_VERSION.labels(hash=digest).set(1)
+            except Exception:
+                pass
+            return digest
+    except Exception:
+        pass
+    _SYSTEM_PROMPT_HASH_CACHE = "unknown"
+    return _SYSTEM_PROMPT_HASH_CACHE
 
 
 def _system_prompt_tokens() -> int:

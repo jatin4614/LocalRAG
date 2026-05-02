@@ -593,3 +593,21 @@ rag_pipeline_timeout_total = Counter(
     "Pipeline runs that exceeded RAG_TOTAL_BUDGET_SEC and returned degraded sources",
     labelnames=["intent"],
 )
+
+
+# ---------------------------------------------------------------------------
+# Wave 2 (review §6.6) — system prompt version stamping.
+#
+# sha256[:12] of the analyst system prompt is exposed as a gauge labelled
+# with the hash. apply_analyst_config.py overwrites the prompt silently —
+# without this, a quality regression can't be bisected to a prompt change.
+# Operators correlate dashboards via:
+#   rag_system_prompt_version{hash="abc123def456"}  # current
+# Plus every record_llm_call carries the same hash as a label so a token-
+# spend or latency dashboard can be split per-version.
+# ---------------------------------------------------------------------------
+RAG_SYSTEM_PROMPT_VERSION = Gauge(
+    "rag_system_prompt_version",
+    "Active analyst system prompt version (hash label = sha256[:12] of prompt)",
+    labelnames=["hash"],
+)

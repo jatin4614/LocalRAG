@@ -151,6 +151,22 @@ def build_app() -> FastAPI:
             type(exc).__name__, exc,
         )
 
+    # Wave 2 (review §6.6): compute + emit the system-prompt version
+    # gauge once at startup so dashboards have a stable label to bisect
+    # quality regressions against. apply_analyst_config.py overwrites the
+    # prompt silently — without this label there's no audit trail.
+    try:
+        from ext.services.chat_rag_bridge import system_prompt_version_hash
+        _logger.info(
+            "rag: analyst system_prompt version_hash=%s",
+            system_prompt_version_hash(),
+        )
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning(
+            "system-prompt version hash failed (%s: %s) — continuing.",
+            type(exc).__name__, exc,
+        )
+
     # Phase 1.2 — reranker preload. Loading on first request blocks that
     # request for ~3-5s on GPU cold start. Preloading at app init shifts
     # the cost to startup time and surfaces load failures before user
