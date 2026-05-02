@@ -35,16 +35,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       tesseract-ocr tesseract-ocr-eng \
     && rm -rf /var/lib/apt/lists/*
 
-# Upstream Python deps
-COPY upstream/backend/requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir uv && \
-    uv pip install --system --no-cache-dir -r requirements.txt
+# Install uv (fast resolver/installer) first.
+RUN pip install --no-cache-dir uv
 
 # Torch cu128 / 2.7+ — adds sm_120 (Blackwell RTX 50X0, RTX PRO 6000 Blackwell)
 # kernel support. Host driver NVRM 580.126.09 (CUDA 12.9 capable) is forward
-# compatible. Install BEFORE the rest so no transitive upgrade/downgrade.
+# compatible.
+#
+# Review §10.2 — install cu128 torch BEFORE upstream requirements.txt. Upstream
+# requirements (transformers / sentence-transformers / etc.) transitively
+# depend on torch; if installed first they pull the default CPU build from
+# PyPI (~2.5 GB), which the next line then immediately overwrites with the
+# cu128 wheel (~3 GB) — ~3 GB + 5 min wasted on a discarded layer. Pinning
+# the cu128 wheel first means later `pip install -r requirements.txt`
+# resolves it as already-satisfied (look for "Requirement already satisfied:
+# torch" in the build log).
 RUN uv pip install --system --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 \
     'torch>=2.7'
+
+# Upstream Python deps — torch is now already-satisfied (cu128 wheel above).
+COPY upstream/backend/requirements.txt ./requirements.txt
+RUN uv pip install --system --no-cache-dir -r requirements.txt
 
 # Our extra Python deps (not in upstream)
 # Versions bumped for torch 2.7 compatibility:
