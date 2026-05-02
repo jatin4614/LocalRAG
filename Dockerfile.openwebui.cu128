@@ -157,7 +157,9 @@ ARG GID=0
 
 ENV ENV=prod \
     PORT=8080 \
-    WEBUI_AUTH=true
+    WEBUI_AUTH=true \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
 WORKDIR /app/backend
 
