@@ -105,5 +105,29 @@ exclude = ["upstream/", ".venv/", "volumes/"]
 
 [tool.mypy]
 python_version = "3.10"
-ignore_missing_imports = true
+# Wave 2 (review §9.6): flipped from True → False so that genuinely
+# missing imports in OUR code are caught. Per-module overrides below
+# preserve the previous behaviour for known-3rd-party libraries that
+# don't ship type stubs (qdrant-client, fastembed, tiktoken, prometheus
+# client variants, OTel SDK shims). Add new entries below as needed.
+ignore_missing_imports = false
 exclude = ["upstream/", ".venv/", "volumes/"]
+
+[[tool.mypy.overrides]]
+module = [
+  "qdrant_client.*",
+  "fastembed.*",
+  "tiktoken",
+  "tiktoken_ext.*",
+  "pymupdf.*",
+  "fitz",
+  "pypdf",
+  "pdfplumber.*",
+  "pytesseract",
+  "transformers.*",
+  "sentence_transformers.*",
+  "tenacity.*",
+  "celery.*",
+  "asyncpg.*",
+]
+ignore_missing_imports = true
