@@ -163,6 +163,13 @@ Every behavior change ships behind a flag, default OFF for first deploy. Soak 7 
 
 (Updated as commits land. Newest first.)
 
+- 2026-05-02 `3ae1f42` — Agent H §9.2: clarify isolation-suite count in CLAUDE.md (cherry-picked from worktree).
+- 2026-05-02 `007bad8` — Agent H §9.1: GH Actions ci.yml — lint + unit matrix + isolation gate (cherry-picked).
+- 2026-05-02 `1f8a51a` — Agent H §9.3: flip integration tests default-on (cherry-picked).
+- 2026-05-02 `d2d440e` — Agent C §3.7: HyDE renormalize averaged vector (cherry-picked).
+- 2026-05-02 `411a57c` — Agent C §3.4: TEI 429 retried as transient (cherry-picked).
+- 2026-05-02 `6a35705` — Agent F §8.11: scheduled_eval gauges parse harness schema (cherry-picked).
+- 2026-05-02 `878d4cc` — Wave 1a complete tracker update + tag `rollback-pre-wave-2`.
 - 2026-05-02 `0dd71f6` — Wave 1a.2: bind 3 ports to loopback + QDRANT_API_KEY plumbing.
 - 2026-05-02 `14f4bc5` — Wave 1a.3: reject change-me-* secrets in bootstrap; sketch QDRANT_API_KEY.
 - 2026-05-02 `0ee861f` — Wave 1a.4: .dockerignore additions.
