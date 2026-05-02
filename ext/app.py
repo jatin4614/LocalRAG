@@ -15,6 +15,7 @@ from .db.session import make_engine, make_sessionmaker
 from .routers import ingest_stream, kb_admin, kb_retrieval, rag, rag_stream, upload
 from .services.budget import preflight_tokenizer
 from .services.chat_model_preflight import preflight_chat_model
+from .services.embed_preflight import preflight_embedder
 from .services.embedder import TEIEmbedder
 from .services.logging_setup import configure_json_logging
 from .services.obs import init_observability
@@ -135,6 +136,21 @@ def build_app() -> FastAPI:
             type(exc).__name__, exc,
         )
 
+    # Bug-fix campaign §3.6 — embed-model preflight. Mirrors the chat
+    # one but against TEI's GET /info (NOT /v1/models). Soft-warn +
+    # counter bump on mismatch; TEI cold-start (~30s) means a hard fail
+    # would deadlock open-webui boot. Drift between EMBED_MODEL env and
+    # what TEI actually loads silently miscalibrates similarity scores
+    # downstream (rerank thresholds, MMR lambda).
+    try:
+        preflight_embedder()
+    except Exception as exc:  # noqa: BLE001 — pure best-effort
+        _logger.warning(
+            "embed-model preflight raised unexpectedly (%s: %s) — "
+            "continuing startup.",
+            type(exc).__name__, exc,
+        )
+
     # Phase 1.2 — reranker preload. Loading on first request blocks that
     # request for ~3-5s on GPU cold start. Preloading at app init shifts
     # the cost to startup time and surfaces load failures before user
@@ -225,6 +241,17 @@ def build_ext_routers():
     except Exception as exc:  # noqa: BLE001 — pure best-effort
         _logger.warning(
             "chat-model preflight raised unexpectedly (%s: %s) — continuing.",
+            type(exc).__name__, exc,
+        )
+
+    # Bug-fix campaign §3.6 — embed-model preflight (mirrors build_app).
+    # Soft-warn + counter bump on mismatch with TEI's GET /info; without
+    # this an EMBED_MODEL drift silently miscalibrates similarity scores.
+    try:
+        preflight_embedder()
+    except Exception as exc:  # noqa: BLE001 — pure best-effort
+        _logger.warning(
+            "embed-model preflight raised unexpectedly (%s: %s) — continuing.",
             type(exc).__name__, exc,
         )
 

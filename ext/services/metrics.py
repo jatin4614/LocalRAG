@@ -185,6 +185,19 @@ chat_model_mismatch_total = Counter(
     "CHAT_MODEL preflight detected mismatch with /v1/models",
 )
 
+# Counter incremented when the configured EMBED_MODEL env var doesn't
+# match what TEI reports at GET /info (review §3.6). Mirrors
+# chat_model_mismatch_total — operators may legitimately alias model
+# names server-side, so we WARN + bump rather than crash. A non-zero
+# rate after deploy means EMBED_MODEL drifted out of sync with the TEI
+# image's loaded model (e.g. swapping bge-m3 → harrier without bumping
+# the env), which silently breaks similarity-score interpretation
+# downstream (rerank thresholds, MMR lambda calibration).
+embed_model_mismatch_total = Counter(
+    f"{_NS}_embed_model_mismatch_total",
+    "EMBED_MODEL preflight detected mismatch with TEI /info",
+)
+
 # RBAC denials (403). Label by route so dashboards can attribute which
 # endpoint is rejecting access (e.g. /api/rag/retrieve vs KB admin).
 rbac_denied_total = Counter(
