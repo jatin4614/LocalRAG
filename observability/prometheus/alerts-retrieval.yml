@@ -29,3 +29,22 @@ groups:
           description: |
             p95 {{ $value }}ms > 1500ms budget. See docs/runbook/slo.md for
             current phase's expected band.
+
+      # Wave 2 (review §8.5): tokenizer fallback indicates chunks were
+      # token-counted with cl100k instead of the deployed gemma-4 tokenizer.
+      # cl100k undercounts gemma by 10-15% → silent budget eviction. The
+      # metric exists for exactly this purpose; no alert was wired.
+      - alert: TokenizerFallbackHigh
+        expr: rate(tokenizer_fallback_total[1h]) > (10/3600)
+        for: 30m
+        labels:
+          severity: warning
+          component: rag
+        annotations:
+          summary: "Tokenizer fallback firing >10/hr — budget calculations are wrong"
+          description: |
+            >10 tokenizer fallback events in the last hour. Check
+            RAG_BUDGET_TOKENIZER + RAG_BUDGET_TOKENIZER_MODEL env vars,
+            the HF cache mount, and that the gemma-4 tokenizer config.json
+            is reachable in the open-webui container at the path
+            preflight_tokenizer() resolves.
