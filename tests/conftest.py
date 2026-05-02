@@ -1,8 +1,16 @@
 """Top-level conftest for pytest configuration.
 
-Adds --integration flag that opts in to tests/integration/ (excluded by default
-because those tests spin up docker compose, taking ~10 min and disrupting any
-locally-running stack).
+Integration tests run **by default** because they cover the security-boundary
+suite (RBAC isolation, KB cross-user containment). Opt out for local-only
+unit work with ``pytest --no-integration``.
+
+History: Until 2026-05-02 (review §9.3) the polarity was inverted —
+``--integration`` was an opt-in flag, which meant the isolation suite never
+ran in default ``pytest`` invocations. The flip was a deliberate choice;
+running these tests is non-negotiable per CLAUDE.md §2 invariant 1.
+
+The legacy ``--integration`` flag is kept as an accepted no-op so existing
+documentation, CI scripts, and Makefile targets continue to work.
 """
 from __future__ import annotations
 
@@ -55,27 +63,33 @@ def fake_redis():
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption(
+        "--no-integration",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip tests/integration/ for fast local iteration. "
+            "Default behaviour runs both unit and integration suites."
+        ),
+    )
+    # Legacy: kept as a no-op so existing scripts that pass --integration
+    # don't break. See module docstring.
+    parser.addoption(
         "--integration",
         action="store_true",
         default=False,
-        help="Also run tests/integration/ (spins up docker compose — slow, heavy).",
+        help="(deprecated; integration runs by default — kept for backward compat)",
     )
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    """When --integration is passed, extend testpaths to include tests/integration/.
+    """Extend testpaths to include tests/integration/ unless --no-integration.
 
-    pyproject.toml pins testpaths=["tests/unit"] so naive `pytest` is unit-only.
-    This hook broadens that when the opt-in flag is set, so `pytest --integration`
-    (no path) picks up both suites. If the user already gave an explicit path,
+    pyproject.toml pins ``testpaths=["tests/unit"]`` so a naive ``pytest`` would
+    only walk unit. This hook broadens that to include integration so the
+    security-boundary suite runs by default. If the user gave an explicit path,
     pytest uses that and ignores testpaths, so no change is needed for that case.
     """
-    markexpr = config.getoption("-m", default="") or ""
-    wants_integration = (
-        config.getoption("--integration")
-        or "integration" in markexpr
-    )
-    if not wants_integration:
+    if config.getoption("--no-integration"):
         return
     # Only extend testpaths if no explicit paths were passed on the CLI.
     # config.invocation_params.args holds the original CLI argv (positional + flags).
@@ -104,22 +118,27 @@ def pytest_configure(config: pytest.Config) -> None:
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    # Strategy: if user passed --integration OR explicitly asked for integration
-    # paths / marker, let things through. Otherwise, skip anything under
-    # tests/integration/ or marked @pytest.mark.integration.
-    if config.getoption("--integration"):
+    """Skip integration tests **only** when --no-integration was passed.
+
+    Default polarity: integration tests run. The security-boundary suite is
+    mandatory CI per CLAUDE.md §2 invariant 1; we cannot make it opt-in.
+    """
+    if not config.getoption("--no-integration"):
         return
-    # If the user directly pointed pytest at tests/integration/, honor it.
-    # Heuristic: any arg in config.args contains "integration".
+    # Honor explicit path requests even with --no-integration (e.g. someone
+    # ran `pytest --no-integration tests/integration/test_kb_isolation.py`
+    # — let it through, because they explicitly asked for integration).
     args_mention_integration = any("integration" in str(a) for a in (config.args or []))
     if args_mention_integration:
         return
-    # If the user used -m integration, collection already filtered by marker.
+    # Honor `-m integration` for the same reason.
     markexpr = config.getoption("-m", default="") or ""
     if "integration" in markexpr:
         return
-    # Otherwise, skip integration tests at collection time.
-    skip_integration = pytest.mark.skip(reason="integration tests skipped (pass --integration to opt in)")
+    # Skip integration tests at collection time.
+    skip_integration = pytest.mark.skip(
+        reason="--no-integration: skipping integration suite (default is to run it)"
+    )
     for item in items:
         # Skip by path
         if "tests/integration" in str(item.fspath).replace("\\", "/"):
