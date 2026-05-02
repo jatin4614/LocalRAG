@@ -198,5 +198,8 @@ def colbert_embed(texts: list[str]) -> list[list[list[float]]]:
         # ``arr`` is np.ndarray of shape (n_tokens, 128) — coerce each
         # token row to a python list of python floats so
         # qdrant-client / json.dumps don't choke on numpy types.
-        out.append([[float(x) for x in v] for v in arr])
+        # Wave 2 (review §3.10): np.ndarray.tolist() is the C-implemented
+        # vectorised path; the prior nested list comp dispatched float()
+        # per element (~10× slower on 200-tok chunks).
+        out.append(arr.tolist())
     return out
