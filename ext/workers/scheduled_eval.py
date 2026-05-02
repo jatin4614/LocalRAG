@@ -111,8 +111,23 @@ def _release_redis_lock(client: Any, lock_val: str) -> None:
 def _publish_gauges(aggregate: dict, latency: dict) -> None:
     """Push the three headline scores into Prometheus gauges.
 
+    Accepts EITHER:
+
+    * The legacy shape this function was originally written for —
+      ``aggregate = {"chunk_recall@10": ..., "faithfulness": ...}``
+      and ``latency = {"p95": ...}`` (no longer produced by the
+      harness, but kept readable so a hand-rolled payload still works).
+    * The current ``tests/eval/harness.py`` shape — top-level
+      ``payload["global"]`` carries ``chunk_recall@10`` /
+      ``faithfulness`` / ``ndcg@10`` AND ``p95_latency_ms`` (no
+      separate ``latency_ms`` block exists). ``run_weekly_eval`` now
+      passes the harness ``global`` block as ``aggregate`` and a
+      derived latency dict as ``latency``.
+
     Fail-open: missing keys silently skip that gauge; prometheus_client
     issues are swallowed so the task still returns its status dict.
+
+    Review §8.11.
     """
     try:
         from ..services import metrics as metrics_mod
@@ -120,13 +135,26 @@ def _publish_gauges(aggregate: dict, latency: dict) -> None:
         log.info("scheduled_eval: metrics import failed: %s", e)
         return
 
+    # Coalesce both schemas into a single read path. New schema wins
+    # over legacy when both somehow appear in the same payload.
     try:
-        if "chunk_recall@10" in aggregate:
-            metrics_mod.rag_eval_chunk_recall.set(float(aggregate["chunk_recall@10"]))
-        if "faithfulness" in aggregate:
-            metrics_mod.rag_eval_faithfulness.set(float(aggregate["faithfulness"]))
-        if "p95" in latency:
-            metrics_mod.rag_eval_p95_latency.set(float(latency["p95"]))
+        chunk_recall = aggregate.get("chunk_recall@10")
+        faithfulness = aggregate.get("faithfulness")
+        # Latency: harness writes p95 inside ``aggregate`` as
+        # ``p95_latency_ms``; legacy callers passed a separate dict
+        # keyed simply by ``p95``. Try both.
+        p95 = aggregate.get("p95_latency_ms")
+        if p95 is None:
+            p95 = latency.get("p95_latency_ms")
+        if p95 is None:
+            p95 = latency.get("p95")
+
+        if chunk_recall is not None:
+            metrics_mod.rag_eval_chunk_recall.set(float(chunk_recall))
+        if faithfulness is not None:
+            metrics_mod.rag_eval_faithfulness.set(float(faithfulness))
+        if p95 is not None:
+            metrics_mod.rag_eval_p95_latency.set(float(p95))
     except Exception as e:
         log.info("scheduled_eval: gauge publish failed: %s", e)
 
@@ -209,7 +237,18 @@ def run_weekly_eval() -> dict[str, Any]:
 
         try:
             payload = json.loads(output_path.read_text())
-            aggregate = payload.get("aggregate", {}) or {}
+            # Harness schema (tests/eval/harness.py): result keyed by
+            # ``global``, ``by_intent``, ``by_year`` ... — top-level
+            # ``global`` carries chunk_recall@10 / faithfulness /
+            # p95_latency_ms. Legacy callers used ``aggregate`` /
+            # ``latency_ms`` — keep reading those as a fallback so a
+            # hand-rolled payload still works (and for the fix's
+            # backwards-compatibility unit test). Review §8.11.
+            aggregate = (
+                payload.get("global")
+                or payload.get("aggregate")
+                or {}
+            )
             latency = payload.get("latency_ms", {}) or {}
             _publish_gauges(aggregate, latency)
             result["aggregate"] = aggregate
