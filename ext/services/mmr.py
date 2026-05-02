@@ -23,21 +23,40 @@ Textbook algorithm::
 * lambda = 0.0 -> pure diversity (pick most-relevant first, then always
   the most-dissimilar-from-selected)
 * lambda = 0.7 is the default (70% relevance, 30% diversity)
+
+Performance (review §5.10)
+--------------------------
+TEI's BAAI/bge-m3 returns L2-normalized vectors, so a plain dot product on
+unit vectors equals cosine similarity. The hot loop in ``mmr_rerank`` now
+pre-normalizes once at entry and uses ``np.dot`` per pair instead of
+recomputing ``np.linalg.norm`` on every call. The legacy ``_cosine`` helper
+is preserved for callers that import it directly; it is no longer used by
+the MMR loop.
 """
 from __future__ import annotations
 
+import logging
 import math
 from typing import Any, Sequence
 
+import numpy as np
+
 from .obs import span
+
+_log = logging.getLogger(__name__)
+
+# Tolerance for the "vectors should already be unit-norm" sanity check.
+# TEI's bge-m3 returns vectors with ||v|| within ~1e-6 of 1.0 in practice;
+# we widen to 1e-3 to cover float32 round-trip and the rare op-tag drift.
+_UNIT_NORM_TOL = 1e-3
 
 
 def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
     """Cosine similarity between two equal-length float sequences.
 
-    Dense vectors from TEI's BAAI/bge-m3 are already L2-normalised so a dot
-    product is equivalent to cosine; we still guard against zero vectors
-    (e.g., synthetic test fixtures) to avoid division-by-zero.
+    Kept for backward compatibility with callers that may import it directly.
+    The MMR hot loop now uses ``np.dot`` on pre-normalized vectors instead;
+    see ``mmr_rerank`` for details.
     """
     dot = sum(x * y for x, y in zip(a, b))
     na = math.sqrt(sum(x * x for x in a))
@@ -45,6 +64,20 @@ def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
     if na == 0.0 or nb == 0.0:
         return 0.0
     return dot / (na * nb)
+
+
+def _l2_normalize(arr: np.ndarray) -> np.ndarray:
+    """Return ``arr`` divided by its L2 norm along the last axis.
+
+    Zero-norm rows are left as zeros (no division-by-zero); their cosine
+    similarity to anything will then be 0, matching the legacy ``_cosine``
+    behaviour for zero-vector inputs.
+    """
+    norms = np.linalg.norm(arr, axis=-1, keepdims=True)
+    # Avoid divide-by-zero: clamp norms below tolerance to 1.0 so the row
+    # stays at all-zeros (since the dividend is zero).
+    safe = np.where(norms > 0.0, norms, 1.0)
+    return arr / safe
 
 
 def mmr_rerank(
@@ -60,6 +93,10 @@ def mmr_rerank(
     ``hits[i]`` must correspond to ``passage_vecs[i]``. Stable ordering: if
     two candidates tie on MMR score, the earlier input-rank wins (preserves
     the reranker's ordering on ties).
+
+    Vectors are L2-normalized once at entry; the inner loop then uses
+    ``np.dot`` (cosine = dot for unit vectors). Behaviour is unchanged
+    within float tolerance vs the legacy ``_cosine`` impl.
     """
     if not hits:
         return []
@@ -70,7 +107,11 @@ def mmr_rerank(
         # callers observe a byte-identical pass-through.
         return list(hits)
 
-    relevance = [_cosine(query_vec, passage_vecs[i]) for i in range(n)]
+    # One-shot L2 normalize. After this every np.dot equals cosine similarity.
+    q = _l2_normalize(np.asarray(query_vec, dtype=np.float64))
+    p = _l2_normalize(np.asarray(passage_vecs, dtype=np.float64))
+
+    relevance = (p @ q).tolist()  # shape (n,)
 
     # Step 1: seed selection with the most relevant. Tie-break by lower index.
     remaining = set(range(n))
@@ -82,10 +123,12 @@ def mmr_rerank(
     while len(selected) < top_k and remaining:
         best_i = -1
         best_score = -float("inf")
+        # Pre-stack the selected vectors so one matmul gives all sims.
+        sel_mat = p[selected]
         for i in sorted(remaining):
-            max_sim_to_selected = max(
-                _cosine(passage_vecs[i], passage_vecs[s]) for s in selected
-            )
+            # cosine(p[i], p[s]) for each s in selected, then take the max.
+            sims = sel_mat @ p[i]
+            max_sim_to_selected = float(sims.max())
             score = lambda_ * relevance[i] - (1.0 - lambda_) * max_sim_to_selected
             # Tie-break: strict > keeps the earliest-indexed winner because we
             # iterate ``sorted(remaining)``. No explicit tie-break branch needed.
@@ -194,5 +237,30 @@ async def _mmr_rerank_from_hits_impl(
 
     query_vec = vectors[-1]
     passage_vecs = vectors[:-1]
+
+    # §5.10 sanity check — TEI's bge-m3 returns L2-normalized vectors. If the
+    # norm drifts (op-tag mismatch, future model swap, broken stub), drop a
+    # warning so we notice. We then renormalize defensively inside mmr_rerank
+    # so the algorithm stays correct either way.
+    try:
+        q_norm = float(np.linalg.norm(np.asarray(query_vec, dtype=np.float64)))
+        if abs(q_norm - 1.0) > _UNIT_NORM_TOL:
+            _log.warning(
+                "MMR: query embedding not L2-normalized (||q||=%.4f); "
+                "renormalizing in fast-path",
+                q_norm,
+            )
+        if passage_vecs:
+            p0_norm = float(
+                np.linalg.norm(np.asarray(passage_vecs[0], dtype=np.float64))
+            )
+            if abs(p0_norm - 1.0) > _UNIT_NORM_TOL:
+                _log.warning(
+                    "MMR: first passage embedding not L2-normalized "
+                    "(||p[0]||=%.4f); renormalizing in fast-path",
+                    p0_norm,
+                )
+    except Exception:  # pragma: no cover - sanity check must never raise
+        pass
 
     return mmr_rerank(query_vec, passage_vecs, hits, top_k=top_k, lambda_=lambda_)
