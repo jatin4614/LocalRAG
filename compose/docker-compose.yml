@@ -2,6 +2,19 @@ version: "3.8"
 
 name: orgchat
 
+# Wave 2 (review §11.4): YAML anchor for consistent log rotation across the
+# base stack. Without rotation, journald/json-file grow unbounded and fill
+# /var/lib/docker on a multi-week run. 100MB × 3 = 300MB cap per container,
+# safe for any host that can run this stack at all. Apply via
+# `logging: *rotated-logging` in each service block. Per-service mem_limit
+# / cpus are added only on the OOM-risk services (postgres, qdrant, vllm-*,
+# open-webui, celery-worker) — the rest are bounded by their own designs.
+x-rotated-logging: &rotated-logging
+  driver: json-file
+  options:
+    max-size: "100m"
+    max-file: "3"
+
 networks:
   default:
     name: orgchat-net
@@ -27,6 +40,9 @@ services:
     image: postgres:15-alpine
     container_name: orgchat-postgres
     restart: unless-stopped
+    logging: *rotated-logging
+    mem_limit: 4g
+    cpus: 2
     environment:
       POSTGRES_USER:     ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -44,6 +60,9 @@ services:
     image: redis:7-alpine
     container_name: orgchat-redis
     restart: unless-stopped
+    logging: *rotated-logging
+    mem_limit: 1g
+    cpus: 1
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis_data:/data
@@ -57,6 +76,9 @@ services:
     image: qdrant/qdrant:latest
     container_name: orgchat-qdrant
     restart: unless-stopped
+    logging: *rotated-logging
+    mem_limit: 8g
+    cpus: 4
     # Plan B Phase 5 — cluster (distributed) mode is required for custom
     # sharding (kb_1_v4 onward). One-time enablement on 2026-04-26 required
     # snapshotting all collections, wiping qdrant_data, restoring after
@@ -100,6 +122,9 @@ services:
     image: caddy:2-alpine
     container_name: orgchat-caddy
     restart: unless-stopped
+    logging: *rotated-logging
+    mem_limit: 256m
+    cpus: 1
     ports:
       - "8880:80"
       - "8443:443"
@@ -131,6 +156,9 @@ services:
     image: vllm/vllm-openai:nightly
     container_name: orgchat-vllm-chat
     restart: unless-stopped
+    logging: *rotated-logging
+    mem_limit: 32g
+    cpus: 8
     ipc: host
     # No host port — accessed via Docker network only (open-webui → vllm-chat:8000)
     volumes:
@@ -210,6 +238,9 @@ services:
     image: ghcr.io/huggingface/text-embeddings-inference:120-1.9
     container_name: orgchat-tei
     restart: unless-stopped
+    logging: *rotated-logging
+    mem_limit: 4g
+    cpus: 2
     command:
       - "--model-id"
       - "${EMBED_MODEL}"
@@ -257,6 +288,9 @@ services:
     image: vllm/vllm-openai:latest
     container_name: orgchat-vllm-qu
     restart: unless-stopped
+    logging: *rotated-logging
+    mem_limit: 12g
+    cpus: 4
     ipc: host
     environment:
       HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-1}
@@ -312,6 +346,9 @@ services:
       context: ../whisper_service
     container_name: orgchat-whisper
     restart: unless-stopped
+    logging: *rotated-logging
+    mem_limit: 2g
+    cpus: 2
     environment:
       WHISPER_MODEL: ${WHISPER_MODEL:-base.en}
       WHISPER_DEVICE: ${WHISPER_DEVICE:-cpu}
@@ -336,6 +373,9 @@ services:
       context: ../tts_service
     container_name: kairos-tts
     restart: unless-stopped
+    logging: *rotated-logging
+    mem_limit: 1g
+    cpus: 1
     environment:
       PIPER_DEFAULT_VOICE: ${AUDIO_TTS_VOICE:-en_US-lessac-medium}
     healthcheck:
@@ -350,6 +390,9 @@ services:
       context: ../model_manager
     container_name: orgchat-model-manager
     restart: unless-stopped
+    logging: *rotated-logging
+    mem_limit: 512m
+    cpus: 1
     environment:
       # Vision consolidated into vllm-chat (Gemma 4 31B is multimodal).
       VISION_URL: http://vllm-chat:8000
@@ -376,6 +419,9 @@ services:
       dockerfile: Dockerfile.openwebui.cu128
     container_name: orgchat-open-webui
     restart: unless-stopped
+    logging: *rotated-logging
+    mem_limit: 8g
+    cpus: 4
     ports:
       # Wave 1a (review §11.2): bound to loopback. End-users go through
       # Caddy on :8443 (HTTPS, with WEBUI_SECRET_KEY-signed JWT). Direct
@@ -649,6 +695,9 @@ services:
       dockerfile: compose/Dockerfile.celery
     container_name: orgchat-celery-worker
     restart: unless-stopped
+    logging: *rotated-logging
+    mem_limit: 8g
+    cpus: 4
     environment:
       DATABASE_URL: ${DATABASE_URL}
       CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/1}
@@ -747,6 +796,9 @@ services:
       dockerfile: compose/Dockerfile.celery
     container_name: orgchat-celery-beat
     restart: unless-stopped
+    logging: *rotated-logging
+    mem_limit: 512m
+    cpus: 1
     environment:
       DATABASE_URL: ${DATABASE_URL}
       CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/1}
