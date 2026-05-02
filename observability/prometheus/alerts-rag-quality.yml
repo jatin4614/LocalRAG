@@ -23,3 +23,34 @@ groups:
             (4) intent classifier routing to wrong KB set. Check the
             `rag_retrieval_empty_total` time-series + recent kb_admin
             health endpoint output.
+
+      # Wave 2 (review §8.4): baseline-relative trigger on the
+      # rag_silent_failure_total ramp. The metric exists in metrics.py:502
+      # and is incremented by _record_silent_failure() on every fail-open
+      # path in chat_rag_bridge (catalog_render, hits_emit, metric_emit,
+      # rerank_fallback, etc.). A small steady rate is normal — what we
+      # want to catch is a 3x ramp vs the same time *yesterday*, which
+      # smooths out daily traffic curves and only fires on real regressions.
+      # We compare a tight 15-minute current rate against a wider 6-hour
+      # rate offset 1d (= 1 day ago) so the baseline isn't whip-sawed by
+      # short-lived noise. 30-minute `for:` to dampen single bad batches.
+      - alert: RagSilentFailureRamp
+        expr: |
+          rate(rag_silent_failure_total[15m])
+            > 3 * rate(rag_silent_failure_total[6h] offset 1d)
+        for: 30m
+        labels:
+          severity: warning
+          component: rag
+        annotations:
+          summary: "rag_silent_failure_total >3x yesterday's baseline (stage={{ $labels.stage }})"
+          description: |
+            The 15-minute rate of silent (logged-only) failures on
+            stage `{{ $labels.stage }}` is more than 3x the 6-hour
+            rolling rate from the same time yesterday. Investigate by
+            grepping open-webui logs for "rag-silent-failure" tagged
+            with the matching stage label — the original exception is
+            attached. Most-likely culprits historically: TEI/reranker
+            briefly down, Postgres latency spike during catalog_render,
+            or a recent change to kb_documents schema breaking the
+            metadata path.
