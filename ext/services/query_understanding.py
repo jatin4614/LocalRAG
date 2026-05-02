@@ -360,18 +360,27 @@ async def analyze_query(
     }
 
     # P3.1 — single retry on transient failures (timeout / connect /
-    # read). Schema violations and HTTP 4xx do NOT retry: those are
-    # deterministic. The retry uses HALF the per-call timeout so the
-    # total wall-clock stays bounded by ~1.5×timeout_ms even when both
-    # attempts fail. Caught: ~5% of QU calls were timing out at 600ms,
-    # falling back to regex and dropping all temporal extraction.
+    # read). Schema violations and HTTP 4xx do NOT retry.
+    # Wave 2 (review §5.16): the original retry used HALF the per-call
+    # timeout. On a saturated vllm-qu where the first 600ms attempt
+    # times out, retrying with 300ms virtually guarantees a second
+    # timeout and a regex fallback. Use the FULL timeout on retry —
+    # total wall-clock is now ~2×timeout_ms but the second attempt
+    # actually has a chance. RAG_QU_RETRY_TIMEOUT_MS overrides if the
+    # operator wants asymmetric behaviour.
     _t0 = _time.monotonic()
     _last_exc: Exception | None = None
+    _retry_timeout_env = os.environ.get("RAG_QU_RETRY_TIMEOUT_MS")
+    if _retry_timeout_env:
+        try:
+            _retry_timeout = max(int(_retry_timeout_env) / 1000.0, 0.001)
+        except (TypeError, ValueError):
+            _retry_timeout = timeout
+    else:
+        _retry_timeout = timeout
     for _attempt in (1, 2):
         try:
-            _per_attempt_timeout = (
-                timeout if _attempt == 1 else max(timeout / 2.0, 0.001)
-            )
+            _per_attempt_timeout = timeout if _attempt == 1 else _retry_timeout
             async with httpx.AsyncClient(timeout=_per_attempt_timeout) as client:
                 r = await client.post(f"{qu_url}/chat/completions", json=payload)
                 r.raise_for_status()
