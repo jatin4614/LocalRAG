@@ -1,0 +1,144 @@
+# LocalRAG CI — bug-fix campaign §9.1
+#
+# Four jobs:
+#   - lint         : ruff check + mypy on ext/  (blocking)
+#   - unit         : tests/unit on Python 3.10 + 3.11 matrix  (blocking)
+#   - isolation    : the security-boundary suite — REQUIRED status check
+#   - eval-gate    : weekly cron only — see FUTURE WORK note below
+#
+# FUTURE WORK (eval-gate):
+#   The eval-gate job runs `make eval-gate`, which depends on a live Qdrant +
+#   TEI stack and a seeded KB. We cannot easily stand those up inside a normal
+#   GH Actions runner without large per-run cost (model pull >2 GB) and
+#   docker-compose orchestration. Today the job runs only on a weekly schedule
+#   (Monday 04:00 UTC) where the operator can pre-warm a self-hosted runner
+#   with the model cache mounted. Per-PR eval gating remains an operator step
+#   (`make eval-gate`) until we have a self-hosted GPU runner with the cache
+#   already on disk.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly eval gate on Mondays 04:00 UTC. Only the eval-gate job is
+    # gated on schedule; the other jobs run on every push/PR.
+    - cron: "0 4 * * 1"
+
+# Cancel older in-progress runs of the same ref to save runner minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint (ruff + mypy on ext/)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-lint-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            pip-lint-${{ runner.os }}-
+      - name: Install (ruff + mypy only — fast)
+        run: |
+          python -m pip install --upgrade pip
+          pip install "ruff>=0.6" "mypy>=1.11"
+      - name: ruff check
+        run: ruff check ext/
+      - name: mypy
+        # Use existing pyproject [tool.mypy] config. ext/ is the org-owned tree;
+        # upstream/ and volumes/ are excluded there.
+        run: mypy ext/
+
+  unit:
+    name: unit (py${{ matrix.python }})
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-unit-${{ runner.os }}-py${{ matrix.python }}-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            pip-unit-${{ runner.os }}-py${{ matrix.python }}-
+      - name: Install dev deps
+        # `pip install -e .[dev]` pulls runtime + dev. fastembed transitively
+        # pulls onnxruntime which is large but cached after the first run.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: pytest unit (no integration)
+        run: pytest -q tests/unit -m "not integration" --no-integration
+
+  isolation:
+    # REQUIRED status check — the security-boundary suite. Do not allow merges
+    # if this is red.  Per CLAUDE.md §2 invariant 1 ("Isolation, three layers").
+    name: isolation (REQUIRED)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-isolation-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            pip-isolation-${{ runner.os }}-
+      - name: Install dev deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: pytest isolation suites
+        # Note: tests/unit/test_kb_models.py::test_kb_access_check_enforced_in_model
+        # covers the SQL-CHECK constraint at the model layer. The integration
+        # suites cover end-to-end API + RBAC enforcement.
+        run: |
+          pytest -q --integration \
+            tests/integration/test_kb_isolation.py \
+            tests/integration/test_rag_isolation.py \
+            tests/unit/test_kb_models.py::test_kb_access_check_enforced_in_model
+
+  eval-gate:
+    # Weekly cron only — needs a live Qdrant + TEI + a seeded KB. See top-of-
+    # file FUTURE WORK note. Today this is documentation-only; the job is
+    # wired so we can flip to a self-hosted runner later without a full
+    # workflow rewrite.
+    name: eval-gate (weekly)
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Placeholder
+        # When a self-hosted GPU runner with model cache is available, replace
+        # this step with `make eval-gate`. For now this just records that the
+        # cron fired so the operator can investigate if it stops firing.
+        run: |
+          echo "eval-gate cron fired at $(date -u +%FT%TZ)"
+          echo "TODO: wire to self-hosted runner with /opt/fastembed_cache mount + Qdrant + TEI."
