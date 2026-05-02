@@ -44,7 +44,24 @@ _HTML_TABLE_RE = re.compile(r"<table[^>]*>.*?</table>", re.DOTALL | re.IGNORECAS
 
 
 def _tok_estimate(s: str) -> int:
-    return max(1, len(s) // 4)
+    """Real tokenizer count (not the previous ``len(s)//4`` estimate).
+
+    Review §2.2 — dense JSON / table / code under-counts by ~30% under
+    ``len/4``, which makes downstream chunks larger than the budget the
+    caller supplied (``chunk_size_tokens``). When the chunk is then sent
+    through the prompt-budget pass the over-large chunk is evicted.
+
+    Routes through ``ext.services.chunker._encoder()`` — the same
+    tokenizer handle the window chunker uses, so structured + window
+    chunks share one token vocabulary. Cached for the life of the
+    process via ``lru_cache`` inside ``_encoder``.
+
+    Empty / whitespace-only input still returns 1 (preserves the old
+    floor — ``max(1, ...)``) so split loops that compare ``cur_tok +
+    rtok`` against ``max_tokens`` never get a zero on a blank row.
+    """
+    from .chunker import _encoder  # local: structured chunker is opt-in path
+    return max(1, len(_encoder().encode(s)))
 
 
 def _split_giant_table(text: str, max_tokens: int) -> list[str]:
