@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from time import perf_counter
 from typing import Any, List, Optional, Sequence
@@ -10,6 +11,22 @@ from . import flags
 from .embedder import Embedder
 from .obs import span
 from .vector_store import CHAT_PRIVATE_COLLECTION, Hit, VectorStore
+
+logger = logging.getLogger(__name__)
+
+
+def _record_silent_failure(stage: str, err: BaseException) -> None:
+    """Mirror chat_rag_bridge._record_silent_failure for retriever-side
+    swallow paths. Cannot import that helper without a circular dep."""
+    try:
+        logger.warning("retriever: %s failed (%s): %r", stage, type(err).__name__, err)
+    except Exception:
+        pass
+    try:
+        from .metrics import RAG_SILENT_FAILURE
+        RAG_SILENT_FAILURE.labels(stage=stage).inc()
+    except Exception:
+        pass
 
 
 # RRF (Reciprocal Rank Fusion) constant. The canonical value 60 from the
@@ -295,7 +312,12 @@ async def retrieve(
                     shard_keys=shard_keys,
                     text_filter=text_filter,
                 )
-        except Exception:
+        except Exception as exc:
+            # Wave 2 (review §5.3): the previous silent return swallowed
+            # Qdrant failures with no operator signal — a broken KB
+            # contributed zero hits while the request appeared "healthy".
+            # _record_silent_failure logs + bumps rag_silent_failure_total{stage}.
+            _record_silent_failure("retrieve.per_kb_search", exc)
             return []
         finally:
             try:
