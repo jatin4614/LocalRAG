@@ -81,6 +81,18 @@ class TEIEmbedder:
         r.raise_for_status()
         return r.json()
 
+    async def _embed_uncached(self, texts: list[str]) -> list[list[float]]:
+        """Direct TEI passthrough — bypasses the embed cache. Internal
+        only; call sites should use :meth:`embed` (which adds caching
+        when enabled). Exposed so the cache layer can fill misses
+        without re-entering the cache check (infinite recursion).
+        """
+        out: list[list[float]] = []
+        for i in range(0, len(texts), self._max_batch):
+            batch = texts[i : i + self._max_batch]
+            out.extend(await self._embed_batch(batch))
+        return out
+
     async def embed(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
@@ -88,6 +100,37 @@ class TEIEmbedder:
         # path (retriever/hyde); larger batches come from ingest/doc paths.
         _path = "query" if len(texts) == 1 else "doc"
         _bytes = sum(len(t) for t in texts)
+
+        # Bug-fix campaign §3.2 — Redis-backed embed cache. Single-text
+        # path (queries) is the natural cache fit; ingest batches are
+        # already content-deduped by blob_sha so caching there is mostly
+        # redundant. Default-OFF behind RAG_EMBED_CACHE_ENABLED, so this
+        # is a passthrough until the operator flips the flag.
+        #
+        # Pass ``_UncachedView(self)`` to the cache so a miss falls
+        # through to ``_embed_uncached`` instead of re-entering this
+        # method (which would re-check the cache → infinite recursion).
+        if (
+            len(texts) == 1
+            and os.environ.get("RAG_EMBED_CACHE_ENABLED", "0") == "1"
+        ):
+            from .embed_cache import get_or_set as _embed_cache_get_or_set
+
+            model_version = os.environ.get("EMBED_MODEL", "unknown")
+            with span(
+                "embed.call",
+                path=_path,
+                batch_size=1,
+                bytes=_bytes,
+                cached=True,
+            ):
+                vec = await _embed_cache_get_or_set(
+                    texts[0],
+                    model_version,
+                    _UncachedView(self),
+                )
+                return [vec]
+
         out: list[list[float]] = []
         with span(
             "embed.call",
@@ -99,6 +142,20 @@ class TEIEmbedder:
                 batch = texts[i : i + self._max_batch]
                 out.extend(await self._embed_batch(batch))
             return out
+
+
+class _UncachedView:
+    """Embedder protocol facade that delegates to ``_embed_uncached``.
+
+    Lets the embed cache fill misses without re-entering :meth:`TEIEmbedder.embed`
+    (which would re-check the cache → infinite recursion).
+    """
+
+    def __init__(self, inner: "TEIEmbedder") -> None:
+        self._inner = inner
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        return await self._inner._embed_uncached(texts)
 
 
 # --- P3.4 ColBERT multi-vector (late interaction) embedder -----------------
