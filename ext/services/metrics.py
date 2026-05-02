@@ -579,3 +579,17 @@ rag_rerank_threshold_dropped_total = Counter(
     "Hits dropped by the RAG_RERANK_MIN_SCORE post-rerank threshold filter",
     labelnames=["intent"],
 )
+
+# Wave 2 round 4 (review §5.15): total-pipeline-timeout counter.
+#
+# Incremented every time ``_run_pipeline`` exceeds RAG_TOTAL_BUDGET_SEC
+# (default 30s). Default budget is generous; a sustained ramp on this
+# counter means a real production pathology (downstream service outage,
+# pathological query, deadlocked semaphore) and should page on-call
+# immediately — chat answers degrade to the datetime preamble alone
+# when this fires.
+rag_pipeline_timeout_total = Counter(
+    "rag_pipeline_timeout_total",
+    "Pipeline runs that exceeded RAG_TOTAL_BUDGET_SEC and returned degraded sources",
+    labelnames=["intent"],
+)

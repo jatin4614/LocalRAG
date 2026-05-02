@@ -5,6 +5,7 @@ Retrieves KB context and returns it in upstream's source dict format.
 """
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import json as _json
 import logging
@@ -623,6 +624,63 @@ async def _lookup_doc_ids_by_date(
         return []
 
 
+# Wave 2 round 4 (review §5.15) — total-pipeline timeout. Default 30s is
+# generous; production pathologies (downstream service stuck, deadlocked
+# semaphore) are the only thing that should trip this. Read at request
+# time so an operator can dial it without a process restart.
+def _total_budget_seconds() -> float:
+    raw = _os.environ.get("RAG_TOTAL_BUDGET_SEC", "30")
+    try:
+        v = float(raw)
+        return v if v > 0 else 30.0
+    except (TypeError, ValueError):
+        return 30.0
+
+
+def _build_datetime_preamble_source() -> Optional[dict]:
+    """Return the canonical ``current-datetime`` source dict (or ``None``).
+
+    Mirrors the inline preamble that ``_run_pipeline`` builds — extracted so
+    the §5.15 timeout fallback can return at least a degraded preamble
+    without touching the database.
+    """
+    if _os.environ.get("RAG_INJECT_DATETIME", "1") == "0":
+        return None
+    try:
+        import datetime as _dt
+        try:
+            import zoneinfo as _zi
+            _tz_name = _os.environ.get("RAG_TZ", "UTC")
+            try:
+                _tz = _zi.ZoneInfo(_tz_name)
+            except Exception:
+                _tz, _tz_name = _zi.ZoneInfo("UTC"), "UTC"
+            _now = _dt.datetime.now(_tz)
+        except Exception:
+            _now = _dt.datetime.now()
+            _tz_name = "local"
+        _dt_text = (
+            "CURRENT DATE AND TIME (authoritative — answer "
+            "'what is today' / 'what date is it' / 'what time is it' "
+            "questions using this preamble, not your training data):\n"
+            f"Date: {_now.strftime('%A, %B %d, %Y')}\n"
+            f"Time: {_now.strftime('%I:%M %p')} {_tz_name}\n"
+            f"ISO: {_now.strftime('%Y-%m-%dT%H:%M:%S')}"
+        )
+        return {
+            "source": {"id": "current-datetime", "name": "current-datetime",
+                       "url": "current-datetime"},
+            "document": [_dt_text],
+            "metadata": [{
+                "source": "current-datetime", "name": "current-datetime",
+                "kb_id": None, "doc_id": None, "chat_id": None,
+                "subtag_id": None,
+            }],
+        }
+    except Exception:
+        return None
+
+
 # Wave 2 round 4 (review §5.2) — cached system-prompt token count for the
 # RAG_BUDGET_INCLUDES_PROMPT estimator. Loaded lazily on first call so the
 # tokenizer doesn't get touched at import time. ``None`` means "tried and
@@ -1006,15 +1064,54 @@ async def _retrieve_kb_sources_inner(
     # of the intent defaults, so its return value IS the effective overlay.
     merged_overrides = _intent_flag_overrides
 
+    # Wave 2 round 4 (review §5.15) — total-pipeline timeout. Wrap the inner
+    # pipeline in asyncio.wait_for so a hung downstream service (TEI, vllm-qu,
+    # chat model) can't deadlock the chat session indefinitely. On timeout
+    # we increment ``rag_pipeline_timeout_total{intent}`` and return an
+    # early-degraded source list — at minimum the datetime preamble so the
+    # LLM still has an authoritative anchor to answer "what's today" with.
+    # Catalog is intentionally omitted because it requires a DB read which
+    # may itself be the source of the timeout.
+    _budget_sec = _total_budget_seconds()
+    _intent_label_for_timeout = _intent_label_for_flags
     with flags.with_overrides(merged_overrides):
-        return await _run_pipeline(
-            query=query,
-            selected_kbs=selected_kbs,
-            user_id=user_id,
-            chat_id=chat_id,
-            history=history,
-            progress_cb=progress_cb,
-        )
+        try:
+            return await asyncio.wait_for(
+                _run_pipeline(
+                    query=query,
+                    selected_kbs=selected_kbs,
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    history=history,
+                    progress_cb=progress_cb,
+                ),
+                timeout=_budget_sec,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "rag.pipeline_timeout: budget=%.1fs intent=%s",
+                _budget_sec, _intent_label_for_timeout,
+            )
+            try:
+                from .metrics import rag_pipeline_timeout_total
+                rag_pipeline_timeout_total.labels(
+                    intent=str(_intent_label_for_timeout)
+                ).inc()
+            except Exception:  # pragma: no cover - metrics fail-open
+                pass
+            try:
+                await _emit(progress_cb, {
+                    "stage": "error",
+                    "message": "pipeline_timeout",
+                    "budget_sec": _budget_sec,
+                })
+            except Exception:
+                pass
+            degraded: list[dict] = []
+            _dt_source = _build_datetime_preamble_source()
+            if _dt_source is not None:
+                degraded.append(_dt_source)
+            return degraded
 
 
 async def _run_pipeline(
