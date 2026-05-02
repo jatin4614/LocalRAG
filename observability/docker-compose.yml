@@ -124,7 +124,9 @@ services:
       BADGER_EPHEMERAL: "false"
       BADGER_DIRECTORY_VALUE: /badger/data
       BADGER_DIRECTORY_KEY: /badger/key
-      BADGER_SPAN_STORE_TTL: 72h
+      # Wave 2 (review §8.12): 72h → 168h so a Friday incident is still
+      # in the trace store come Monday triage.
+      BADGER_SPAN_STORE_TTL: 168h
       COLLECTOR_OTLP_ENABLED: "true"
     volumes:
       - ../volumes/observability/jaeger:/badger
