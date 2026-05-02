@@ -18,6 +18,7 @@ per-document coroutine.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 import httpx
@@ -129,6 +130,21 @@ async def _summarize_impl(
     headers = inject_context_into_headers(headers)
 
     url = f"{chat_url.rstrip('/')}/chat/completions"
+    # Wave 2 (review §6.12): LLM circuit breaker. Mirrors the TEI breaker
+    # at embedder.py:91 — when RAG_CB_LLM_ENABLED=1 + N failures in window,
+    # raises CircuitOpenError BEFORE the network call so the chat-LLM
+    # outage doesn't cascade into N concurrent retries. Default OFF for
+    # safe deploy; flip on after observing baseline failure rate.
+    cb_enabled = os.environ.get("RAG_CB_LLM_ENABLED", "0") == "1"
+    breaker = None
+    if cb_enabled:
+        from .circuit_breaker import breaker_for
+        breaker = breaker_for("llm")
+        try:
+            breaker.raise_if_open()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("doc summary skipped (LLM breaker open): %s", exc)
+            return ""
     try:
         # Wrap in ``record_llm_call`` so the doc-summarizer's prompt /
         # completion token spend lands in ``rag_tokens_prompt_total`` /
@@ -146,7 +162,11 @@ async def _summarize_impl(
                 completion=usage.get("completion_tokens", 0),
             )
         summary = (data["choices"][0]["message"]["content"] or "").strip()
+        if breaker is not None:
+            breaker.record_success()
     except Exception as e:  # noqa: BLE001 — fail-open by design
+        if breaker is not None:
+            breaker.record_failure()
         log.warning("doc summary failed for %s: %s", filename, e)
         return ""
 
