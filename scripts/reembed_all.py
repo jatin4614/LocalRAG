@@ -160,22 +160,48 @@ async def _enumerate_collections(qdrant: Any, *, kb: Optional[int], all_kbs: boo
     return []
 
 
+def _sparse_to_tuple(sparse: Any) -> Optional[tuple[list[int], list[float]]]:
+    """Coerce a Qdrant SparseVector-ish object back to ``(indices, values)``.
+
+    VectorStore.upsert expects the tuple form (indices, values); points
+    scrolled from Qdrant come back as ``models.SparseVector`` objects
+    with ``.indices`` and ``.values`` attributes (or as a dict in some
+    qdrant-client versions). Returns None for absent / unrecognized.
+    """
+    if sparse is None:
+        return None
+    indices = getattr(sparse, "indices", None)
+    values = getattr(sparse, "values", None)
+    if indices is None or values is None:
+        # Older / mocked shapes may be plain dicts.
+        if isinstance(sparse, dict):
+            indices = sparse.get("indices")
+            values = sparse.get("values")
+    if indices is None or values is None:
+        return None
+    return ([int(i) for i in indices], [float(v) for v in values])
+
+
 async def _reembed_collection(
     collection: str,
     *,
     qdrant: Any,
     embedder: Any,
+    vector_store: Any,
     pipeline_version: str,
     batch_size: int,
     apply: bool,
 ) -> tuple[int, int]:
-    """Return (total_points, re_embedded). Re-embedded may be 0 in dry-run."""
-    try:
-        from qdrant_client.http import models as qm
-    except ImportError as e:
-        print(f"error: qdrant-client not installed: {e}", file=sys.stderr)
-        raise
+    """Return (total_points, re_embedded). Re-embedded may be 0 in dry-run.
 
+    Bug-fix campaign §3.3: writes route through ``VectorStore.upsert``
+    (instead of a raw qdrant client upsert from the original script) so
+    custom-sharded targets like ``kb_1_v4`` (live since 2026-04-26)
+    auto-derive ``shard_key_selector`` from each point's
+    ``payload['shard_key']``. Without that, a raw upsert returns
+    ``Shard key not specified`` 400 and the operator script blows up
+    after the first scrolled page.
+    """
     total = 0
     re_embedded = 0
     offset = None
@@ -225,30 +251,29 @@ async def _reembed_collection(
                     f"embedder returned {len(new_vecs)} vectors for {len(new_points)} texts"
                 )
 
-            upserts: list[Any] = []
+            # VectorStore.upsert takes a list of dicts shaped:
+            #   {id, vector (dense list), payload, sparse_vector?, colbert_vector?}
+            # It handles named-vector encoding and shard_key derivation
+            # internally, so we just hand it the data and let it pick the
+            # right path. Custom-sharded collections require each point's
+            # payload to carry ``shard_key`` — already preserved here
+            # because we copy the original payload through unchanged
+            # (only stamping ``pipeline_version`` on top).
+            upserts: list[dict] = []
             for np_dict, new_vec in zip(new_points, new_vecs):
                 updated_payload = dict(np_dict["payload"])
                 updated_payload["pipeline_version"] = pipeline_version
-                vec_map: dict[str, Any] = {_DENSE_NAME: list(new_vec)}
-                if np_dict["sparse"] is not None:
-                    vec_map[_SPARSE_NAME] = np_dict["sparse"]
-                # Legacy unnamed-vector collections store a plain list;
-                # detect by checking whether old dense was dict-shaped.
-                pt_vector: Any
-                if np_dict["sparse"] is not None or isinstance(
-                    getattr(page[0], "vector", None), dict
-                ):
-                    pt_vector = vec_map
-                else:
-                    pt_vector = list(new_vec)
-                upserts.append(
-                    qm.PointStruct(
-                        id=np_dict["id"],
-                        vector=pt_vector,
-                        payload=updated_payload,
-                    )
-                )
-            await qdrant.upsert(collection_name=collection, points=upserts, wait=True)
+                pt_dict: dict[str, Any] = {
+                    "id": np_dict["id"],
+                    "vector": list(new_vec),
+                    "payload": updated_payload,
+                }
+                sparse_tup = _sparse_to_tuple(np_dict["sparse"])
+                if sparse_tup is not None:
+                    pt_dict["sparse_vector"] = sparse_tup
+                upserts.append(pt_dict)
+
+            await vector_store.upsert(collection, upserts)
             re_embedded += len(upserts)
         else:
             re_embedded += len(texts)
@@ -268,8 +293,13 @@ async def _main(args: argparse.Namespace) -> int:
 
     try:
         from ext.services.embedder import TEIEmbedder
+        # Bug-fix campaign §3.3 — route writes through VectorStore so
+        # custom-sharded collections (kb_1_v4 onward) auto-derive
+        # shard_key_selector from each point's payload. The raw qdrant
+        # client upsert path bypassed that and 400'd on first apply.
+        from ext.services.vector_store import VectorStore
     except ImportError as e:
-        print(f"error: cannot import TEIEmbedder: {e}", file=sys.stderr)
+        print(f"error: cannot import dependencies: {e}", file=sys.stderr)
         return 1
 
     apply = bool(args.apply)
@@ -278,6 +308,10 @@ async def _main(args: argparse.Namespace) -> int:
 
     qdrant = AsyncQdrantClient(url=args.qdrant_url, timeout=args.timeout)
     embedder = TEIEmbedder(base_url=args.tei_url, timeout=args.timeout)
+    # vector_size on the wrapper isn't consulted on upsert (the dense
+    # vector dimensionality follows the embedder output), so 0 is fine
+    # — but pick the real bge-m3 size to keep diagnostic logs sane.
+    vector_store = VectorStore(url=args.qdrant_url, vector_size=1024)
     try:
         collections = await _enumerate_collections(
             qdrant, kb=args.kb, all_kbs=args.all,
@@ -295,6 +329,7 @@ async def _main(args: argparse.Namespace) -> int:
                     col,
                     qdrant=qdrant,
                     embedder=embedder,
+                    vector_store=vector_store,
                     pipeline_version=args.pipeline_version,
                     batch_size=args.batch_size,
                     apply=apply,
@@ -317,6 +352,10 @@ async def _main(args: argparse.Namespace) -> int:
     finally:
         try:
             await embedder.aclose()
+        except Exception:
+            pass
+        try:
+            await vector_store.close()
         except Exception:
             pass
         try:

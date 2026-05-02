@@ -76,3 +76,54 @@ def test_script_rejects_kb_plus_all() -> None:
     )
     assert proc.returncode != 0
     assert "not allowed" in proc.stderr or "argument" in proc.stderr
+
+
+def test_script_imports_vector_store() -> None:
+    """Bug-fix campaign §3.3: script must route upserts through
+    ``VectorStore.upsert`` so custom-sharded targets (kb_1_v4 since
+    2026-04-26) auto-derive the shard_key from each point's payload.
+    Direct ``qdrant.upsert`` would 400 with ``Shard key not specified``.
+
+    Asserts the source file imports VectorStore — a static guard against
+    an accidental revert to the raw client path.
+    """
+    text = SCRIPT.read_text()
+    # Either explicit import, or referenced by name when constructed.
+    assert "VectorStore" in text, (
+        "scripts/reembed_all.py must use ext.services.vector_store.VectorStore "
+        "to route upserts through the sharding-aware path."
+    )
+    # The script should NOT call qdrant.upsert directly any more.
+    # ``qdrant.scroll`` and ``qdrant.get_collections`` remain fine.
+    import re
+    bad = re.search(r"\bqdrant\.upsert\b", text)
+    assert bad is None, (
+        "scripts/reembed_all.py still calls qdrant.upsert directly — "
+        "this bypasses VectorStore's shard_key derivation and will fail "
+        "on custom-sharded collections."
+    )
+
+
+def test_script_signature_matches_vector_store_upsert() -> None:
+    """``VectorStore.upsert(name, points: list[dict])`` is the contract.
+
+    Locks the import + signature so the script doesn't drift from the
+    helper it depends on. Without this, a future refactor of VectorStore
+    could silently break the operator script.
+    """
+    import inspect
+
+    # Repo-relative import; the script does the same on its sys.path
+    # fix-up so this is the same surface it will see at runtime.
+    sys.path.insert(0, str(ROOT))
+    try:
+        from ext.services.vector_store import VectorStore
+    finally:
+        sys.path.remove(str(ROOT))
+
+    sig = inspect.signature(VectorStore.upsert)
+    params = list(sig.parameters)
+    # First param after self is 'name', then keyword-only options.
+    assert params[0] == "self"
+    assert params[1] == "name"
+    assert "points" in params
