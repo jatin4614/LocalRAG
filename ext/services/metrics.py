@@ -166,6 +166,19 @@ sse_event_interval_seconds = Histogram(
     buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0),
 )
 
+# Counter incremented when the configured CHAT_MODEL env var is not
+# present in the chat endpoint's /v1/models response (review §6.7).
+# Operators may have set up an alias on the endpoint that resolves
+# transparently (no real misconfiguration), so we don't crash — but a
+# noticeable counter lets dashboards / alerts surface real misconfigs
+# (e.g. ".env got overwritten and CHAT_MODEL no longer matches the
+# AWQ build the model-manager has loaded"). Unlabelled because the
+# preflight runs once per process at startup.
+chat_model_mismatch_total = Counter(
+    f"{_NS}_chat_model_mismatch_total",
+    "CHAT_MODEL preflight detected mismatch with /v1/models",
+)
+
 # RBAC denials (403). Label by route so dashboards can attribute which
 # endpoint is rejecting access (e.g. /api/rag/retrieve vs KB admin).
 rbac_denied_total = Counter(
