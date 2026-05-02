@@ -34,4 +34,25 @@ scrape_configs:
       - target_label: job
         replacement: orgchat-containers
     pipeline_stages:
+      # Docker stage strips Docker's outer JSON wrapper so the inner
+      # log line surfaces in `output`. Required before json parsing.
       - docker: {}
+      # Wave 2 (review §8.8): parse the JSON log payload to surface
+      # ``trace_id`` / ``span_id`` / ``request_id`` for trace correlation
+      # in Loki. Without this stage, Grafana's "Logs for trace" lookup
+      # from Jaeger has nothing to match on. Lines that aren't JSON
+      # (the only such case in OrgChat is upstream/vllm preflight noise)
+      # silently no-op — Promtail's json stage is permissive on parse fail.
+      - json:
+          expressions:
+            trace_id: trace_id
+            span_id: span_id
+            request_id: request_id
+      # Promote the parsed extracted fields to log labels so LogQL
+      # ``{trace_id="…"}`` selectors work end-to-end. Limited to three
+      # fields (cardinality stays bounded — trace_id is per-request, not
+      # per-line, so the active label set is request-shaped).
+      - labels:
+          trace_id:
+          span_id:
+          request_id:
