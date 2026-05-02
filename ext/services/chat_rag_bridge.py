@@ -1537,6 +1537,39 @@ async def _run_pipeline(
                     "top_k": len(reranked),
                 })
 
+            # Wave 2 round 4 (review §5.1) — RAG_RERANK_MIN_SCORE post-filter.
+            # Default unset = OFF, byte-identical pass-through. When set (e.g.
+            # 0.05 after eval-gate), drop hits whose score is strictly below
+            # the threshold. Garbage values fail open (no filter applied) so a
+            # typo doesn't silently nuke retrieval. Counter labelled by intent
+            # so an operator can see which intent class the floor is shaping.
+            _min_score_raw = flags.get("RAG_RERANK_MIN_SCORE")
+            if _min_score_raw not in (None, "",):
+                try:
+                    _min_score = float(_min_score_raw)
+                except (TypeError, ValueError):
+                    _min_score = None
+                if _min_score is not None and reranked:
+                    _kept_above = [
+                        h for h in reranked
+                        if float(getattr(h, "score", 0.0) or 0.0) >= _min_score
+                    ]
+                    _dropped = len(reranked) - len(_kept_above)
+                    if _dropped:
+                        try:
+                            from .metrics import rag_rerank_threshold_dropped_total
+                            rag_rerank_threshold_dropped_total.labels(
+                                intent=str(_intent)
+                            ).inc(_dropped)
+                        except Exception:  # pragma: no cover - metrics fail-open
+                            pass
+                        await _emit(progress_cb, {
+                            "stage": "rerank.threshold",
+                            "dropped": _dropped,
+                            "kept": len(_kept_above),
+                        })
+                    reranked = _kept_above
+
             # P1.3 — MMR diversification (flag-gated). Reads the flag at call time
             # so tests can monkeypatch the env without module reload. When the flag
             # is off (default) the ``mmr`` module is never imported. Fails open:
