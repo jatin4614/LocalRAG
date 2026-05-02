@@ -35,6 +35,7 @@ from typing import Any, Iterable, Optional
 import httpx
 
 from .llm_telemetry import record_llm_call
+from .obs import inject_context_into_headers
 from .retry_policy import with_transient_retry
 
 
@@ -245,6 +246,12 @@ async def contextualize_chunk(
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+    # Wave 2 round 4 (review §7.6) — propagate the W3C traceparent into
+    # the outbound POST so Jaeger can correlate the contextualizer span
+    # with the chat-server span. HyDE / query_rewriter / doc_summarizer
+    # already inject; contextualizer was the lone outbound LLM call still
+    # missing the header.
+    headers = inject_context_into_headers(headers)
 
     url = f"{chat_url.rstrip('/')}/chat/completions"
     try:
@@ -359,6 +366,9 @@ async def _chat_call(
         api_key = os.environ.get("OPENAI_API_KEY")
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+    # Wave 2 round 4 (review §7.6) — propagate W3C traceparent (mirrors the
+    # ``contextualize_chunk`` path above so both entry points inject).
+    headers = inject_context_into_headers(headers)
     url = f"{resolved_url.rstrip('/')}/chat/completions"
     data = await _contextualize_call(url, body, headers, timeout_s, transport)
     return data["choices"][0]["message"]["content"] or ""
