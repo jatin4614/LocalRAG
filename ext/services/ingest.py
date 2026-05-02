@@ -151,6 +151,53 @@ def _raptor_enabled() -> bool:
     return flags.get("RAG_RAPTOR", "0") == "1"
 
 
+async def _persist_doc_pipeline_version(
+    doc_id: int | str,
+    pipeline_version: str,
+) -> None:
+    """Refresh ``kb_documents.pipeline_version`` to reflect the actual
+    pipeline that produced the embeddings.
+
+    Bug-fix campaign §1.12: ``upload.py`` stamps the column at upload
+    time (``ctx=none`` because contextualize is a runtime decision based
+    on per-KB ``rag_config``). When ``ingest_bytes`` later flips
+    ``context_augmented=True`` and stamps every Qdrant point's
+    ``pipeline_version`` payload with ``ctx=contextual-v1``, the
+    Postgres column was left lying — the kb_admin drift dashboard and
+    ``reembed_all.py`` checkpoint thought the doc was un-contextualized.
+
+    Best-effort: any DB error is logged + swallowed. The Qdrant points
+    already carry the correct value; the column update is a metadata
+    convenience. Indirected via the ``ingest_worker`` engine singleton
+    (lazy import — keeps ingest.py free of any sqlalchemy import when
+    the column update isn't needed) so tests can monkeypatch this whole
+    function on the ``ext.services.ingest`` module.
+    """
+    if doc_id is None:
+        return
+    try:
+        from ..workers.ingest_worker import _get_engine
+        from sqlalchemy import text as _sql
+        engine = _get_engine()
+        if engine is None:
+            return
+        async with engine.begin() as conn:
+            await conn.execute(
+                _sql(
+                    "UPDATE kb_documents SET pipeline_version = :pv "
+                    "WHERE id = :i"
+                ),
+                {"pv": pipeline_version, "i": int(doc_id)},
+            )
+    except Exception as e:  # noqa: BLE001 — best-effort
+        import logging as _log
+        _log.getLogger("orgchat.ingest").warning(
+            "ingest: failed to refresh kb_documents.pipeline_version "
+            "doc_id=%s pv=%s err=%s",
+            doc_id, pipeline_version, e,
+        )
+
+
 async def _maybe_contextualize_chunks(
     chunks_and_blocks: list[tuple[object, object]],
     *,
@@ -489,6 +536,18 @@ async def ingest_bytes(
 
     doc_id = payload_base.get("doc_id")
     chat_id = payload_base.get("chat_id")
+
+    # Bug-fix campaign §1.12: refresh kb_documents.pipeline_version when
+    # contextualize ran. Upload-time stamps ``ctx=none`` (runtime decision);
+    # the Qdrant points stamp ``ctx=contextual-v1``. Without this update,
+    # the column drifts from the points and reembed_all + the kb_admin
+    # drift dashboard mis-classify the doc. Skipped for chat-private
+    # uploads (doc_id is None) since they have no kb_documents row.
+    if context_augmented and doc_id is not None:
+        try:
+            await _persist_doc_pipeline_version(doc_id, pv)
+        except Exception:  # noqa: BLE001 — fail-open
+            pass
 
     # P3.4: optional RAPTOR tree expansion. OFF by default — the default
     # path does not import the raptor module at all. When on, we replace
