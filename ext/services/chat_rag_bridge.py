@@ -1811,6 +1811,10 @@ async def _run_pipeline(
         })
 
     sources_out = list(sources_by_doc.values())
+    # Wave 2 (review §8.3): record the *real* hit count before preambles are
+    # injected — catalog + datetime preambles are always added, so they would
+    # mask a genuinely empty retrieval if measured at the return site.
+    _real_hits_count = len(sources_out)
 
     # --- KB catalog preamble ---------------------------------------------
     # Metadata queries ("which reports do I have?", "list documents",
@@ -2097,4 +2101,14 @@ async def _run_pipeline(
         hits=len(sources_out),
         total_ms=_total_ms_done,
     )
+    # Wave 2 (review §8.3): increment empty-retrieval counter when no real
+    # hits came back (preambles excluded — see _real_hits_count above).
+    if _real_hits_count == 0:
+        try:
+            from .metrics import rag_retrieval_empty_total
+            rag_retrieval_empty_total.labels(
+                intent=_intent_label, kb_count=str(len(_kb_ids_for_log)),
+            ).inc()
+        except Exception as _err:  # pragma: no cover - never break retrieval
+            _record_silent_failure("metric_emit", _err)
     return sources_out

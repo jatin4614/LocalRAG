@@ -29,6 +29,7 @@ services:
       - ./prometheus/alerts-qu.yml:/etc/prometheus/alerts-qu.yml:ro
       - ./prometheus/alerts-tiered-shards.yml:/etc/prometheus/alerts-tiered-shards.yml:ro
       - ./prometheus/alerts-celery.yml:/etc/prometheus/alerts-celery.yml:ro
+      - ./prometheus/alerts-rag-quality.yml:/etc/prometheus/alerts-rag-quality.yml:ro
       - ../volumes/observability/prometheus:/prometheus
     depends_on:
       - alertmanager

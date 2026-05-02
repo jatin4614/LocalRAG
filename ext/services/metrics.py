@@ -504,3 +504,14 @@ RAG_SILENT_FAILURE = Counter(
     "Silent (logged-only) failures in chat_rag_bridge that don't kill the pipeline",
     labelnames=["stage"],
 )
+
+# Wave 2 (review §8.3): track retrievals returning zero real hits (i.e. before
+# the always-present catalog/datetime preambles are added). A sustained ramp
+# usually means: corpus drift (queries miss the active KB), embedding model
+# swap, broken ingest, or a regression in intent-classified KB selection.
+# Pair with the alerts-rag-quality.yml rule that fires above 0.1/sec for 10m.
+rag_retrieval_empty_total = Counter(
+    "rag_retrieval_empty_total",
+    "Retrievals returning zero real hits (pre-preamble), broken down by intent",
+    labelnames=["intent", "kb_count"],
+)

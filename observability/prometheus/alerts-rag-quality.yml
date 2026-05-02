@@ -1,0 +1,25 @@
+groups:
+  - name: rag-quality
+    interval: 30s
+    rules:
+      # Wave 2 (review §8.3): alerts when retrievals routinely come back empty.
+      # 0.1 events/sec averaged over 5m ≈ 30 empty retrievals every 5 minutes,
+      # which is well above the noise floor for a healthy KB (most queries hit
+      # at least one chunk after RBAC + intent routing). The 10-minute `for:`
+      # window keeps quick traffic spikes from paging during a single bad batch.
+      - alert: RagRetrievalEmptyHigh
+        expr: rate(rag_retrieval_empty_total[5m]) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+          component: rag
+        annotations:
+          summary: "RAG returning zero hits — intent={{ $labels.intent }}, kbs={{ $labels.kb_count }}"
+          description: |
+            Sustained empty retrievals from chat_rag_bridge for >10 min.
+            Likely causes: (1) corpus drift — selected KBs no longer cover
+            the queries; (2) embedding model swap without re-embed; (3)
+            ingest pipeline broken (`kb_documents.ingest_status` stuck);
+            (4) intent classifier routing to wrong KB set. Check the
+            `rag_retrieval_empty_total` time-series + recent kb_admin
+            health endpoint output.

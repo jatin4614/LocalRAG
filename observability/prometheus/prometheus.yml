@@ -29,6 +29,9 @@ rule_files:
   # Wave 2 (review §8.2): file existed in repo but was never loaded —
   # worker-down + DLQ-depth alerts were silently disabled.
   - /etc/prometheus/alerts-celery.yml
+  # Wave 2 (review §8.3, §8.4, §8.7): RAG-quality alerts (empty retrievals,
+  # silent-failure ramp, daily-eval staleness).
+  - /etc/prometheus/alerts-rag-quality.yml
 
 scrape_configs:
   - job_name: prometheus
