@@ -611,6 +611,15 @@ services:
         condition: service_healthy
       whisper:
         condition: service_healthy
+      # Wave 2 (review §11.12): tei + vllm-chat warm slowly (60s+ for TEI
+      # model load, ~2 min for vllm-chat). Without these gates, the first
+      # retrieval after `docker compose up` 503s with "embedder not ready"
+      # for the warm-up window. Now open-webui won't start until both are
+      # responding to their /health probes.
+      tei:
+        condition: service_healthy
+      vllm-chat:
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
       interval: 30s
