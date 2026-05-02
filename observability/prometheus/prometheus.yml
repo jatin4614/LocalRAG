@@ -24,6 +24,9 @@ rule_files:
   - /etc/prometheus/alerts-gpu.yml
   - /etc/prometheus/alerts-qu.yml
   - /etc/prometheus/alerts-tiered-shards.yml
+  # Wave 2 (review §8.2): file existed in repo but was never loaded —
+  # worker-down + DLQ-depth alerts were silently disabled.
+  - /etc/prometheus/alerts-celery.yml
 
 scrape_configs:
   - job_name: prometheus
