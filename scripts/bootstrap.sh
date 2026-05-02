@@ -31,12 +31,49 @@ if [[ ! -f compose/.env ]]; then
   echo "   cp compose/.env.example compose/.env && \$EDITOR compose/.env" >&2
   exit 1
 fi
-for key in WEBUI_NAME DOMAIN SESSION_SECRET ADMIN_EMAIL ADMIN_PASSWORD WEBUI_SECRET_KEY; do
+for key in WEBUI_NAME DOMAIN SESSION_SECRET ADMIN_EMAIL ADMIN_PASSWORD WEBUI_SECRET_KEY POSTGRES_PASSWORD; do
   if ! grep -q "^${key}=" compose/.env; then
     echo "!! compose/.env missing key: $key" >&2; exit 1
   fi
 done
 set -a; source compose/.env; set +a
+
+# Wave 1a (review §11.5 / §9): refuse to bootstrap when the placeholder
+# `change-me-…` literals from .env.example survive. Previously bootstrap only
+# verified the keys EXISTED — a blank-fill operator run would happily ship the
+# defaults to production where Qdrant is reachable on the LAN with no auth and
+# WEBUI_SECRET_KEY signs JWTs with a string everyone has the source for.
+REJECTED=0
+check_secret() {
+  local key="$1" val="$2"
+  if [[ "$val" == change-me-* ]] || [[ "$val" == "" ]]; then
+    echo "!! compose/.env: $key is unset or still the placeholder ('$val')" >&2
+    REJECTED=1
+  fi
+}
+check_secret SESSION_SECRET    "${SESSION_SECRET:-}"
+check_secret WEBUI_SECRET_KEY  "${WEBUI_SECRET_KEY:-}"
+check_secret ADMIN_PASSWORD    "${ADMIN_PASSWORD:-}"
+check_secret POSTGRES_PASSWORD "${POSTGRES_PASSWORD:-}"
+# QDRANT_API_KEY is OPTIONAL — empty / unset means Qdrant runs without auth
+# (current default). If set, it must NOT be the placeholder. If you want to
+# enable Qdrant auth, generate one with `openssl rand -base64 32`.
+if [[ -n "${QDRANT_API_KEY:-}" ]]; then
+  check_secret QDRANT_API_KEY "$QDRANT_API_KEY"
+fi
+# DATABASE_URL embeds POSTGRES_PASSWORD; spot-check the literal too.
+if [[ "${DATABASE_URL:-}" == *change-me-* ]]; then
+  echo "!! compose/.env: DATABASE_URL still contains 'change-me-…' (rotate POSTGRES_PASSWORD AND DATABASE_URL together)" >&2
+  REJECTED=1
+fi
+if [[ $REJECTED -eq 1 ]]; then
+  echo "" >&2
+  echo "Generate strong secrets:" >&2
+  echo "  openssl rand -base64 32        # for SESSION_SECRET / WEBUI_SECRET_KEY / QDRANT_API_KEY" >&2
+  echo "  openssl rand -base64 24        # for ADMIN_PASSWORD / POSTGRES_PASSWORD" >&2
+  echo "Then edit compose/.env (and rebuild DATABASE_URL with the new pg password)." >&2
+  exit 1
+fi
 
 say "Step 1/6: preflight model weights"
 if [[ $SKIP_PULL -eq 0 ]]; then
