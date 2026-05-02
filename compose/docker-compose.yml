@@ -64,6 +64,15 @@ services:
     # in-place). See docs/runbook/temporal-reshard-procedure.md.
     environment:
       QDRANT__CLUSTER__ENABLED: "true"
+      # Wave 1a (review §4.1): per-request API-key gate on REST + gRPC.
+      # If QDRANT_API_KEY is unset/empty in compose/.env, qdrant runs with
+      # no auth (current default). If set, every client must include the
+      # `api-key: …` header — VectorStore reads QDRANT_API_KEY from env
+      # and passes it to AsyncQdrantClient. Operator scripts that talk
+      # to Qdrant directly (reembed_all, reconcile_qdrant_schema, etc.)
+      # also need QDRANT_API_KEY in their env to keep working — see
+      # docs/superpowers/plans/2026-05-02-bug-fix-campaign.md (Wave 2 G).
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:-}
     # First (and only) peer in a single-node cluster must advertise its
     # P2P URI so consensus can initialize. Inside the orgchat compose
     # network, the service is reachable as http://qdrant:6335.
@@ -72,7 +81,13 @@ services:
       - "--uri"
       - "http://qdrant:6335"
     ports:
-      - "6333:6333"
+      # Wave 1a (review §11.2): bound to loopback so the LAN can't reach
+      # Qdrant directly. Caddy + open-webui are on the docker network and
+      # still talk to qdrant:6333 via service name. Operators who need
+      # ad-hoc REST access run `curl http://127.0.0.1:6333/...` from the
+      # host (or via SSH port-forward); LAN clients are denied at the
+      # network layer regardless of API-key state.
+      - "127.0.0.1:6333:6333"
     volumes:
       - qdrant_data:/qdrant/storage
     healthcheck:
@@ -250,7 +265,11 @@ services:
     volumes:
       - ../volumes/models:/root/.cache/huggingface/hub
     ports:
-      - "8101:8000"
+      # Wave 1a (review §11.2): bound to loopback. vllm-qu has no auth at
+      # all — exposing 8101 to the LAN handed an open OpenAI-compatible
+      # endpoint to anyone who could route to the host. open-webui talks
+      # to it via the docker network (vllm-qu:8000) regardless.
+      - "127.0.0.1:8101:8000"
     command:
       # Quantization is auto-detected from the model's config.json
       # (compressed-tensors AWQ-4bit). Passing --quantization explicitly
@@ -358,7 +377,11 @@ services:
     container_name: orgchat-open-webui
     restart: unless-stopped
     ports:
-      - "6100:8080"
+      # Wave 1a (review §11.2): bound to loopback. End-users go through
+      # Caddy on :8443 (HTTPS, with WEBUI_SECRET_KEY-signed JWT). Direct
+      # access to :6100 bypasses the TLS layer; only operators on the
+      # host (or SSH-tunneled) need it for debugging.
+      - "127.0.0.1:6100:8080"
     environment:
       PORT: "8080"
       WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY}
@@ -494,6 +517,10 @@ services:
       DATABASE_URL: ${DATABASE_URL}
       QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
       QDRANT_URI: ${QDRANT_URL:-http://qdrant:6333}
+      # Wave 1a (review §4.1): empty-string passthrough so the value is
+      # truthy-empty in Python (os.environ.get returns ""), which
+      # VectorStore treats as None — preserving the no-auth default.
+      QDRANT_API_KEY: ${QDRANT_API_KEY:-}
       TEI_URL: ${TEI_URL:-http://tei:80}
       AUTH_MODE: ${AUTH_MODE:-jwt}
       RAG_VECTOR_SIZE: ${RAG_VECTOR_SIZE:-1024}
@@ -619,6 +646,9 @@ services:
       CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/2}
       INGEST_BLOB_ROOT: /var/ingest
       QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
+      # Wave 1a (review §4.1): celery-worker also instantiates VectorStore
+      # for ingest upserts; same QDRANT_API_KEY plumbing as open-webui.
+      QDRANT_API_KEY: ${QDRANT_API_KEY:-}
       TEI_URL: ${TEI_URL:-http://tei:80}
       RAG_VECTOR_SIZE: ${RAG_VECTOR_SIZE:-1024}
       RAG_EMBEDDING_OPENAI_API_BASE_URL: ${RAG_EMBEDDING_OPENAI_API_BASE_URL:-http://tei:80/v1}

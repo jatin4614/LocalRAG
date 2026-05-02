@@ -199,8 +199,13 @@ class VectorStore:
         # Large ColBERT-laden upserts (multi-vector ~400 KB per chunk) plus
         # Qdrant under memory pressure can blow past 30s. RAG_QDRANT_TIMEOUT
         # env override lets ops dial up further without code change.
+        # Wave 1a (review §4.1): pass api_key when the operator has enabled
+        # Qdrant's per-request auth (QDRANT_API_KEY). Empty string is treated
+        # as "no auth" so the no-auth default keeps working.
+        api_key = os.environ.get("QDRANT_API_KEY") or None
         self._client = AsyncQdrantClient(
             url=url,
+            api_key=api_key,
             timeout=float(os.environ.get("RAG_QDRANT_TIMEOUT", "120.0")),
             pool_size=_env_int("RAG_QDRANT_MAX_CONNS", 32),
         )
