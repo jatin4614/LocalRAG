@@ -436,19 +436,25 @@ async def ingest_bytes(
             image_chunks = []
     else:
         image_chunks = []
+    # Bug-fix campaign §1.13: pair each image chunk with the block whose
+    # ``page`` matches the image's page so the downstream payload
+    # inherits the *page-local* heading_path. The previous
+    # ``blocks[0]`` fallback caused images on page 5 of a 100-page PDF
+    # to inherit the page-1 chapter heading — citations and faceted
+    # retrieval were silently mis-attributed. When no block matches
+    # (image on a page that yielded no extracted text, or no ``page``
+    # in the image dict), we pair with ``None`` so heading_path falls
+    # back to ``[]`` and the payload is honest about its provenance.
+    _block_by_page = {b.page: b for b in blocks if b.page is not None}
     for ic in image_chunks:
-        # Synthesize a minimal block — image lives at its own page,
-        # outside any structural heading. Use the first block as the
-        # fallback "host" for sheet/heading_path so downstream
-        # build_point_payload still gets non-None values where the
-        # block-level structure made sense.
-        fake_block = blocks[0] if blocks else None
+        page = ic.get("page")
+        host_block = _block_by_page.get(page) if page is not None else None
         paired.append((
-            _Chunk(index=len(paired), text=ic["text"]), fake_block,
+            _Chunk(index=len(paired), text=ic["text"]), host_block,
         ))
         extras: dict = {"chunk_type": "image_caption"}
-        if ic.get("page") is not None:
-            extras["page"] = ic["page"]
+        if page is not None:
+            extras["page"] = page
         if ic.get("language"):
             extras["language"] = ic["language"]
         chunk_extras.append(extras)
