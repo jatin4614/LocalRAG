@@ -1,0 +1,55 @@
+# Wave 2 (review §9.7 + §9.10): pre-commit hooks for ruff format + lint,
+# secret scan, large-file guard, and standard hygiene.
+#
+# Install:    pip install pre-commit && pre-commit install
+# Run all:    pre-commit run --all-files
+# Skip once:  SKIP=ruff git commit -m "..."
+#
+# Hook versions are pinned. Bump deliberately + run `pre-commit autoupdate`
+# to refresh; never auto-update silently.
+repos:
+  # ---- Python lint + format (ruff) -----------------------------------
+  # Ruff is the project's linter (pyproject.toml [tool.ruff]). Pre-commit
+  # runs the same rules on changed files only — keeps commits clean
+  # without forcing a whole-tree format on legacy code.
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+        # Don't lint upstream/ — it's vendored Open WebUI.
+        exclude: ^(upstream/|volumes/|backups/|\.venv/|compose/archive/)
+      - id: ruff-format
+        exclude: ^(upstream/|volumes/|backups/|\.venv/|compose/archive/)
+
+  # ---- Secret scan (gitleaks) ----------------------------------------
+  # Scans staged diffs for high-entropy strings, AWS/GCP/HF tokens, etc.
+  # Treat any positive as a hard stop — rotate the secret BEFORE pushing.
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.4
+    hooks:
+      - id: gitleaks
+        # Suppress false positives via a project .gitleaks.toml if needed;
+        # default ruleset is sane for this repo.
+
+  # ---- Standard hygiene ----------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: check-yaml
+        # Helm chart templates use {{ }} syntax — not pure YAML; skip.
+        exclude: ^(k8s/.*templates/|k8s\.future/.*templates/)
+      - id: check-added-large-files
+        args: [--maxkb=500]
+        # Vendored upstream may legitimately carry larger fixtures
+        exclude: ^(upstream/|volumes/|backups/)
+      - id: end-of-file-fixer
+        exclude: ^(upstream/|volumes/|backups/|compose/archive/)
+      - id: trailing-whitespace
+        exclude: ^(upstream/|volumes/|backups/|compose/archive/)
+      - id: check-merge-conflict
+      - id: check-symlinks
+
+# Don't auto-fail on first hook — let all run so the operator sees the full
+# diff at once.
+fail_fast: false
