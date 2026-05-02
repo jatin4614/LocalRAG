@@ -163,6 +163,26 @@ Every behavior change ships behind a flag, default OFF for first deploy. Soak 7 
 
 (Updated as commits land. Newest first.)
 
+### Wave 2 round 4 (4 background agents, 17 fixes shipped, 1 dedup-skip)
+
+- 2026-05-02 `3bed794` — D-2 §5.15: RAG_TOTAL_BUDGET_SEC pipeline timeout (asyncio.wait_for + degraded fallback).
+- 2026-05-02 `e25a9b6` — D-2 §5.9: MMR reuses Hit.vector (with_vectors=True path; skip TEI re-embed).
+- 2026-05-02 `d4a0a6f` — D-2 §5.2: RAG_BUDGET_INCLUDES_PROMPT pre-deduct (reserved_tokens kwarg).
+- 2026-05-02 `4e12829` — D-2 §5.1: RAG_RERANK_MIN_SCORE post-rerank floor (default OFF).
+- 2026-05-02 (skipped) — D-2 §7.6: dedup with D-1's c48a9fa, no merge.
+- 2026-05-02 `399b250` — C-2 §3.8: concurrent dense/sparse/colbert via asyncio.gather + to_thread.
+- 2026-05-02 `fdd803a` — C-2 §3.6: EMBED_MODEL preflight via TEI /info.
+- 2026-05-02 `4882b37` — C-2 §3.5: TEI circuit breaker (RAG_CB_TEI_ENABLED=0 default).
+- 2026-05-02 `de24f93` — C-2 §3.3: reembed_all routes upserts through VectorStore (shard_key fix).
+- 2026-05-02 `e795855` — C-2 §3.2: Redis-backed embed cache (RAG_EMBED_CACHE_ENABLED=0 default).
+- 2026-05-02 `f3aa2c5` — F-2 §8.9: RAG_LOG_QUERY_TEXT optional debug log (default OFF, PII-safe).
+- 2026-05-02 `9a95a5b` — F-2 §8.8: Promtail JSON parse + Loki structured metadata (trace_id label).
+- 2026-05-02 `931f4fb` — F-2 §8.6: kb→(kb_count, kb_primary) cardinality fix on retrieval_hits_total.
+- 2026-05-02 `e09db51` — A §1.13: image-caption heading_path page-aware lookup.
+- 2026-05-02 `6bba8de` — A §1.12: refresh kb_documents.pipeline_version after contextualize.
+- 2026-05-02 `454af1e` — A §1.7: UTF-8-safe error_message truncation in worker.
+- 2026-05-02 `f99fcdf` — A §1.6: SQLAlchemy engine singleton in ingest_worker (lazy).
+
 ### Wave 2 round 3 (3 background agents, smaller charters; 13 fixes + 2 BLOCKED)
 
 - 2026-05-02 `2f5da50` — D-1 §7.5: double-checked locking on bridge singletons.
