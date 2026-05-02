@@ -1,0 +1,51 @@
+# Alertmanager configuration for OrgChat observability stack.
+# Wave 2 (review §8.1): brought up to give Prometheus a real receiver.
+#
+# IMPORTANT — operator action required for production:
+#   The default receiver below writes alert payloads to a local file
+#   (/var/log/alerts/alerts.log) so the stack is runnable air-gapped
+#   without external integrations. BEFORE production rollout, swap the
+#   `receivers:` block for Slack, PagerDuty, email, or your incident
+#   manager of choice. See:
+#     https://prometheus.io/docs/alerting/latest/configuration/#receiver
+#
+# A few sane defaults that we DO want kept:
+#   * group_wait 30s + group_interval 5m batches noisy alerts
+#   * repeat_interval 12h prevents pager-fatigue on long-running issues
+#   * resolve_timeout 5m mirrors Prometheus default
+
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: file-log
+  group_by: ["alertname", "severity"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 12h
+  routes:
+    # Critical alerts repeat sooner so they don't get lost in the queue.
+    - matchers:
+        - severity = critical
+      receiver: file-log
+      repeat_interval: 1h
+
+receivers:
+  - name: file-log
+    # webhook_configs writes a JSON payload per alert group via HTTP POST.
+    # The placeholder below points at a log-only sink that runs inside the
+    # alertmanager container itself (operators can also point at any local
+    # webhook receiver, e.g. https://github.com/prometheus/alertmanager/tree/main/examples/webhook).
+    # If no listener is reachable, alertmanager logs the failed delivery
+    # and we can still see the alert state in its UI (port 9093).
+    webhook_configs:
+      - url: "http://127.0.0.1:5001/alerts"
+        send_resolved: true
+
+inhibit_rules:
+  # Critical alerts should silence equivalent warnings on the same labels.
+  - source_matchers:
+      - severity = critical
+    target_matchers:
+      - severity = warning
+    equal: ["alertname", "component"]

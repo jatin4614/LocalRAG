@@ -28,11 +28,40 @@ services:
       - ./prometheus/alerts-gpu.yml:/etc/prometheus/alerts-gpu.yml:ro
       - ./prometheus/alerts-qu.yml:/etc/prometheus/alerts-qu.yml:ro
       - ./prometheus/alerts-tiered-shards.yml:/etc/prometheus/alerts-tiered-shards.yml:ro
+      - ./prometheus/alerts-celery.yml:/etc/prometheus/alerts-celery.yml:ro
       - ../volumes/observability/prometheus:/prometheus
+    depends_on:
+      - alertmanager
     ports:
       - "127.0.0.1:9091:9090"
     mem_limit: 1g
     cpus: 1.0
+    networks:
+      - orgchat-obs-net
+      - orgchat-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  alertmanager:
+    # Wave 2 (review §8.1): bring up Alertmanager so prometheus rules have a
+    # destination. Receivers default to a file-log webhook — operators MUST
+    # swap for Slack/PagerDuty/email in production (see alertmanager.yml).
+    image: prom/alertmanager:v0.27.0
+    container_name: orgchat-obs-alertmanager
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --web.listen-address=:9093
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - ../volumes/observability/alertmanager:/alertmanager
+    ports:
+      - "127.0.0.1:9093:9093"
+    mem_limit: 256m
     networks:
       - orgchat-obs-net
       - orgchat-net

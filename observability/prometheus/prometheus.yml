@@ -11,11 +11,13 @@ global:
   external_labels:
     stack: orgchat
 
-# Alerting/rules placeholders — enable when alertmanager is added.
-# alerting:
-#   alertmanagers:
-#     - static_configs:
-#         - targets: ["alertmanager:9093"]
+# Wave 2 (review §8.1): Alertmanager wired up. Receivers default to a
+# file-log webhook in observability/alertmanager/alertmanager.yml — swap for
+# Slack/PagerDuty/email before production rollout.
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
 # Rule files are loaded from /etc/prometheus/. Operator must mount each new rule
 # file in observability/docker-compose.yml prometheus.volumes; default mount only
 # brings in prometheus.yml itself.
