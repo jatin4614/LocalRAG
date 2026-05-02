@@ -34,8 +34,8 @@ commit message; this doc tracks PR numbers, rollback tags, and per-fix decisions
 
 | Tag | Date | pg_dump | Qdrant snapshots | Image tags | Notes |
 |---|---|---|---|---|---|
-| `rollback-pre-wave-1` | _pending_ | n/a (Wave 1 = code-only, no schema) | n/a | snap latest as `:pre-wave-1` after first deploy | Tag set after committing Phase 6.X completions |
-| `rollback-pre-wave-2` | _pending_ | n/a (Wave 2 = code-only) | n/a | snap as `:pre-wave-2` | After Wave 1 merged + soak |
+| `rollback-pre-wave-1` | 2026-05-02 (`de52ca5`) | n/a (Wave 1 = code-only, no schema) | n/a | snap latest as `:pre-wave-1` after first deploy | Tag set after committing Phase 6.X completions (`9084694`, `204f66f`, `de52ca5`) |
+| `rollback-pre-wave-2` | _to set after Wave 1a tracker commit_ | n/a (Wave 2 = code-only) | n/a | snap as `:pre-wave-2` | Wave 1a merged into main; Agent G inherits Wave 1b USER directive scope |
 | `rollback-pre-wave-3a` | _pending_ | **REQUIRED** | **REQUIRED** | snap as `:pre-wave-3a` | Snapshot infra must exist BEFORE 3a |
 | `rollback-pre-wave-3b` | _pending_ | REQUIRED | REQUIRED | `:pre-wave-3b` | DB migrations |
 | `rollback-pre-wave-3c` | _pending_ | REQUIRED | REQUIRED | `:pre-wave-3c` | Qdrant schema |
@@ -63,17 +63,17 @@ Pre-flight tag: `rollback-pre-wave-1`. Code-only changes; revert via `git revert
 
 | # | Item | Review § | Status | Commit |
 |---|---|---|---|---|
-| 1a.1 | Cert filename mismatch (orgchat.crt vs kairos.crt) | §11.1 | `[ ]` | |
-| 1a.2 | Bind qdrant:6333 / open-webui:6100 / vllm-qu:8101 to 127.0.0.1 + Qdrant API key | §4.1, §11.2 | `[ ]` | |
-| 1a.3 | Reject default `change-me-*` secrets in bootstrap.sh | §9 + §11 | `[ ]` | |
-| 1a.4 | `.dockerignore` additions (.claude, .env*, node_modules, *.log, dist, build) | §10.3 | `[ ]` | |
-| 1a.5 | Fix `Makefile:84` BASELINE default to existing file | §9.4 | `[ ]` | |
-| 1a.6 | Update `.env.example`: CHAT_MODEL → gemma-4 | §11.13 | `[ ]` | |
-| 1a.7 | Archive `compose/*.pre-gemma4` to `compose/archive/` | §11.14 | `[ ]` | |
-| 1a.8 | TEI `--max-input-length 8192` (compose) — moved up from §3.1 | §3.1 | `[ ]` | |
-| 1a.9 | `internal: true` on orgchat-net | §11.3 | `[ ]` | |
-| 1b.1 | USER 1000:1000 in 7 Dockerfiles (build-test each) | §10.1 | `[ ]` | Wave 1b — separate batch |
-| 1b.2 | Shared volume UID mapping for ingest_blobs | §11.10 | `[ ]` | Pair with 1b.1 |
+| 1a.1 | Cert filename mismatch (orgchat.crt vs kairos.crt) | §11.1 | `[x]` | `cdb2801` |
+| 1a.2 | Bind qdrant:6333 / open-webui:6100 / vllm-qu:8101 to 127.0.0.1 + Qdrant API key | §4.1, §11.2 | `[x]` | `0dd71f6` |
+| 1a.3 | Reject default `change-me-*` secrets in bootstrap.sh | §9 + §11 | `[x]` | `14f4bc5` |
+| 1a.4 | `.dockerignore` additions (.claude, .env*, node_modules, *.log, dist, build) | §10.3 | `[x]` | `0ee861f` |
+| 1a.5 | Fix `Makefile:84` BASELINE default to existing file | §9.4 | `[x]` | `a46e470` |
+| 1a.6 | Update `.env.example`: CHAT_MODEL → gemma-4 | §11.13 | `[x]` | `8e8af7e` |
+| 1a.7 | Archive `compose/*.pre-gemma4` to `compose/archive/` | §11.14 | `[x]` | `e3c19cd` |
+| 1a.8 | TEI `--max-input-length 8192` (compose) — moved up from §3.1 | §3.1 | `[x]` | `9f42974` |
+| 1a.9 | `internal: true` on orgchat-net | §11.3 | `[-]` | Deferred to Wave 1c (validation cycle); risk: TEI/vllm boot probes may need outbound during cold-start even with HF_HUB_OFFLINE |
+| 1b.1 | USER 1000:1000 in 7 Dockerfiles (build-test each) | §10.1 | `[-]` | **Folded into Wave 2 Agent G** — Agent G already touches all Dockerfiles; combining avoids two rounds of container rebuilds |
+| 1b.2 | Shared volume UID mapping for ingest_blobs | §11.10 | `[-]` | Folded into Agent G with 1b.1 |
 
 ---
 
@@ -163,4 +163,14 @@ Every behavior change ships behind a flag, default OFF for first deploy. Soak 7 
 
 (Updated as commits land. Newest first.)
 
-- 2026-05-02 — campaign kickoff. Tracking doc created.
+- 2026-05-02 `0dd71f6` — Wave 1a.2: bind 3 ports to loopback + QDRANT_API_KEY plumbing.
+- 2026-05-02 `14f4bc5` — Wave 1a.3: reject change-me-* secrets in bootstrap; sketch QDRANT_API_KEY.
+- 2026-05-02 `0ee861f` — Wave 1a.4: .dockerignore additions.
+- 2026-05-02 `9f42974` — Wave 1a.8: TEI --max-input-length 8192 (highest-impact single fix).
+- 2026-05-02 `e3c19cd` — Wave 1a.7: archive docker-compose.yml.pre-gemma4.
+- 2026-05-02 `8e8af7e` — Wave 1a.6: env.example CHAT_MODEL → gemma-4.
+- 2026-05-02 `a46e470` — Wave 1a.5: Makefile baseline default → baseline.json.
+- 2026-05-02 `cdb2801` — Wave 1a.1: Caddyfile cert filename → orgchat.{crt,key}.
+- 2026-05-02 `de52ca5` — campaign kickoff. Tracking doc created. Baseline tagged `rollback-pre-wave-1`.
+- 2026-05-02 `204f66f` — Phase 6.X UI: chat skeleton "thinking" label.
+- 2026-05-02 `9084694` — Phase 6.X backend: multi-entity decompose + MMR/expand caps + per-KB image_captions.
