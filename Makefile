@@ -78,7 +78,11 @@ clean:
 KB_EVAL_ID ?= 1
 API_BASE   ?= http://localhost:6100
 GOLDEN     ?= tests/eval/golden_starter.jsonl
-BASELINE   ?= tests/eval/results/phase-0-baseline.json
+# Default baseline used by `make eval-gate`. The original phase-0-baseline.json
+# was never committed; the canonical baseline is tests/eval/results/baseline.json
+# (refreshed by `make eval-baseline`). Override per-run with `make eval-gate
+# BASELINE=tests/eval/results/baseline-pre-phase1a.json` etc.
+BASELINE   ?= tests/eval/results/baseline.json
 LATEST     ?= tests/eval/results/latest.json
 
 .PHONY: eval eval-baseline eval-gate eval-seed
