@@ -6,7 +6,11 @@ Self-hosted, air-gapped, multi-user ChatGPT-style assistant for orgs (20–200 u
 
 ## 1. Core invariants (don't break without an explicit decision)
 
-1. **Isolation, three layers.** Every Qdrant chunk has either `kb_id`/`doc_id` (+optional `subtag_id`) for shared KBs, OR `chat_id`/`owner_user_id` for chat-private. Never both. Enforced at DB (`kb_access` XOR check), API (`rbac.get_allowed_kb_ids` + Redis cache w/ pubsub invalidation, DB is source of truth — cache miss MUST fall through to DB), and vector layer (every search injects `kb_id ∈ allowed` filter). Six explicit isolation tests in `tests/integration/test_kb_isolation.py` are the mandatory CI gate.
+1. **Isolation, three layers.** Every Qdrant chunk has either `kb_id`/`doc_id` (+optional `subtag_id`) for shared KBs, OR `chat_id`/`owner_user_id` for chat-private. Never both. Enforced at DB (`kb_access` XOR check), API (`rbac.get_allowed_kb_ids` + Redis cache w/ pubsub invalidation, DB is source of truth — cache miss MUST fall through to DB), and vector layer (every search injects `kb_id ∈ allowed` filter). The mandatory CI gate is the **isolation suite (11 tests across three files):**
+   - `tests/integration/test_kb_isolation.py` — 2 tests: cross-user KB visibility + admin-only routes (end-to-end via FastAPI test client).
+   - `tests/integration/test_rag_isolation.py` — 2 tests: chat-private retrieval + chat-scoped query containment (end-to-end RAG path).
+   - `tests/integration/test_rbac_cache_invalidation.py` — 6 tests: the RBAC cache contract (group grant, pubsub revocation, TTL safety net, dropped-message recovery, concurrent-revocation consistency, per-user cache key isolation).
+   - `tests/unit/test_kb_models.py::test_kb_access_check_enforced_in_model` — 1 test: SQL CHECK XOR constraint at the model layer (`KBAccess(user_id=None, group_id=None)` and `KBAccess(user_id=1, group_id=1)` both raise).
 2. **Fail-open.** Silent fallthrough must `_record_silent_failure(stage, err)` (logs + counter). Never re-raise from helper. Counter / label cardinality must never break retrieval.
 3. **Default-off quality flags.** `RAG_RERANK`, `RAG_MMR`, `RAG_CONTEXT_EXPAND`, `RAG_HYDE`, `RAG_SPOTLIGHT`, `RAG_CONTEXTUALIZE_KBS`, `RAG_RAPTOR`, `RAG_SEMCACHE` ship default-off. Production deviations live in `compose/.env`.
 4. **Air-gapped.** All weights cached under `volumes/models` + `/opt/fastembed_cache` + `/opt/tiktoken-cache`. Validate before deploy with `python scripts/preflight_models.py`.
