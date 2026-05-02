@@ -37,6 +37,34 @@
         max_size 100MB
     }
 
+    # Wave 2 (review §11.9): rate-limit /api/rag/* to defend against floods.
+    # The standard caddy:2-alpine image does NOT include the rate_limit
+    # module; uncomment + rebuild Caddy with the plugin to enable:
+    #
+    #   docker run --rm caddyserver/xcaddy:latest build \
+    #     --with github.com/mholt/caddy-ratelimit \
+    #     --output /tmp/caddy
+    #
+    # Then swap the image: tag to caddy/caddy:2-with-ratelimit.
+    # The directives below take effect once the module is loaded.
+    #
+    # @rag path /api/rag/*
+    # rate_limit @rag {
+    #     zone rag {
+    #         key {client_ip}
+    #         events 60
+    #         window 1m
+    #     }
+    # }
+    # @kbadmin path /api/kb/*
+    # rate_limit @kbadmin {
+    #     zone kb_admin {
+    #         key {client_ip}
+    #         events 10
+    #         window 1m
+    #     }
+    # }
+
     reverse_proxy open-webui:8080 {
         flush_interval -1
         transport http {

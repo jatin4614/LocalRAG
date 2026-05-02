@@ -144,6 +144,33 @@ def _window_chunk_prose(text: str, chunk_size_tokens: int,
     return out
 
 
+def _is_real_markdown_table(block: str) -> bool:
+    """Wave 2 (review §2.4): post-regex filter — count `|` separators per
+    row and require all rows to share the same column count. The regex
+    above already requires header + separator + ≥1 row, but the column-
+    count check rules out log lines like `| 2026-05-02 | INFO | ... |`
+    that happen to repeat with structurally-different column shapes.
+    A genuine markdown table is rectangular; mismatched rows usually
+    indicate a noise pattern (log frames, ASCII boxes, code samples
+    that escaped the fenced-code matcher)."""
+    rows = [r.strip() for r in block.strip().split("\n") if r.strip()]
+    if len(rows) < 3:
+        return False
+    # Strip leading/trailing | then split on |. The header row sets the
+    # canonical column count; every other row must match exactly.
+    def _cols(row: str) -> int:
+        s = row.strip()
+        if s.startswith("|"):
+            s = s[1:]
+        if s.endswith("|"):
+            s = s[:-1]
+        return len(s.split("|"))
+    expected = _cols(rows[0])
+    if expected < 1:
+        return False
+    return all(_cols(r) == expected for r in rows[1:])
+
+
 def _segments_with_offsets(text: str) -> list[tuple[int, int, str, dict]]:
     """Return [(start, end, type, meta)] sorted by start."""
     segs: list[tuple[int, int, str, dict]] = []
@@ -152,6 +179,9 @@ def _segments_with_offsets(text: str) -> list[tuple[int, int, str, dict]]:
     for m in _PIPE_TABLE_RE.finditer(text):
         # Skip if inside a code segment
         if any(s <= m.start() < e for s, e, t, _ in segs if t == "code"):
+            continue
+        # Wave 2 (review §2.4): column-count consistency check.
+        if not _is_real_markdown_table(m.group(1)):
             continue
         segs.append((m.start(), m.end(), "table", {"format": "markdown"}))
     for m in _HTML_TABLE_RE.finditer(text):
