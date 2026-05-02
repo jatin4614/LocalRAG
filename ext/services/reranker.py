@@ -6,12 +6,29 @@ Strategy:
 """
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from typing import Any, Callable, List, Sequence
 
 from . import flags
 from .obs import span
 from .vector_store import Hit
+
+logger = logging.getLogger(__name__)
+
+
+def _record_silent_failure(stage: str, err: BaseException) -> None:
+    """Mirror chat_rag_bridge._record_silent_failure for reranker-side
+    swallow paths."""
+    try:
+        logger.warning("reranker: %s failed (%s): %r", stage, type(err).__name__, err)
+    except Exception:
+        pass
+    try:
+        from .metrics import RAG_SILENT_FAILURE
+        RAG_SILENT_FAILURE.labels(stage=stage).inc()
+    except Exception:
+        pass
 
 
 FAST_PATH_RATIO = 2.0
@@ -27,7 +44,12 @@ def rerank(hits: List[Hit], *, top_k: int = 10) -> List[Hit]:
 
 def _rerank_impl(hits: List[Hit], *, top_k: int = 10) -> List[Hit]:
     ordered = sorted(hits, key=lambda h: h.score, reverse=True)
-    if len(ordered) >= 2 and ordered[1].score > 0 and (ordered[0].score / ordered[1].score) > FAST_PATH_RATIO:
+    # Wave 2 (review §5.13): the prior guard `ordered[1].score > 0`
+    # SKIPPED the fast path when ordered[1].score == 0 — but that IS the
+    # textbook "top hit dominates" case the fast path was designed for.
+    # Use a small epsilon in the divisor instead so the ratio is well-defined
+    # and the dominate case takes the fast path.
+    if len(ordered) >= 2 and ordered[0].score >= FAST_PATH_RATIO * max(ordered[1].score, 1e-9):
         return ordered[:top_k]
 
     def _kb_key(h: Hit) -> Any:
@@ -86,6 +108,9 @@ def rerank_with_flag(
     try:
         from ext.services.cross_encoder_reranker import rerank_cross_encoder
         return rerank_cross_encoder(query, hits, top_k=top_k)
-    except Exception:
+    except Exception as exc:
         # Fail open: model load or inference failure → legacy path still serves.
+        # Wave 2 (review §5.4): record the swallow so a GPU 1 OOM no
+        # longer registers as silent quality drop.
+        _record_silent_failure("rerank.cross_encoder", exc)
         return fn(hits, top_k=top_k)
