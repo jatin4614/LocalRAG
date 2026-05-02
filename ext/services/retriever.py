@@ -178,6 +178,7 @@ async def retrieve(
     doc_ids: Optional[list[int]] = None,
     temporal_constraint: Optional[dict] = None,
     text_filter: Optional[str] = None,
+    with_vectors: bool = False,
 ) -> List[Hit]:
     """Run parallel searches against each selected KB and an optional chat namespace.
 
@@ -320,6 +321,7 @@ async def retrieve(
                         level=level_filter,
                         shard_keys=shard_keys,
                         text_filter=text_filter,
+                        with_vectors=with_vectors,
                     )
                 return await vector_store.search(
                     collection, qvec, limit=per_kb_limit, subtag_ids=subtag_ids,
@@ -329,6 +331,7 @@ async def retrieve(
                     level=level_filter,
                     shard_keys=shard_keys,
                     text_filter=text_filter,
+                    with_vectors=with_vectors,
                 )
         except Exception as exc:
             # Wave 2 (review §5.3): the previous silent return swallowed
