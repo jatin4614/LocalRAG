@@ -25,7 +25,7 @@ async def test_metrics_endpoint_returns_prom_text():
     # exposition is non-trivial.
     with metrics.time_stage("retrieve"):
         pass
-    metrics.retrieval_hits_total.labels(kb="1", path="dense").inc()
+    metrics.retrieval_hits_total.labels(kb_count="1", kb_primary="1", path="dense").inc()
     metrics.rerank_cache_total.labels(outcome="hit").inc()
     metrics.flag_state.labels(flag="hybrid").set(1)
     metrics.ingest_chunks_total.labels(collection="kb_1", path="sync").inc(3)

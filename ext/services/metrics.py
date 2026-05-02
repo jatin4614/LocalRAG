@@ -12,7 +12,7 @@ for histograms/counters, snake_case labels.
 
 Exported names:
     rag_stage_latency_seconds  — Histogram(stage)
-    rag_retrieval_hits_total   — Counter(kb, path)
+    rag_retrieval_hits_total   — Counter(kb_count, kb_primary, path)
     rag_rerank_cache_total     — Counter(outcome)
     rag_flag_enabled           — Gauge(flag)
     rag_ingest_chunks_total    — Counter(collection, path)
@@ -77,12 +77,18 @@ stage_latency = Histogram(
 )
 
 # Retrieval hit counters.
-# kb label: <kb_id> | "chat" | "eval" | "unknown"
+# kb_count label: number of KBs in the request selection (low cardinality:
+# bounded by the platform's KB count, typically <50). Replaces the legacy
+# ``kb`` label that risked becoming a comma-joined string of selected
+# kb_ids — that encoding had exponential cardinality in N selected KBs
+# and broke Prometheus stability for users with >5 KBs (review §8.6).
+# kb_primary label: a single kb_id (the hit's own kb_id) so operators
+# retain a coarse per-KB view without exploding the label space.
 # path label: "dense" | "hybrid"
 retrieval_hits_total = Counter(
     f"{_NS}_retrieval_hits_total",
-    "Count of retrieval hits by KB and search path",
-    labelnames=("kb", "path"),
+    "Count of retrieval hits by KB selection and search path",
+    labelnames=("kb_count", "kb_primary", "path"),
 )
 
 # Reranker score-cache outcomes.
