@@ -32,6 +32,53 @@ from .celery_app import app
 log = logging.getLogger("orgchat.ingest_worker")
 
 
+# Lazy module-level engine cache. Bug-fix campaign §1.6: prior to this fix,
+# every ``_update_doc_status`` / ``_fetch_kb_rag_config`` call created and
+# disposed a SQLAlchemy engine, costing ~1000 inits on a 1000-doc batch.
+# The first call instantiates a single engine bound to the resolved
+# ``DATABASE_URL``; subsequent calls in the same worker process reuse it.
+# Indirected via ``_create_async_engine`` so tests can monkeypatch the
+# factory without importing sqlalchemy.
+_engine_singleton: object | None = None
+
+
+def _create_async_engine(db_url: str):
+    """Thin wrapper around ``sqlalchemy.ext.asyncio.create_async_engine``.
+
+    Exists as a separate module attribute so tests can monkeypatch the
+    engine factory directly (see ``tests/unit/test_ingest_worker_engine_singleton.py``).
+    """
+    from sqlalchemy.ext.asyncio import create_async_engine as _ce
+    return _ce(db_url, pool_pre_ping=True)
+
+
+def _normalize_db_url() -> str:
+    """Return the DATABASE_URL coerced to the asyncpg dialect, or ``""``."""
+    db_url = os.environ.get("DATABASE_URL", "")
+    if not db_url:
+        return ""
+    if db_url.startswith("postgres://"):
+        db_url = db_url.replace("postgres://", "postgresql+asyncpg://", 1)
+    elif db_url.startswith("postgresql://") and "+asyncpg" not in db_url:
+        db_url = db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    return db_url
+
+
+def _get_engine():
+    """Return the cached async engine, creating it on first call.
+
+    Returns ``None`` when ``DATABASE_URL`` is unset (test or stand-alone mode).
+    """
+    global _engine_singleton
+    if _engine_singleton is not None:
+        return _engine_singleton
+    db_url = _normalize_db_url()
+    if not db_url:
+        return None
+    _engine_singleton = _create_async_engine(db_url)
+    return _engine_singleton
+
+
 async def _update_doc_status(
     doc_id: int | str | None,
     status: str,
@@ -53,31 +100,22 @@ async def _update_doc_status(
     """
     if doc_id is None:
         return
-    db_url = os.environ.get("DATABASE_URL", "")
-    if not db_url:
+    engine = _get_engine()
+    if engine is None:
         return
-    if db_url.startswith("postgres://"):
-        db_url = db_url.replace("postgres://", "postgresql+asyncpg://", 1)
-    elif db_url.startswith("postgresql://") and "+asyncpg" not in db_url:
-        db_url = db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
     try:
         from sqlalchemy import text as _sql
-        from sqlalchemy.ext.asyncio import create_async_engine
-        engine = create_async_engine(db_url, pool_pre_ping=True)
-        try:
-            sets = ["ingest_status = :s"]
-            params: dict[str, object] = {"s": status, "i": int(doc_id)}
-            if chunk_count is not None:
-                sets.append("chunk_count = :c")
-                params["c"] = int(chunk_count)
-            if error_message is not None:
-                sets.append("error_message = :e")
-                params["e"] = error_message
-            sql = f"UPDATE kb_documents SET {', '.join(sets)} WHERE id = :i"
-            async with engine.begin() as conn:
-                await conn.execute(_sql(sql), params)
-        finally:
-            await engine.dispose()
+        sets = ["ingest_status = :s"]
+        params: dict[str, object] = {"s": status, "i": int(doc_id)}
+        if chunk_count is not None:
+            sets.append("chunk_count = :c")
+            params["c"] = int(chunk_count)
+        if error_message is not None:
+            sets.append("error_message = :e")
+            params["e"] = error_message
+        sql = f"UPDATE kb_documents SET {', '.join(sets)} WHERE id = :i"
+        async with engine.begin() as conn:
+            await conn.execute(_sql(sql), params)
     except Exception as e:  # noqa: BLE001 — best-effort
         log.warning(
             "ingest: failed to update kb_documents.ingest_status "
@@ -95,28 +133,19 @@ async def _fetch_kb_rag_config(kb_id: int) -> dict | None:
     payload_base. Returns ``None`` on DB error or when the row is
     absent — caller treats that as "no per-KB override".
     """
-    db_url = os.environ.get("DATABASE_URL", "")
-    if not db_url:
+    engine = _get_engine()
+    if engine is None:
         return None
-    if db_url.startswith("postgres://"):
-        db_url = db_url.replace("postgres://", "postgresql+asyncpg://", 1)
-    elif db_url.startswith("postgresql://") and "+asyncpg" not in db_url:
-        db_url = db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
     from sqlalchemy import text as _sql
-    from sqlalchemy.ext.asyncio import create_async_engine
-    engine = create_async_engine(db_url, pool_pre_ping=True)
-    try:
-        async with engine.begin() as conn:
-            row = (await conn.execute(
-                _sql("SELECT rag_config FROM knowledge_bases WHERE id = :i"),
-                {"i": int(kb_id)},
-            )).first()
-        if row is None:
-            return None
-        cfg = row[0]
-        return dict(cfg) if cfg else None
-    finally:
-        await engine.dispose()
+    async with engine.begin() as conn:
+        row = (await conn.execute(
+            _sql("SELECT rag_config FROM knowledge_bases WHERE id = :i"),
+            {"i": int(kb_id)},
+        )).first()
+    if row is None:
+        return None
+    cfg = row[0]
+    return dict(cfg) if cfg else None
 
 
 def _blob_root() -> str:
