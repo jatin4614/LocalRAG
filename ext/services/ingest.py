@@ -7,6 +7,7 @@ metadata onto every resulting chunk so Qdrant payloads can surface hints like
 """
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import os
@@ -426,53 +427,85 @@ async def ingest_bytes(
         )
 
     texts = [c.text for c, _ in paired]
-    vectors = await embedder.embed(texts)
 
-    # Sparse vectors are only computed when hybrid is on AND the target
-    # collection was created with sparse support. When either condition fails
-    # we produce no sparse vectors and the upsert path takes the legacy
-    # dense-only shape (byte-identical to the pre-hybrid behaviour). We use
-    # getattr with defaults so test doubles / minimal VectorStore substitutes
-    # that don't implement the sparse detection helpers still work.
-    sparse_vectors: list[tuple[list[int], list[float]] | None] = [None] * len(paired)
-    if _hybrid_enabled():
+    # Bug-fix campaign §3.8 — run dense / sparse / colbert embedders
+    # concurrently. The three are independent (each consumes ``texts``;
+    # none reads another's output) so they can interleave. Dense is
+    # async network I/O (TEI HTTP). Sparse and ColBERT are synchronous
+    # ONNX runs — wrapped in ``asyncio.to_thread`` so they don't block
+    # the event loop while dense waits on the network. Net effect on a
+    # large batch: the slowest of the three caps total embed time
+    # instead of the sum (was: dense + sparse + colbert; now: max).
+    #
+    # Each arm's two-gate logic (flag + collection has slot) is
+    # preserved — when a gate is closed, the coroutine resolves to the
+    # ``None``-filled fallback list immediately without touching the
+    # underlying embedder.
+    async def _dense_arm() -> list[list[float]]:
+        return await embedder.embed(texts)
+
+    async def _sparse_arm() -> list[tuple[list[int], list[float]] | None]:
+        # Sparse vectors are only computed when hybrid is on AND the
+        # target collection was created with sparse support. When
+        # either condition fails we produce no sparse vectors and the
+        # upsert path takes the legacy dense-only shape (byte-identical
+        # to the pre-hybrid behaviour). We use getattr with defaults so
+        # test doubles / minimal VectorStore substitutes that don't
+        # implement the sparse detection helpers still work.
+        if not _hybrid_enabled():
+            return [None] * len(paired)
         refresh = getattr(vector_store, "_refresh_sparse_cache", None)
         has_sparse = getattr(vector_store, "_collection_has_sparse", None)
-        if refresh is not None and has_sparse is not None:
-            try:
-                await refresh(collection)
-            except Exception:
-                pass  # fall through — has_sparse below will be False
-            if has_sparse(collection):
-                try:
-                    from .sparse_embedder import embed_sparse
-                    sparse_vectors = list(embed_sparse(texts))  # type: ignore[assignment]
-                except Exception:
-                    # fastembed missing or failed — silently skip sparse arm.
-                    sparse_vectors = [None] * len(paired)
+        if refresh is None or has_sparse is None:
+            return [None] * len(paired)
+        try:
+            await refresh(collection)
+        except Exception:
+            return [None] * len(paired)  # fall through — collection check failed
+        if not has_sparse(collection):
+            return [None] * len(paired)
+        try:
+            from .sparse_embedder import embed_sparse
+            # ONNX run — blocks the event loop in-process. Push to a
+            # thread so dense (network IO) and colbert (also ONNX,
+            # different model) can overlap.
+            return list(await asyncio.to_thread(embed_sparse, texts))  # type: ignore[arg-type]
+        except Exception:
+            # fastembed missing or failed — silently skip sparse arm.
+            return [None] * len(paired)
 
-    # P3.4: ColBERT multi-vectors. Same two-gate pattern as sparse:
-    # ``RAG_COLBERT=1`` AND the target collection was created with the
-    # ``colbert`` named slot. When either is false we leave a list of
-    # Nones and the upsert path skips the colbert arm — leaving dense
-    # (and sparse, if applicable) byte-identical to pre-Task-3.4.
-    # Failures (model missing, fastembed not installed) silently fall
-    # through to dense+sparse only — never block ingest.
-    colbert_vectors: list[list[list[float]] | None] = [None] * len(paired)
-    if _colbert_enabled():
+    async def _colbert_arm() -> list[list[list[float]] | None]:
+        # P3.4: ColBERT multi-vectors. Same two-gate pattern as sparse:
+        # ``RAG_COLBERT=1`` AND the target collection was created with
+        # the ``colbert`` named slot. When either is false we leave a
+        # list of Nones and the upsert path skips the colbert arm —
+        # leaving dense (and sparse, if applicable) byte-identical to
+        # pre-Task-3.4. Failures (model missing, fastembed not
+        # installed) silently fall through to dense+sparse only — never
+        # block ingest.
+        if not _colbert_enabled():
+            return [None] * len(paired)
         refresh_cb = getattr(vector_store, "_refresh_colbert_cache", None)
         has_colbert = getattr(vector_store, "_collection_has_colbert", None)
-        if refresh_cb is not None and has_colbert is not None:
-            try:
-                await refresh_cb(collection)
-            except Exception:
-                pass  # fall through — has_colbert below will be False
-            if has_colbert(collection):
-                try:
-                    from .embedder import colbert_embed
-                    colbert_vectors = list(colbert_embed(texts))  # type: ignore[assignment]
-                except Exception:
-                    colbert_vectors = [None] * len(paired)
+        if refresh_cb is None or has_colbert is None:
+            return [None] * len(paired)
+        try:
+            await refresh_cb(collection)
+        except Exception:
+            return [None] * len(paired)
+        if not has_colbert(collection):
+            return [None] * len(paired)
+        try:
+            from .embedder import colbert_embed
+            # Same to_thread treatment as sparse — colbert_embed runs a
+            # separate ONNX session, also blocking.
+            return list(await asyncio.to_thread(colbert_embed, texts))  # type: ignore[arg-type]
+        except Exception:
+            return [None] * len(paired)
+
+    vectors, sparse_vectors, colbert_vectors = await asyncio.gather(
+        _dense_arm(), _sparse_arm(), _colbert_arm(),
+    )
 
     now = time.time_ns()
     pv = current_version(context_augmented=context_augmented)
