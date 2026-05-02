@@ -22,6 +22,7 @@ from typing import Optional
 
 import httpx
 
+from .llm_telemetry import record_llm_call
 from .obs import inject_context_into_headers, span
 
 log = logging.getLogger("orgchat.doc_summarizer")
@@ -129,10 +130,21 @@ async def _summarize_impl(
 
     url = f"{chat_url.rstrip('/')}/chat/completions"
     try:
-        async with httpx.AsyncClient(timeout=timeout, transport=transport) as client:
-            r = await client.post(url, json=payload, headers=headers)
-            r.raise_for_status()
-            data = r.json()
+        # Wrap in ``record_llm_call`` so the doc-summarizer's prompt /
+        # completion token spend lands in ``rag_tokens_prompt_total`` /
+        # ``rag_tokens_completion_total`` like the contextualizer / hyde /
+        # rewriter call sites. This is the heaviest LLM cost during ingest
+        # — invisibility here was a real dashboard gap (review §6.3).
+        async with record_llm_call(stage="doc_summarizer", model=chat_model) as rec:
+            async with httpx.AsyncClient(timeout=timeout, transport=transport) as client:
+                r = await client.post(url, json=payload, headers=headers)
+                r.raise_for_status()
+                data = r.json()
+            usage = data.get("usage") or {}
+            rec.set_tokens(
+                prompt=usage.get("prompt_tokens", 0),
+                completion=usage.get("completion_tokens", 0),
+            )
         summary = (data["choices"][0]["message"]["content"] or "").strip()
     except Exception as e:  # noqa: BLE001 — fail-open by design
         log.warning("doc summary failed for %s: %s", filename, e)
