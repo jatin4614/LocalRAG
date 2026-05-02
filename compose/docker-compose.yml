@@ -200,6 +200,14 @@ services:
       - "${EMBED_MODEL}"
       - "--port"
       - "80"
+      # Wave 1a (review §3.1): default --max-input-length is 512, which
+      # silently truncates RAPTOR L1+ summaries and per-doc summaries
+      # (often 800-2000 tok of synthesized text) at the embed step.
+      # bge-m3 supports up to 8192. One-line fix; no data migration required,
+      # but to RE-EQUALIZE existing summary embeddings operators must run
+      # scripts/reembed_all.py against the affected docs.
+      - "--max-input-length"
+      - "8192"
     volumes:
       - ../volumes/models:/data
     environment:
