@@ -9,6 +9,7 @@ import contextvars
 import json as _json
 import logging
 import os as _os
+import threading
 import time
 from typing import Any, Awaitable, Callable, List, Mapping, Optional
 
@@ -170,40 +171,53 @@ def _hash_short(s: str) -> str:
 # Lazily-initialized singleton — first call opens the redis connection,
 # subsequent calls return the same handle. Reset to None in tests via
 # ``monkeypatch.setattr(bridge, "_qu_cache_singleton", None)``.
+#
+# §7.5: ``_QU_CACHE_LOCK`` guards the read+create against two concurrent
+# first-callers each building (and leaking) their own client. Mirrors the
+# double-checked-locking pattern in
+# ``ext/services/cross_encoder_reranker.py:80-82``.
 _qu_cache_singleton = None
+_QU_CACHE_LOCK = threading.Lock()
 
 
 def _get_qu_cache():
     """Return the process-wide :class:`QUCache` singleton, or ``None`` if
     the cache is disabled (``RAG_QU_CACHE_ENABLED=0``) or redis cannot be
     reached. Soft-fails so the bridge never raises on cache infra issues.
+
+    Thread-safe singleton init under ``_QU_CACHE_LOCK`` (§7.5).
     """
     global _qu_cache_singleton
     if _qu_cache_singleton is not None:
         return _qu_cache_singleton
     if _os.environ.get("RAG_QU_CACHE_ENABLED", "1") != "1":
         return None
-    try:
-        import redis.asyncio as _redis
+    with _QU_CACHE_LOCK:
+        # Re-check inside the lock — another caller may have raced past the
+        # first None-check and finished the init while we were blocked.
+        if _qu_cache_singleton is not None:
+            return _qu_cache_singleton
+        try:
+            import redis.asyncio as _redis
 
-        from .qu_cache import QUCache
+            from .qu_cache import QUCache
 
-        url = _os.environ.get("REDIS_URL", "redis://redis:6379")
-        # Strip any /<db> suffix so we can override with the dedicated DB
-        if "/" in url.rsplit("@", 1)[-1].split("//", 1)[-1]:
-            base = url.rsplit("/", 1)[0]
-        else:
-            base = url
-        db = int(_os.environ.get("RAG_QU_REDIS_DB", "4"))
-        client = _redis.from_url(f"{base}/{db}", decode_responses=True)
-        _qu_cache_singleton = QUCache(redis_client=client)
-        return _qu_cache_singleton
-    except Exception as e:
-        # B6: keep the existing operator-facing warning AND emit the silent-
-        # failure counter so QU-cache outages can be alerted on.
-        logger.warning("QU cache init failed: %s — running without cache", e)
-        _record_silent_failure("qu_cache_init", e)
-        return None
+            url = _os.environ.get("REDIS_URL", "redis://redis:6379")
+            # Strip any /<db> suffix so we can override with the dedicated DB
+            if "/" in url.rsplit("@", 1)[-1].split("//", 1)[-1]:
+                base = url.rsplit("/", 1)[0]
+            else:
+                base = url
+            db = int(_os.environ.get("RAG_QU_REDIS_DB", "4"))
+            client = _redis.from_url(f"{base}/{db}", decode_responses=True)
+            _qu_cache_singleton = QUCache(redis_client=client)
+            return _qu_cache_singleton
+        except Exception as e:
+            # B6: keep the existing operator-facing warning AND emit the silent-
+            # failure counter so QU-cache outages can be alerted on.
+            logger.warning("QU cache init failed: %s — running without cache", e)
+            _record_silent_failure("qu_cache_init", e)
+            return None
 
 
 async def _classify_with_qu(
@@ -394,7 +408,11 @@ _sessionmaker = None
 # Phase 1.5 — process-wide redis handle for the RBAC cache. Lazy-init via
 # _redis_client() so unit tests that never touch RBAC don't pay the cost
 # of opening a connection to a redis that isn't running.
+#
+# §7.5: ``_RBAC_REDIS_LOCK`` guards the read+create against two concurrent
+# first-callers each building (and leaking) their own client.
 _rbac_redis = None
+_RBAC_REDIS_LOCK = threading.Lock()
 
 
 def _redis_client():
@@ -404,15 +422,23 @@ def _redis_client():
     (default ``redis://localhost:6379/3`` so it's isolated from the
     application redis on DB 0). Subsequent calls return the same
     handle.
+
+    Thread-safe singleton init under ``_RBAC_REDIS_LOCK`` (§7.5).
     """
     global _rbac_redis
-    if _rbac_redis is None:
+    if _rbac_redis is not None:
+        return _rbac_redis
+    with _RBAC_REDIS_LOCK:
+        # Re-check inside the lock — another caller may have raced past the
+        # first None-check and finished the init while we were blocked.
+        if _rbac_redis is not None:
+            return _rbac_redis
         import redis.asyncio as _redis
         url = _os.environ.get(
             "RAG_RBAC_CACHE_REDIS_URL", "redis://localhost:6379/3"
         )
         _rbac_redis = _redis.from_url(url)
-    return _rbac_redis
+        return _rbac_redis
 
 
 _CONFIGURED: bool = False
