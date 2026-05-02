@@ -27,7 +27,15 @@ T = TypeVar("T")
 
 
 def is_transient(exc: BaseException) -> bool:
-    """True if retrying the call may succeed."""
+    """True if retrying the call may succeed.
+
+    Retriable: connection-level errors, 5xx server errors, and HTTP 429
+    (Too Many Requests). 429 was added per review §3.4 — vLLM and TEI both
+    emit it under load, and treating it as permanent caused user-visible
+    failures the moment a single concurrent burst clipped the rate limit.
+    All other 4xx codes remain non-transient (a 400 / 401 / 403 / 404 won't
+    fix itself by waiting and retrying just amplifies pressure).
+    """
     if isinstance(
         exc,
         (
@@ -39,7 +47,10 @@ def is_transient(exc: BaseException) -> bool:
     ):
         return True
     if isinstance(exc, httpx.HTTPStatusError):
-        return 500 <= exc.response.status_code < 600
+        status = exc.response.status_code
+        if status == 429:
+            return True
+        return 500 <= status < 600
     return False
 
 
