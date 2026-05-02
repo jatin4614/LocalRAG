@@ -34,6 +34,36 @@ groups:
       # We compare a tight 15-minute current rate against a wider 6-hour
       # rate offset 1d (= 1 day ago) so the baseline isn't whip-sawed by
       # short-lived noise. 30-minute `for:` to dampen single bad batches.
+      # Wave 2 (review §8.7): daily nDCG cron staleness alert is BLOCKED.
+      #
+      # The cron at scripts/daily_eval_cron.sh writes to
+      #   /var/lib/node_exporter/textfile_collector/retrieval_daily.prom
+      # but the orgchat-obs-node-exporter container is NOT started with
+      #   --collector.textfile.directory=...
+      # so node_textfile_mtime_seconds is never emitted and the staleness
+      # query (`time() - node_textfile_mtime_seconds{file=~".*daily_eval.*"} > 26*3600`)
+      # would be vacuous (no series → no alert ever fires).
+      #
+      # TODO: enable the textfile collector on node-exporter
+      #   1. Bind-mount /var/lib/node_exporter/textfile_collector into
+      #      orgchat-obs-node-exporter (e.g. as a volume in
+      #      observability/docker-compose.yml).
+      #   2. Add `--collector.textfile.directory=/var/lib/node_exporter/textfile_collector`
+      #      to that service's command list.
+      #   3. THEN add the alert rule below — keep the labeled trigger
+      #      identical so dashboards stay stable across cutover:
+      #
+      # - alert: DailyEvalStale
+      #   expr: time() - node_textfile_mtime_seconds{file=~".*daily_eval.*"} > 26 * 3600
+      #   for: 1h
+      #   labels: {severity: warning, component: rag}
+      #   annotations:
+      #     summary: "daily_eval_cron has not written results in >26h"
+      #     description: |
+      #       The daily nDCG cron writes a textfile that node-exporter
+      #       picks up. >26h staleness means the cron is broken or the
+      #       collector isn't reading the directory.
+
       - alert: RagSilentFailureRamp
         expr: |
           rate(rag_silent_failure_total[15m])
