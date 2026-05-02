@@ -163,6 +163,18 @@ Every behavior change ships behind a flag, default OFF for first deploy. Soak 7 
 
 (Updated as commits land. Newest first.)
 
+- 2026-05-02 `04cd57b` — Round 2 H §9.7+§9.10: .pre-commit-config.yaml (ruff + gitleaks + standard hygiene).
+- 2026-05-02 `a6f303f` — Round 2 H §9.6: targeted mypy stub overrides + flip ignore_missing_imports=false.
+- 2026-05-02 `f302327` — Round 2 H §9.5: xfail-quarantine 2 pre-existing reds + tests/README update.
+- 2026-05-02 `b3951ea` — Round 2 D §7.4: configure() idempotent guard.
+- 2026-05-02 `1e305b4` — Round 2 D §5.16: QU retry uses full timeout (RAG_QU_RETRY_TIMEOUT_MS override).
+- 2026-05-02 `7d1a47a` — Round 2 D §5.14: partition empty-text hits (preserve at score 0).
+- 2026-05-02 `bbf416b` — Round 2 D §5.4 + §5.13: silent-failure on rerank fallback + repaired fast-path divzero guard.
+- 2026-05-02 `f8a6046` — Round 2 D §5.3: silent-failure on retriever per-KB exception.
+- 2026-05-02 `616bf47` — Round 2 C §3.10: np.ndarray.tolist() in colbert_embed.
+- 2026-05-02 `093bd3b` — Round 2 F §8.5: tokenizer-fallback alert rule.
+- 2026-05-02 `ab4d3b9` — Round 2 F §8.2: load alerts-celery.yml in prometheus rule_files.
+- 2026-05-02 `7f6c47f` — Round 1 → main cherry-picks tracker update + tag `rollback-post-batch1`.
 - 2026-05-02 `3ae1f42` — Agent H §9.2: clarify isolation-suite count in CLAUDE.md (cherry-picked from worktree).
 - 2026-05-02 `007bad8` — Agent H §9.1: GH Actions ci.yml — lint + unit matrix + isolation gate (cherry-picked).
 - 2026-05-02 `1f8a51a` — Agent H §9.3: flip integration tests default-on (cherry-picked).
