@@ -14,6 +14,7 @@ from .config import clear_settings_cache, get_settings
 from .db.session import make_engine, make_sessionmaker
 from .routers import ingest_stream, kb_admin, kb_retrieval, rag, rag_stream, upload
 from .services.budget import preflight_tokenizer
+from .services.chat_model_preflight import preflight_chat_model
 from .services.embedder import TEIEmbedder
 from .services.logging_setup import configure_json_logging
 from .services.obs import init_observability
@@ -117,6 +118,23 @@ def build_app() -> FastAPI:
     # misconfigured deploy fails loudly at startup, not on first chat.
     preflight_tokenizer()
 
+    # Bug-fix campaign §6.7 — chat-model preflight. Validates that
+    # CHAT_MODEL is in the chat endpoint's /v1/models response, bumping
+    # ``chat_model_mismatch_total`` + WARNING on miss. Does NOT crash:
+    # operators may use transparent aliases on the endpoint, and
+    # vllm-chat can take ~60s to come up so a hard fail would deadlock
+    # the open-webui boot. Surfaces real misconfigs (e.g. .env rolled
+    # back without redeploying vllm-chat) on the metrics dashboard.
+    try:
+        preflight_chat_model()
+    except Exception as exc:  # noqa: BLE001 — pure best-effort
+        _logger.warning(
+            "chat-model preflight raised unexpectedly (%s: %s) — "
+            "continuing startup. This is a soft check; chat will still "
+            "work if the endpoint is up.",
+            type(exc).__name__, exc,
+        )
+
     # Phase 1.2 — reranker preload. Loading on first request blocks that
     # request for ~3-5s on GPU cold start. Preloading at app init shifts
     # the cost to startup time and surfaces load failures before user
@@ -198,6 +216,17 @@ def build_ext_routers():
     # explicit non-cl100k HF alias can't load, raise here so the upstream
     # process exits at import time instead of silently drifting budgets.
     preflight_tokenizer()
+
+    # Bug-fix campaign §6.7 — chat-model preflight (mirrors build_app).
+    # Soft-fail with a metrics counter + WARNING on mismatch so operators
+    # can spot a stale CHAT_MODEL env without breaking upstream startup.
+    try:
+        preflight_chat_model()
+    except Exception as exc:  # noqa: BLE001 — pure best-effort
+        _logger.warning(
+            "chat-model preflight raised unexpectedly (%s: %s) — continuing.",
+            type(exc).__name__, exc,
+        )
 
     # Phase 1.2 — reranker preload (mirrors build_app). Surface model load
     # failures at upstream startup, not on first user query. Non-fatal:
