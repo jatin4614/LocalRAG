@@ -361,6 +361,26 @@ def resolve_intent_flags(
     return merged
 
 
+def _debug_query_extras(query: Optional[str], hits_detail: Optional[list]) -> dict:
+    """Wave 2 (review §8.9): build the optional ``query_text`` + ``chunks_summary``
+    extras passed via ``logger.info(..., extra={...})`` when ``RAG_LOG_QUERY_TEXT=1``.
+    PII-sensitive — see ``_log_rag_query`` docstring + RAG_LOG_QUERY_TEXT comment.
+    """
+    out: dict = {}
+    if query:
+        out["query_text"] = str(query)[:1024]
+    if hits_detail:
+        out["chunks_summary"] = [
+            {
+                "chunk_id": getattr(h, "id", None),
+                "score": float(getattr(h, "score", 0.0) or 0.0),
+                "filename": str((getattr(h, "payload", {}) or {}).get("filename", "")),
+            }
+            for h in list(hits_detail)[:3]
+        ]
+    return out
+
+
 def _log_rag_query(
     *,
     req_id: str,
@@ -368,12 +388,21 @@ def _log_rag_query(
     kbs: list,
     hits: int,
     total_ms: int,
+    query: Optional[str] = None,
+    hits_detail: Optional[list] = None,
 ) -> None:
     """Emit one ``event=rag_query`` JSON log line.
 
     Fail-open: any exception inside ``json.dumps`` / the logger call is
     swallowed because this is a telemetry side-effect — the retrieval
     pipeline must not fail because the log record could not be built.
+
+    Wave 2 (review §8.9): when ``RAG_LOG_QUERY_TEXT=1`` (default 0,
+    PII-sensitive), the logger receives ``query_text`` (truncated to 1 KB)
+    and a ``chunks_summary`` (top-3 ``{chunk_id, score, filename}``) via
+    ``extra={...}`` so the JSON formatter lifts them into the structured
+    payload. The base JSON message is unchanged so existing dashboards
+    keep working.
     """
     try:
         payload = {
@@ -384,7 +413,10 @@ def _log_rag_query(
             "hits": int(hits),
             "total_ms": int(total_ms),
         }
-        logger.info(_json.dumps(payload, separators=(",", ":")))
+        extra = _debug_query_extras(query, hits_detail) if _os.environ.get(
+            "RAG_LOG_QUERY_TEXT", "0"
+        ) == "1" else {}
+        logger.info(_json.dumps(payload, separators=(",", ":")), extra=extra)
     except Exception as _err:
         # B6: telemetry side-effect — must not fail the pipeline. Surface
         # the swallow via warning + counter so a broken json.dumps shape
@@ -1737,6 +1769,8 @@ async def _run_pipeline(
             kbs=_kb_ids_for_log,
             hits=0,
             total_ms=_total_ms_empty,
+            query=query,
+            hits_detail=reranked,
         )
         return []
 
@@ -2136,6 +2170,8 @@ async def _run_pipeline(
         kbs=_kb_ids_for_log,
         hits=len(sources_out),
         total_ms=_total_ms_done,
+        query=query,
+        hits_detail=budgeted,
     )
     # Wave 2 (review §8.3): increment empty-retrieval counter when no real
     # hits came back (preambles excluded — see _real_hits_count above).
