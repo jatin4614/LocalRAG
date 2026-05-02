@@ -35,6 +35,7 @@ from typing import Any, Iterable, Optional
 import httpx
 
 from .llm_telemetry import record_llm_call
+from .obs import inject_context_into_headers
 from .retry_policy import with_transient_retry
 
 
@@ -245,6 +246,9 @@ async def contextualize_chunk(
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+    # §7.6 — propagate OTel trace context to chat-LLM so distributed traces
+    # span the contextualizer → vllm-chat boundary.
+    headers = inject_context_into_headers(headers)
 
     url = f"{chat_url.rstrip('/')}/chat/completions"
     try:
@@ -359,6 +363,8 @@ async def _chat_call(
         api_key = os.environ.get("OPENAI_API_KEY")
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+    # §7.6 — propagate OTel trace context to chat-LLM.
+    headers = inject_context_into_headers(headers)
     url = f"{resolved_url.rstrip('/')}/chat/completions"
     data = await _contextualize_call(url, body, headers, timeout_s, transport)
     return data["choices"][0]["message"]["content"] or ""
