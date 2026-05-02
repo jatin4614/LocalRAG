@@ -148,6 +148,24 @@ llm_tpot_seconds = Histogram(
     buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5),
 )
 
+# SSE event-spacing histogram (review §6.5). The RAG SSE stream emits
+# pipeline progress events ("retrieve", "rerank", "mmr", ...). The
+# spacing between two consecutive events is a UX measure of how
+# evenly the pipeline produces output, NOT a per-LLM-token latency.
+# Originally this was being observed into ``llm_tpot_seconds`` which
+# polluted the LLM TPOT dashboard with non-LLM data. This metric is
+# the dedicated home for SSE event spacing so the LLM TPOT histogram
+# stays pure (only actual streaming-LLM observations, currently fed
+# from records that thread ``set_first_token_at`` through a real
+# streaming chat call).
+sse_event_interval_seconds = Histogram(
+    f"{_NS}_sse_event_interval_seconds",
+    "Wall-clock spacing between consecutive SSE retrieval-pipeline "
+    "events. NOT an LLM-token metric — see comments above llm_tpot_seconds.",
+    labelnames=("model",),
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0),
+)
+
 # RBAC denials (403). Label by route so dashboards can attribute which
 # endpoint is rejecting access (e.g. /api/rag/retrieve vs KB admin).
 rbac_denied_total = Counter(
