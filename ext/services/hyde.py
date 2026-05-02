@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 from typing import Optional
 
@@ -226,6 +227,16 @@ async def hyde_embed(
     dim = len(vecs[0])
     n_vecs = len(vecs)
     avg = [sum(v[i] for v in vecs) / n_vecs for i in range(dim)]
+    # Review §3.7: TEI returns unit vectors and Qdrant cosine assumes
+    # unit-norm queries. The mean of N unit vectors has magnitude ≤ 1 and
+    # equals 1 only when all inputs point in the same direction — so the
+    # raw average silently miscalibrates score thresholds. Renormalize so
+    # downstream distance scoring stays consistent with the rest of the
+    # query path. Guard against the degenerate zero-norm case (opposing
+    # vectors that exactly cancel) — div-by-zero would crash retrieval.
+    norm = math.sqrt(sum(x * x for x in avg))
+    if norm > 0.0:
+        avg = [x / norm for x in avg]
     return avg
 
 

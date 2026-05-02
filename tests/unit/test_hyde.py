@@ -10,6 +10,8 @@ assert exact mean-pooling math.
 """
 from __future__ import annotations
 
+import math
+
 import httpx
 import pytest
 
@@ -20,6 +22,15 @@ from ext.services.hyde import (
     hyde_embed,
     is_enabled,
 )
+
+
+def _norm(v: list[float]) -> float:
+    return math.sqrt(sum(x * x for x in v))
+
+
+def _normalize(v: list[float]) -> list[float]:
+    n = _norm(v) or 1.0
+    return [x / n for x in v]
 
 
 CHAT_URL = "http://fake-vllm:8000/v1"
@@ -319,7 +330,13 @@ async def test_generate_n_negative_returns_empty():
 # ---------------------------------------------------------------------------
 
 async def test_hyde_embed_averages_excerpt_and_query():
-    """One excerpt + raw query → component-wise mean of the two vectors."""
+    """One excerpt + raw query → unit-normalized component-wise mean.
+
+    Per review §3.7 the averaged vector is renormalized to unit norm
+    before return — Qdrant's cosine distance assumes unit-norm queries
+    (TEI returns unit vectors), so the sum-of-unit-vectors mean must be
+    rescaled or distance scoring is silently miscalibrated.
+    """
 
     def handler(req: httpx.Request) -> httpx.Response:
         return _chat_response("the excerpt text")
@@ -338,8 +355,10 @@ async def test_hyde_embed_averages_excerpt_and_query():
         include_raw_query=True,
         transport=_make_transport(handler),
     )
-    # Expected: mean of ([1,2,3,4], [0,0,5,8]) = [0.5, 1.0, 4.0, 6.0]
-    assert avg == [0.5, 1.0, 4.0, 6.0]
+    # mean = [0.5, 1.0, 4.0, 6.0]; normalized → unit vector with same direction.
+    expected = _normalize([0.5, 1.0, 4.0, 6.0])
+    assert avg == pytest.approx(expected)
+    assert _norm(avg) == pytest.approx(1.0)
     # Single batch embed call.
     assert len(embedder.calls) == 1
     # Order is [excerpts..., raw_query]
@@ -347,7 +366,7 @@ async def test_hyde_embed_averages_excerpt_and_query():
 
 
 async def test_hyde_embed_without_raw_query():
-    """include_raw_query=False → average only the excerpts."""
+    """include_raw_query=False → average only the excerpts (unit-normalized)."""
 
     call = {"n": 0}
 
@@ -369,8 +388,10 @@ async def test_hyde_embed_without_raw_query():
         include_raw_query=False,
         transport=_make_transport(handler),
     )
-    # Mean of [1,1,1] and [3,3,3] → [2,2,2]. No raw-query vector involved.
-    assert avg == [2.0, 2.0, 2.0]
+    # Mean of [1,1,1] and [3,3,3] → [2,2,2]; normalize → 1/sqrt(3) each.
+    expected = _normalize([2.0, 2.0, 2.0])
+    assert avg == pytest.approx(expected)
+    assert _norm(avg) == pytest.approx(1.0)
     assert embedder.calls[0] == ["excerpt-1", "excerpt-2"]
 
 
@@ -420,8 +441,10 @@ async def test_hyde_embed_partial_success_still_averages():
         include_raw_query=True,
         transport=_make_transport(handler),
     )
-    # 1 excerpt + raw query → mean([2,4], [0,0]) = [1.0, 2.0]
-    assert avg == [1.0, 2.0]
+    # 1 excerpt + raw query → mean([2,4], [0,0]) = [1.0, 2.0]; unit-norm.
+    expected = _normalize([1.0, 2.0])
+    assert avg == pytest.approx(expected)
+    assert _norm(avg) == pytest.approx(1.0)
 
 
 async def test_hyde_embed_n_equal_three_averages_all():
@@ -452,11 +475,72 @@ async def test_hyde_embed_n_equal_three_averages_all():
         transport=_make_transport(handler),
     )
     # Set comparison to tolerate handler-call ordering in asyncio.gather —
-    # we assert the SUM of the 4 vectors was [2, 2] → mean [0.5, 0.5].
+    # we assert the SUM of the 4 vectors was [2, 2] → mean [0.5, 0.5];
+    # post §3.7 normalization → [1/sqrt(2), 1/sqrt(2)] (unit norm).
     assert avg is not None
     assert len(avg) == 2
-    assert avg[0] == pytest.approx(0.5)
-    assert avg[1] == pytest.approx(0.5)
+    assert avg[0] == pytest.approx(1 / math.sqrt(2))
+    assert avg[1] == pytest.approx(1 / math.sqrt(2))
+    assert _norm(avg) == pytest.approx(1.0)
+
+
+async def test_hyde_embed_unit_inputs_produce_unit_output():
+    """Sanity check (§3.7): mean of unit vectors is renormalized to unit.
+
+    TEI returns unit-norm embeddings. The pre-fix average produced a
+    sub-unit vector whose direction was correct but whose magnitude
+    biased Qdrant's cosine-distance scoring. Post-fix, every output is
+    unit-norm regardless of input magnitudes.
+    """
+    # Two orthogonal unit vectors → mean magnitude is 1/sqrt(2),
+    # post-normalization it should be exactly 1.
+    a = [1.0, 0.0, 0.0]
+    b = [0.0, 1.0, 0.0]
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _chat_response("excerpt-a")
+
+    embedder = _FixedEmbedder({"excerpt-a": a, "q": b})
+    avg = await hyde_embed(
+        "q",
+        embedder,
+        n=1,
+        chat_url=CHAT_URL,
+        chat_model=CHAT_MODEL,
+        include_raw_query=True,
+        transport=_make_transport(handler),
+    )
+    assert avg is not None
+    assert _norm(avg) == pytest.approx(1.0)
+
+
+async def test_hyde_embed_zero_average_falls_back_to_input():
+    """Edge case (§3.7): if the averaged vector is exactly zero (e.g. two
+    inputs that cancel), normalization would divide by zero. The fix
+    must guard against this without crashing — returning the unscaled
+    average is acceptable since downstream cosine treats it as undefined
+    direction; what is NOT acceptable is a divide-by-zero exception."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _chat_response("opposite excerpt")
+
+    embedder = _FixedEmbedder({
+        "opposite excerpt": [1.0, 0.0, 0.0],
+        "q": [-1.0, 0.0, 0.0],
+    })
+
+    avg = await hyde_embed(
+        "q",
+        embedder,
+        n=1,
+        chat_url=CHAT_URL,
+        chat_model=CHAT_MODEL,
+        include_raw_query=True,
+        transport=_make_transport(handler),
+    )
+    # Doesn't crash; result is a finite vector (or all zeros).
+    assert avg is not None
+    assert all(math.isfinite(x) for x in avg)
 
 
 # ---------------------------------------------------------------------------
