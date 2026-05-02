@@ -268,22 +268,49 @@ def preflight_tokenizer() -> None:
     _module_logger.info(msg)
 
 
-def budget_chunks(hits: List[Hit], *, max_tokens: int = 4000) -> List[Hit]:
-    """Assumes hits is pre-sorted best-first. Returns longest prefix that fits."""
-    with span("budget.truncate", input_size=len(hits), max_tokens=max_tokens) as _sp:
+def budget_chunks(
+    hits: List[Hit],
+    *,
+    max_tokens: int = 4000,
+    reserved_tokens: int = 0,
+) -> List[Hit]:
+    """Assumes hits is pre-sorted best-first. Returns longest prefix that fits.
+
+    Wave 2 round 4 (review §5.2): when ``RAG_BUDGET_INCLUDES_PROMPT=1`` the
+    caller can pass ``reserved_tokens`` covering the system prompt + catalog
+    preamble + datetime preamble + spotlight wrap overhead. The effective
+    chunk budget then becomes ``max(0, max_tokens - reserved_tokens)`` so
+    chunks no longer get evicted by the LLM context overflow caused by
+    untracked prompt parts.
+
+    Default OFF — when the env flag is unset / ``"0"``, ``reserved_tokens``
+    is ignored and behaviour is byte-identical to the pre-§5.2 contract.
+    Existing callers that don't pass the kwarg are unaffected.
+    """
+    flag_on = os.environ.get("RAG_BUDGET_INCLUDES_PROMPT", "0") == "1"
+    effective_max = max_tokens
+    if flag_on and reserved_tokens > 0:
+        effective_max = max(0, max_tokens - reserved_tokens)
+    with span(
+        "budget.truncate",
+        input_size=len(hits),
+        max_tokens=max_tokens,
+        reserved_tokens=reserved_tokens if flag_on else 0,
+        effective_max=effective_max,
+    ) as _sp:
         kept: list[Hit] = []
         total = 0
         dropped = 0
         for h in hits:
             t = _count_tokens(str(h.payload.get("text", "")))
-            if total + t > max_tokens:
+            if total + t > effective_max:
                 dropped += 1
                 continue
             total += t
             kept.append(h)
         if dropped:
             logger.debug("budget dropped %d of %d chunks (used %d/%d tokens)",
-                         dropped, len(hits), total, max_tokens)
+                         dropped, len(hits), total, effective_max)
         try:
             _sp.set_attribute("output_size", len(kept))
             _sp.set_attribute("tokens_used", total)
