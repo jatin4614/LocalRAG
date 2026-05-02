@@ -64,10 +64,15 @@ RUN mkdir -p /opt/tiktoken-cache && \
 # huggingface/token)`` enables the download even when the host has the
 # rate-limit gate up. Without it, fastembed downloads anonymously which
 # works for these public models.
+# Wave 2 (review §10.7): prefer BuildKit secret over ARG so the token
+# never lands in image layers. Falls back to ARG=`` when the secret
+# isn't mounted (anonymous download still works for these public models).
+# Build with: DOCKER_BUILDKIT=1 docker build --secret id=hf_token,src=$HOME/.cache/huggingface/token ...
 ARG HF_TOKEN=
 ENV FASTEMBED_CACHE_PATH=/opt/fastembed_cache
-RUN mkdir -p /opt/fastembed_cache && \
-    HF_TOKEN="${HF_TOKEN}" python -c "\
+RUN --mount=type=secret,id=hf_token,required=false,target=/run/secrets/hf_token \
+    mkdir -p /opt/fastembed_cache && \
+    HF_TOKEN="$(cat /run/secrets/hf_token 2>/dev/null || echo "${HF_TOKEN}")" python -c "\
 from fastembed import LateInteractionTextEmbedding, SparseTextEmbedding;\
 LateInteractionTextEmbedding(model_name='colbert-ir/colbertv2.0', cache_dir='/opt/fastembed_cache');\
 SparseTextEmbedding(model_name='Qdrant/bm25', cache_dir='/opt/fastembed_cache');\
