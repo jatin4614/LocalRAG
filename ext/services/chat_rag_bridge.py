@@ -591,6 +591,61 @@ async def _lookup_doc_ids_by_date(
         return []
 
 
+# Wave 2 round 4 (review §5.2) — cached system-prompt token count for the
+# RAG_BUDGET_INCLUDES_PROMPT estimator. Loaded lazily on first call so the
+# tokenizer doesn't get touched at import time. ``None`` means "tried and
+# failed" — fall back to the static estimate.
+_SYSTEM_PROMPT_TOKEN_CACHE: Optional[int] = None
+
+
+def _system_prompt_tokens() -> int:
+    """Return the token count of the analyst system prompt (cached).
+
+    Reads ``scripts/system_prompt_analyst.txt`` (the canonical source that
+    ``apply_analyst_config.py`` writes into the chat config) and tokenizes
+    it with the budget tokenizer. Falls back to a calibrated 1500-token
+    estimate if the file is missing or the tokenizer load failed — this
+    matches the production prompt's typical size when measured with the
+    gemma-4 tokenizer.
+    """
+    global _SYSTEM_PROMPT_TOKEN_CACHE
+    if _SYSTEM_PROMPT_TOKEN_CACHE is not None:
+        return _SYSTEM_PROMPT_TOKEN_CACHE
+    try:
+        from pathlib import Path
+        from .budget import _count_tokens
+        # ext/services/chat_rag_bridge.py → repo root → scripts/
+        _path = Path(__file__).resolve().parents[2] / "scripts" / "system_prompt_analyst.txt"
+        if _path.is_file():
+            text = _path.read_text(encoding="utf-8")
+            _SYSTEM_PROMPT_TOKEN_CACHE = _count_tokens(text)
+            return _SYSTEM_PROMPT_TOKEN_CACHE
+    except Exception:
+        # Tokenizer or filesystem failure — fall through to the static estimate.
+        pass
+    _SYSTEM_PROMPT_TOKEN_CACHE = 1500  # measured baseline for the analyst prompt
+    return _SYSTEM_PROMPT_TOKEN_CACHE
+
+
+def _estimate_reserved_tokens(*, n_hits: int, intent: str) -> int:
+    """Return total non-chunk tokens the budget should pre-deduct.
+
+    Composition:
+      * system prompt — measured (cached) via ``_system_prompt_tokens``
+      * KB catalog preamble — 800 tokens worst-case (50-doc cap, ~10-15
+        tokens per filename + ~120-token header). Catalog is added for
+        every intent so we always include it.
+      * Datetime preamble — 40 tokens (RAG_INJECT_DATETIME default-on)
+      * Spotlight wrap — 30 tokens per hit (open + close + sanitize markers).
+
+    intent is currently informational only — every code path adds catalog
+    and datetime. Kept as a parameter so a future intent (e.g. an ablation
+    that drops the catalog) can shrink the reserve without a signature break.
+    """
+    _ = intent  # reserved for future intent-conditional adjustments
+    return _system_prompt_tokens() + 800 + 40 + (30 * max(0, int(n_hits)))
+
+
 async def _emit(cb: Optional[Callable[[dict], Awaitable[None]]], event: dict) -> None:
     """Call the progress callback, swallowing any errors so a broken SSE
     client never breaks retrieval. No-op when cb is None."""
@@ -1714,12 +1769,48 @@ async def _run_pipeline(
                 if _intent == "global"
                 else int(flags.get("RAG_BUDGET_TOKENS", "10000") or "10000")
             )
+            # Wave 2 round 4 (review §5.2) — pre-deduct non-chunk prompt parts
+            # so the chunk budget no longer overflows the LLM context. Default
+            # OFF (env unset / 0) keeps the legacy behaviour. When ON, we
+            # estimate reserved_tokens as
+            #   system_prompt + catalog_preamble + datetime_preamble + (~30 * len(hits))
+            # The catalog/datetime preambles aren't generated yet (they come
+            # after this stage), so we use static estimates calibrated against
+            # production payload sizes:
+            #   * KB Catalog: ~120 tokens header + ~10 tokens per filename
+            #     listed; 50-doc cap → ~620 tokens worst-case. Default 800.
+            #   * Datetime preamble: ~40 tokens.
+            #   * System prompt: tokenize ext.static.system_prompt_analyst.txt
+            #     (or its production location) once and cache.
+            #   * Spotlight wrap overhead: ~30 tokens per chunk
+            #     (open + close + sanitize markers).
+            _reserved = 0
+            if flags.get("RAG_BUDGET_INCLUDES_PROMPT", "0") == "1":
+                try:
+                    _reserved = _estimate_reserved_tokens(
+                        n_hits=len(reranked),
+                        intent=_intent,
+                    )
+                except Exception as _re:
+                    _record_silent_failure("budget.reserve_estimate", _re)
+                    _reserved = 0
             with span(
                 "rag.budget",
                 max_tokens=_budget_max,
                 chunks_in=len(reranked),
+                reserved_tokens=_reserved,
             ) as _budget_sp, time_stage("budget"):
-                budgeted = budget_chunks(reranked, max_tokens=_budget_max)
+                # Only pass ``reserved_tokens`` when the flag is on so test
+                # stubs that don't accept the kwarg (and the legacy
+                # signature) keep working byte-identically.
+                if _reserved > 0:
+                    budgeted = budget_chunks(
+                        reranked,
+                        max_tokens=_budget_max,
+                        reserved_tokens=_reserved,
+                    )
+                else:
+                    budgeted = budget_chunks(reranked, max_tokens=_budget_max)
                 try:
                     _budget_sp.set_attribute("chunks_kept", len(budgeted))
                     _kept_total_tokens = sum(
