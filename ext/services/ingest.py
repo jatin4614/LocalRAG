@@ -898,7 +898,12 @@ async def _emit_doc_summary_point(
     [summary_vec] = await embedder.embed([summary])
 
     summary_payload: dict = dict(payload_base)
-    summary_payload["chunk_index"] = -1
+    # Wave 2 (review §2.8): doc-summary points have no logical "chunk_index"
+    # in the source — the legacy -1 magic value conflicted with `WHERE
+    # chunk_index >= 0` filters. The level="doc" + kind="doc_summary" fields
+    # below are the canonical discriminator. Setting None instead of -1.
+    # D-1's RRF dedup fix (commit 5b7ce80) handles None correctly.
+    summary_payload["chunk_index"] = None
     summary_payload["text"] = summary
     summary_payload["uploaded_at"] = now_ns
     summary_payload["deleted"] = False
