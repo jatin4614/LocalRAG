@@ -565,3 +565,17 @@ rag_retrieval_empty_total = Counter(
     "Retrievals returning zero real hits (pre-preamble), broken down by intent",
     labelnames=["intent", "kb_count"],
 )
+
+# Wave 2 round 4 (review §5.1): RAG_RERANK_MIN_SCORE filter drop counter.
+#
+# Incremented by the count of hits whose post-rerank score fell strictly
+# below ``RAG_RERANK_MIN_SCORE``. Default OFF (env unset) means this counter
+# is never bumped. When the operator sets the threshold (recommend 0.05
+# after eval-gate) a sustained ramp signals either (a) a useful low-quality
+# floor cleaning out noise, or (b) corpus / model drift that knocked
+# real answers below the floor — pair with eval scores.
+rag_rerank_threshold_dropped_total = Counter(
+    "rag_rerank_threshold_dropped_total",
+    "Hits dropped by the RAG_RERANK_MIN_SCORE post-rerank threshold filter",
+    labelnames=["intent"],
+)
