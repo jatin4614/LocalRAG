@@ -213,3 +213,49 @@ def test_clear_all_unscoped(monkeypatch):
     assert deleted == 2
     assert rc.get_many("a", [("q", "p")]) == [None]
     assert rc.get_many("b", [("q", "p")]) == [None]
+
+
+# ---------------------------------------------------------------------------
+# pipeline_version invalidation (review §5.7)
+# ---------------------------------------------------------------------------
+
+
+def test_key_includes_pipeline_version():
+    """Cache keys must include the pipeline_version so a re-ingest with a
+    bumped chunker/extractor invalidates stale rerank scores. Without this,
+    re-ingest with normalized text would let stale scores survive 5 min."""
+    k1 = rc._key("m", "q", "p", "chunker=v1|extractor=v1")
+    k2 = rc._key("m", "q", "p", "chunker=v2|extractor=v1")
+    assert k1 != k2, "pipeline_version must be part of the cache key"
+
+
+def test_pipeline_version_bump_causes_miss(monkeypatch):
+    """End-to-end: storing under v1 then querying under v2 must miss.
+
+    Mirrors the contract enforced for ``ext/services/retrieval_cache.py``:
+    a chunker bump invalidates cached scores in the same TTL window.
+    """
+    from ext.services import pipeline_version
+
+    _patch_fake_client(monkeypatch)
+
+    # Store under v1 chunker.
+    monkeypatch.setattr(pipeline_version, "CHUNKER_VERSION", "v1")
+    rc.put_many("m", [("q", "p", 0.99)])
+    assert rc.get_many("m", [("q", "p")]) == [0.99]
+
+    # Bump pipeline version: should miss.
+    monkeypatch.setattr(pipeline_version, "CHUNKER_VERSION", "v2")
+    out = rc.get_many("m", [("q", "p")])
+    assert out == [None], "stale rerank score must NOT be returned after pipeline bump"
+
+
+def test_same_pipeline_version_still_hits(monkeypatch):
+    """Sanity: with no bump, the cache still hits."""
+    from ext.services import pipeline_version
+
+    _patch_fake_client(monkeypatch)
+    monkeypatch.setattr(pipeline_version, "CHUNKER_VERSION", "v2")
+    rc.put_many("m", [("q", "p", 0.5)])
+    out = rc.get_many("m", [("q", "p")])
+    assert out == [0.5]
