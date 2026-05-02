@@ -163,6 +163,25 @@ Every behavior change ships behind a flag, default OFF for first deploy. Soak 7 
 
 (Updated as commits land. Newest first.)
 
+### Wave 2 round 6 (9 inline fixes — finish small remaining items)
+
+- 2026-05-03 `6d1fb9f` — Inline §6.12: LLM circuit breaker on doc_summarizer (RAG_CB_LLM_ENABLED=0 default).
+- 2026-05-03 `dd57147` — Inline §6.6: system prompt version stamping (sha256[:12] gauge + startup log).
+- 2026-05-03 `898f45a` — Inline §11.9 + §2.4: Caddy rate-limit recipe + pipe-table column-count.
+- 2026-05-03 `c610b29` — Inline §11.4: mem_limit + cpus + log rotation across base stack (YAML anchor).
+- 2026-05-03 `e401266` — Inline §10.7: BuildKit secret for HF_TOKEN (both Dockerfiles).
+- 2026-05-03 `d174383` — Inline §10.9: Tesseract multilingual packs (fra/deu/jpn/chi-sim/hin).
+- 2026-05-03 `9d73335` — Inline §10.5 + §10.6: celery requirements.txt extraction + HEALTHCHECK.
+
+### Round 6 deferred / out-of-scope:
+- **§10.1** Wave 1b (USER 1000:1000 + volume UID) — needs container build verification → Wave 1c after the rest stabilizes.
+- **§11.5** Docker secrets — needs operator-side coordination (secrets/ dir creation, bootstrap.sh updates); not pushable as a single safe commit.
+- **§11.11** PVC quota — already mitigated by existing daily blob_gc beat schedule (`ext/workers/blob_gc_task.py:128`); operator can shorten cron via `RAG_BLOB_GC_CRON` env if needed.
+- **§2.5** pysbd multilingual splitter — needs new pip dep; defer to a focused agent.
+- **§6.10 / §6.11** RAG_ENFORCE_CITATIONS / RAG_ENFORCE_ABSTENTION — LLM-output post-processing complexity; flag-gated, defer.
+- **§6.4** BLOCKED upstream — chat-call record_llm_call lives in open_webui/main.py; needs middleware patch.
+- **§8.7** BLOCKED operator — daily-eval staleness alert needs node-exporter `--collector.textfile.directory` flag.
+
 ### Wave 2 round 5 (4 background agents quota-capped + 5 inline; 9 fixes shipped)
 
 - 2026-05-02 `8cfcb2f` — Inline §11.12: open-webui depends_on tei + vllm-chat healthy.
