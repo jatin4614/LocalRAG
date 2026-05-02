@@ -39,6 +39,8 @@ from typing import Any, Optional
 
 import httpx
 
+from .llm_telemetry import record_llm_call
+
 
 log = logging.getLogger("orgchat.qu")
 
@@ -381,10 +383,24 @@ async def analyze_query(
     for _attempt in (1, 2):
         try:
             _per_attempt_timeout = timeout if _attempt == 1 else _retry_timeout
-            async with httpx.AsyncClient(timeout=_per_attempt_timeout) as client:
-                r = await client.post(f"{qu_url}/chat/completions", json=payload)
-                r.raise_for_status()
-                data = r.json()
+            # Wrap the HTTP call in ``record_llm_call`` so the QU LLM's
+            # token spend lands in ``rag_tokens_prompt_total`` /
+            # ``rag_tokens_completion_total`` — QU fires on every chat
+            # turn when ``RAG_QU_ENABLED=1`` and was previously invisible
+            # in the LLM dashboards (review §6.3). Recorder context is
+            # nested inside the retry try/except so each attempt records
+            # independently; on retry, both attempts' usage (if any) is
+            # summed into the counter.
+            async with record_llm_call(stage="query_understanding", model=model) as rec:
+                async with httpx.AsyncClient(timeout=_per_attempt_timeout) as client:
+                    r = await client.post(f"{qu_url}/chat/completions", json=payload)
+                    r.raise_for_status()
+                    data = r.json()
+                usage = data.get("usage") or {}
+                rec.set_tokens(
+                    prompt=usage.get("prompt_tokens", 0),
+                    completion=usage.get("completion_tokens", 0),
+                )
                 raw = data["choices"][0]["message"]["content"]
                 try:
                     return parse_qu_response(raw)
