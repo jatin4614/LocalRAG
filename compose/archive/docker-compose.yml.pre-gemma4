@@ -1,0 +1,307 @@
+version: "3.8"
+
+name: orgchat
+
+networks:
+  default:
+    name: orgchat-net
+    driver: bridge
+    internal: false  # temporarily false; switched to true after Caddy is wired (Task 7)
+
+volumes:
+  postgres_data: { driver: local }
+  redis_data:    { driver: local }
+  qdrant_data:   { driver: local }
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: orgchat-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB:       ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ../ext/db/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: orgchat-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: orgchat-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/6333'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: orgchat-caddy
+    restart: unless-stopped
+    ports:
+      - "8880:80"
+      - "8443:443"
+    environment:
+      DOMAIN: ${DOMAIN}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ../volumes/certs:/certs:ro
+    depends_on:
+      - open-webui
+
+  vllm-chat:
+    image: vllm/vllm-openai:latest
+    container_name: orgchat-vllm-chat
+    restart: unless-stopped
+    ipc: host
+    # No host port — accessed via Docker network only (open-webui → vllm-chat:8000)
+    volumes:
+      - ../volumes/models:/root/.cache/huggingface/hub
+    environment:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    command:
+      - "--model"
+      - "${CHAT_MODEL}"
+      - "--served-model-name"
+      - "orgchat-chat"
+      - "--max-model-len"
+      - "32768"
+      - "--gpu-memory-utilization"
+      - "0.45"
+      - "--enable-prefix-caching"
+      - "--enable-chunked-prefill"
+      - "--kv-cache-dtype"
+      - "fp8"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/v1/models || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 15
+      start_period: 180s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  tei:
+    image: ghcr.io/huggingface/text-embeddings-inference:1.5
+    container_name: orgchat-tei
+    restart: unless-stopped
+    command:
+      - "--model-id"
+      - "${EMBED_MODEL}"
+      - "--port"
+      - "80"
+    volumes:
+      - ../volumes/models:/data
+    environment:
+      HF_HUB_OFFLINE: "1"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:80/health || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  vllm-vision:
+    image: vllm/vllm-openai:latest
+    container_name: orgchat-vllm-vision
+    restart: unless-stopped
+    ipc: host
+    volumes:
+      - ../volumes/models:/root/.cache/huggingface/hub
+    environment:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    command:
+      - "--model"
+      - "${VISION_MODEL}"
+      - "--served-model-name"
+      - "orgchat-vision"
+      - "--max-model-len"
+      - "2048"
+      - "--gpu-memory-utilization"
+      - "0.14"
+      - "--enforce-eager"
+      - "--dtype"
+      - "half"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/v1/models || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 15
+      start_period: 240s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  whisper:
+    build:
+      context: ../whisper_service
+    container_name: orgchat-whisper
+    restart: unless-stopped
+    environment:
+      WHISPER_MODEL: ${WHISPER_MODEL:-base.en}
+      WHISPER_DEVICE: ${WHISPER_DEVICE:-cpu}
+      WHISPER_COMPUTE_TYPE: ${WHISPER_COMPUTE_TYPE:-int8}
+      WHISPER_CACHE: /models
+      PORT: "9000"
+    volumes:
+      - ../volumes/models:/models
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9000/health || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  tts:
+    build:
+      context: ../tts_service
+    container_name: kairos-tts
+    restart: unless-stopped
+    environment:
+      PIPER_DEFAULT_VOICE: ${AUDIO_TTS_VOICE:-en_US-lessac-medium}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9100/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  model-manager:
+    build:
+      context: ../model_manager
+    container_name: orgchat-model-manager
+    restart: unless-stopped
+    environment:
+      VISION_URL: http://vllm-vision:8000
+      WHISPER_URL: http://whisper:9000
+      MODEL_UNLOAD_IDLE_SECS: ${MODEL_UNLOAD_IDLE_SECS:-300}
+      MODEL_MANAGER_POLL_SECS: "15"
+    # No host port — accessed via Docker network only
+    depends_on:
+      - vllm-vision
+      - whisper
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/healthz || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  open-webui:
+    build:
+      context: ..
+      dockerfile: Dockerfile.openwebui
+    container_name: orgchat-open-webui
+    restart: unless-stopped
+    ports:
+      - "6100:8080"
+    environment:
+      PORT: "8080"
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY}
+      WEBUI_NAME: ${WEBUI_NAME}
+      ENABLE_SIGNUP: ${ENABLE_SIGNUP:-false}
+      DEFAULT_USER_ROLE: ${DEFAULT_USER_ROLE:-pending}
+      DEFAULT_MODELS: ${DEFAULT_MODELS:-orgchat-chat}
+      ENABLE_COMMUNITY_SHARING: "false"
+      ENABLE_MESSAGE_RATING: "false"
+      SHOW_ADMIN_DETAILS: "false"
+      ENABLE_OPENAI_API: ${ENABLE_OPENAI_API:-true}
+      OPENAI_API_BASE_URL: ${OPENAI_API_BASE_URL:-http://vllm-chat:8000/v1}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-sk-internal-dummy}
+      VISION_API_BASE_URL: ${VISION_API_BASE_URL:-http://vllm-vision:8000/v1}
+      VISION_MODEL_SERVED_NAME: ${VISION_MODEL_SERVED_NAME:-orgchat-vision}
+      ENABLE_OLLAMA_API: ${ENABLE_OLLAMA_API:-false}
+      ENABLE_WEB_SEARCH: ${ENABLE_WEB_SEARCH:-false}
+      ENABLE_IMAGE_GENERATION: ${ENABLE_IMAGE_GENERATION:-false}
+      ENABLE_RAG_WEB_LOADER: ${ENABLE_RAG_WEB_LOADER:-false}
+      AUDIO_STT_ENGINE: ${AUDIO_STT_ENGINE:-openai}
+      AUDIO_STT_OPENAI_API_BASE_URL: ${AUDIO_STT_OPENAI_API_BASE_URL:-http://whisper:9000/v1}
+      AUDIO_STT_OPENAI_API_KEY: ${AUDIO_STT_OPENAI_API_KEY:-sk-kairos-stt}
+      AUDIO_STT_MODEL: ${AUDIO_STT_MODEL:-whisper-1}
+      AUDIO_TTS_ENGINE: ${AUDIO_TTS_ENGINE:-openai}
+      AUDIO_TTS_OPENAI_API_BASE_URL: ${AUDIO_TTS_OPENAI_API_BASE_URL:-http://tts:9100/v1}
+      AUDIO_TTS_OPENAI_API_KEY: ${AUDIO_TTS_OPENAI_API_KEY:-sk-kairos-tts}
+      AUDIO_TTS_MODEL: ${AUDIO_TTS_MODEL:-tts-1}
+      AUDIO_TTS_VOICE: ${AUDIO_TTS_VOICE:-en_US-lessac-medium}
+      RAG_EMBEDDING_ENGINE: ${RAG_EMBEDDING_ENGINE:-openai}
+      RAG_EMBEDDING_OPENAI_API_BASE_URL: ${RAG_EMBEDDING_OPENAI_API_BASE_URL:-http://tei:80/v1}
+      RAG_OPENAI_API_BASE_URL: ${RAG_OPENAI_API_BASE_URL:-http://tei:80/v1}
+      RAG_OPENAI_API_KEY: ${RAG_OPENAI_API_KEY:-sk-kairos-embed}
+      RAG_EMBEDDING_MODEL: ${RAG_EMBEDDING_MODEL:-BAAI/bge-m3}
+      RAG_FULL_CONTEXT: ${RAG_FULL_CONTEXT:-false}
+      RAG_TOP_K: ${RAG_TOP_K:-5}
+      RAG_TOP_K_RERANKER: ${RAG_TOP_K_RERANKER:-5}
+      CHUNK_SIZE: ${CHUNK_SIZE:-800}
+      CHUNK_OVERLAP: ${CHUNK_OVERLAP:-100}
+      RAG_FILE_MAX_SIZE: ${RAG_FILE_MAX_SIZE:-26214400}
+      RAG_FILE_MAX_COUNT: ${RAG_FILE_MAX_COUNT:-10}
+      VECTOR_DB: ${VECTOR_DB:-qdrant}
+      DATABASE_URL: ${DATABASE_URL}
+      QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
+      QDRANT_URI: ${QDRANT_URL:-http://qdrant:6333}
+      TEI_URL: ${TEI_URL:-http://tei:80}
+      AUTH_MODE: ${AUTH_MODE:-jwt}
+      RAG_VECTOR_SIZE: ${RAG_VECTOR_SIZE:-1024}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      SESSION_SECRET: ${SESSION_SECRET}
+    volumes:
+      - ../volumes/uploads:/app/backend/data/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      tts:
+        condition: service_healthy
+      whisper:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
