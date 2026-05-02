@@ -706,6 +706,7 @@ async def _multi_entity_retrieve(
     level_filter=None,
     doc_ids=None,
     temporal_constraint=None,
+    with_vectors: bool = False,
 ):
     """Multi-entity decomposed retrieval (Phase 6.X — Methods 3 + 4).
 
@@ -766,6 +767,7 @@ async def _multi_entity_retrieve(
                 doc_ids=doc_ids,
                 temporal_constraint=temporal_constraint,
                 text_filter=(entity if (with_filter and text_filter_on) else None),
+                with_vectors=with_vectors,
             )
         except Exception as exc:
             _record_silent_failure(
@@ -1394,6 +1396,18 @@ async def _run_pipeline(
                             ).inc()
                         except Exception:
                             pass
+                    # Wave 2 round 4 (review §5.9) — request dense vectors back
+                    # from Qdrant when MMR will run on this request, so the
+                    # MMR helper can skip its TEI re-embed of every passage.
+                    # MMR runs when ``RAG_MMR=1`` AND intent != "global"
+                    # (global skips MMR; doc summaries are self-contained).
+                    # Reading the flag through ``flags.get`` honors per-KB
+                    # rag_config overrides set up in ``_retrieve_overrides``.
+                    with flags.with_overrides(_retrieve_overrides):
+                        _with_vectors_for_mmr = (
+                            flags.get("RAG_MMR", "0") == "1"
+                            and _intent != "global"
+                        )
                     with span("embed.query", path="query"), flags.with_overrides(_retrieve_overrides):
                         # ``retrieve`` internally calls embedder.embed() — the
                         # embed.call span will nest under this embed.query span
@@ -1412,6 +1426,7 @@ async def _run_pipeline(
                                 level_filter=_level_filter,
                                 doc_ids=_date_doc_ids,
                                 temporal_constraint=_temporal_constraint,
+                                with_vectors=_with_vectors_for_mmr,
                             )
                         else:
                             raw_hits = await retrieve(
@@ -1429,6 +1444,7 @@ async def _run_pipeline(
                                 level_filter=_level_filter,
                                 doc_ids=_date_doc_ids,
                                 temporal_constraint=_temporal_constraint,
+                                with_vectors=_with_vectors_for_mmr,
                             )
                 _retrieve_ms = int((time.perf_counter() - _tR) * 1000)
                 # B4 — tag the rag.retrieve span with the post-retrieval

@@ -178,11 +178,38 @@ _COLBERT_DIM = 128
 CHAT_PRIVATE_COLLECTION = "chat_private"
 
 
+# Wave 2 round 4 (review §5.9) — pull the dense slot out of whatever shape
+# Qdrant returned. Hybrid-named-vector collections wrap vectors in a dict
+# keyed by the named slot; legacy single-vector collections return a plain
+# list. We only ever care about the dense slot for MMR — sparse and colbert
+# use different metric spaces and would be wrong here.
+def _extract_dense_vector(raw: object) -> Optional[list[float]]:
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        v = raw.get(_DENSE_NAME)
+        if v is None:
+            return None
+        return list(v)
+    # Plain list / tuple — legacy unnamed-vector collection.
+    try:
+        return list(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
 @dataclass
 class Hit:
     id: int | str | uuid.UUID
     score: float
     payload: dict
+    # Wave 2 round 4 (review §5.9): optional dense vector. When set (because
+    # ``vector_store.search``/``hybrid_search`` was called with
+    # ``with_vectors=True``), MMR can skip its TEI re-embed pass and use the
+    # vector directly. Default ``None`` preserves the legacy contract — every
+    # call site that constructs a Hit without this kwarg gets the original
+    # 3-field shape.
+    vector: Optional[list[float]] = None
 
 
 class VectorStore:
@@ -898,6 +925,7 @@ class VectorStore:
         rescore: Optional[bool] = None,
         shard_keys: Optional[list[str]] = None,
         text_filter: Optional[str] = None,
+        with_vectors: bool = False,
     ) -> List[Hit]:
         """Dense-only search.
 
@@ -950,6 +978,11 @@ class VectorStore:
             # when rescore is on (no-op on unquantized collections).
             "search_params": _search_params(rescore=rescore),
         }
+        # Wave 2 round 4 (review §5.9): only set ``with_vectors`` on the wire
+        # when the caller explicitly asked for it — keeps the default network
+        # payload byte-identical to pre-§5.9.
+        if with_vectors:
+            kwargs["with_vectors"] = True
         if self._sparse_cache.get(name):
             kwargs["using"] = _DENSE_NAME
         # Phase 1.3: per-collection circuit breaker. If Qdrant has been
@@ -975,7 +1008,20 @@ class VectorStore:
                 except Exception:
                     pass
             cb.record_success()
-        return [Hit(id=r.id, score=r.score, payload=r.payload or {}) for r in response.points]
+        # When ``with_vectors`` was passed, attach the dense vector to each Hit
+        # so MMR (and any future caller) can skip the TEI re-embed.
+        # Qdrant returns the vectors under ``r.vector`` (named-vector
+        # collections may surface a dict ``{"dense": [...]}`` — extract the
+        # canonical dense slot when so).
+        return [
+            Hit(
+                id=r.id,
+                score=r.score,
+                payload=r.payload or {},
+                vector=_extract_dense_vector(getattr(r, "vector", None)) if with_vectors else None,
+            )
+            for r in response.points
+        ]
 
     async def hybrid_search(
         self,
@@ -992,6 +1038,7 @@ class VectorStore:
         rescore: Optional[bool] = None,
         shard_keys: Optional[list[str]] = None,
         text_filter: Optional[str] = None,
+        with_vectors: bool = False,
     ) -> List[Hit]:
         """Server-side RRF fusion of dense + BM25 sparse (+ optional ColBERT) results.
 
@@ -1084,17 +1131,23 @@ class VectorStore:
         # dense ``search`` path. Same trip rules: only transport errors count.
         cb = breaker_for(f"qdrant:{name}")
         cb.raise_if_open()
+        # Wave 2 round 4 (review §5.9): only request vectors back when the
+        # caller asked. Hybrid RRF still returns the full Hit list so MMR
+        # downstream gets the dense vectors without a second round-trip.
+        _hybrid_kwargs = dict(
+            collection_name=name,
+            prefetch=prefetch,
+            query=qm.FusionQuery(fusion=qm.Fusion.RRF),
+            limit=limit,
+            query_filter=flt,
+            with_payload=_PAYLOAD_FIELDS,
+        )
+        if with_vectors:
+            _hybrid_kwargs["with_vectors"] = True
         with span("qdrant.client.search", collection=name, limit=limit, mode="hybrid"):
             _t = _perf_counter()
             try:
-                response = await self._client.query_points(
-                    collection_name=name,
-                    prefetch=prefetch,
-                    query=qm.FusionQuery(fusion=qm.Fusion.RRF),
-                    limit=limit,
-                    query_filter=flt,
-                    with_payload=_PAYLOAD_FIELDS,
-                )
+                response = await self._client.query_points(**_hybrid_kwargs)
             except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError):
                 cb.record_failure()
                 raise
@@ -1106,7 +1159,15 @@ class VectorStore:
                 except Exception:
                     pass
             cb.record_success()
-        return [Hit(id=r.id, score=r.score, payload=r.payload or {}) for r in response.points]
+        return [
+            Hit(
+                id=r.id,
+                score=r.score,
+                payload=r.payload or {},
+                vector=_extract_dense_vector(getattr(r, "vector", None)) if with_vectors else None,
+            )
+            for r in response.points
+        ]
 
     async def delete_by_doc(self, collection: str, doc_id: int | str) -> int:
         """Delete all points in ``collection`` whose payload ``doc_id`` matches.

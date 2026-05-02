@@ -217,26 +217,58 @@ async def _mmr_rerank_from_hits_impl(
     top_k: int,
     lambda_: float,
 ) -> list[Any]:
-    texts = [
-        (getattr(h, "payload", {}) or {}).get("text")
-        or getattr(h, "text", "")
-        or ""
-        for h in hits
-    ]
+    # Wave 2 round 4 (review §5.9) — fast path: when EVERY hit carries a
+    # ``.vector`` (because the upstream retriever asked Qdrant for
+    # ``with_vectors=True``), skip the TEI re-embed of the passages and
+    # only embed the query. Mixed input (some hits with vectors, some
+    # without) safely falls back to the legacy batch path — interleaving
+    # cached and re-embedded vectors is fragile (different model snapshots
+    # can drift) and the savings are smaller anyway.
+    prefetched_vecs: list[list[float]] | None = None
+    if hits:
+        candidate = []
+        for h in hits:
+            v = getattr(h, "vector", None)
+            if v is None:
+                candidate = None
+                break
+            candidate.append(list(v))
+        if candidate is not None:
+            prefetched_vecs = candidate
 
-    # Single batched call: passages first, then the query. Matches the
-    # TEIEmbedder.embed(list[str]) signature used everywhere else.
-    if hasattr(embedder, "embed"):
-        vectors = await embedder.embed(texts + [query])
-    elif hasattr(embedder, "embed_batch"):
-        vectors = await embedder.embed_batch(texts + [query])
-    else:  # pragma: no cover - defensive
-        raise TypeError(
-            "embedder must expose async embed(list[str]) or embed_batch(list[str])"
-        )
+    if prefetched_vecs is not None:
+        # Embed the query alone — single network round-trip, no passage re-embed.
+        if hasattr(embedder, "embed"):
+            qvec_batch = await embedder.embed([query])
+        elif hasattr(embedder, "embed_batch"):
+            qvec_batch = await embedder.embed_batch([query])
+        else:  # pragma: no cover - defensive
+            raise TypeError(
+                "embedder must expose async embed(list[str]) or embed_batch(list[str])"
+            )
+        query_vec = qvec_batch[0]
+        passage_vecs = prefetched_vecs
+    else:
+        texts = [
+            (getattr(h, "payload", {}) or {}).get("text")
+            or getattr(h, "text", "")
+            or ""
+            for h in hits
+        ]
 
-    query_vec = vectors[-1]
-    passage_vecs = vectors[:-1]
+        # Single batched call: passages first, then the query. Matches the
+        # TEIEmbedder.embed(list[str]) signature used everywhere else.
+        if hasattr(embedder, "embed"):
+            vectors = await embedder.embed(texts + [query])
+        elif hasattr(embedder, "embed_batch"):
+            vectors = await embedder.embed_batch(texts + [query])
+        else:  # pragma: no cover - defensive
+            raise TypeError(
+                "embedder must expose async embed(list[str]) or embed_batch(list[str])"
+            )
+
+        query_vec = vectors[-1]
+        passage_vecs = vectors[:-1]
 
     # §5.10 sanity check — TEI's bge-m3 returns L2-normalized vectors. If the
     # norm drifts (op-tag mismatch, future model swap, broken stub), drop a
