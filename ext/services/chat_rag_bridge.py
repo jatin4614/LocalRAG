@@ -415,11 +415,25 @@ def _redis_client():
     return _rbac_redis
 
 
+_CONFIGURED: bool = False
+
+
 def configure(*, vector_store, embedder, sessionmaker) -> None:
-    global _vector_store, _embedder, _sessionmaker
+    """Set the module-level singletons used by the retrieval pipeline.
+
+    Wave 2 (review §7.4): idempotent. The first call wins; subsequent
+    calls (test-setup runs after app-startup, repeat boot probes, etc.)
+    are no-ops. Without the guard, two concurrent first-callers could
+    silently overwrite each other's references to vector_store/embedder
+    and leak Redis/httpx pools.
+    """
+    global _vector_store, _embedder, _sessionmaker, _CONFIGURED
+    if _CONFIGURED:
+        return
     _vector_store = vector_store
     _embedder = embedder
     _sessionmaker = sessionmaker
+    _CONFIGURED = True
 
 
 async def get_kb_config_for_chat(chat_id: str, user_id: str) -> Optional[list]:
