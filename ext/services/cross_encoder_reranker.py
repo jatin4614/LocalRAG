@@ -255,11 +255,30 @@ def rerank_cross_encoder(
         model=model_name,
         top_k=top_k,
     ):
+        # Wave 2 (review §5.14): partition hits before the cross-encoder
+        # pass. score(query, "") is meaningless — but the hits aren't
+        # garbage (e.g., image-caption chunks awaiting vision-LLM output,
+        # doc-summary points with text NULL during upsert race). Skip the
+        # CE scoring for empty-text hits and append them at the END with
+        # score 0 so the meaningful hits sort to the top while the empty
+        # ones stay reachable for downstream stages (context_expand may
+        # re-fetch their siblings, MMR may de-duplicate).
+        scored_hits: list = []
         passages: list[str] = []
+        empty_hits: list = []
         for h in hits:
             payload = getattr(h, "payload", None) or {}
             text = payload.get("text") or getattr(h, "text", "") or ""
-            passages.append(str(text))
-        scores = score_pairs(query, passages, batch_size=batch_size)
-        scored = sorted(zip(scores, hits), key=lambda t: t[0], reverse=True)
-        return [h for _, h in scored[:top_k]]
+            if str(text).strip():
+                scored_hits.append(h)
+                passages.append(str(text))
+            else:
+                empty_hits.append(h)
+        if scored_hits:
+            scores = score_pairs(query, passages, batch_size=batch_size)
+            scored = sorted(zip(scores, scored_hits), key=lambda t: t[0], reverse=True)
+            ordered = [h for _, h in scored]
+        else:
+            ordered = []
+        ordered.extend(empty_hits)
+        return ordered[:top_k]
