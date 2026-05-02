@@ -1,8 +1,14 @@
 """Redis-backed cache for cross-encoder rerank scores.
 
-Key format: ``rerank:{model_name}:{sha1(query)[:16]}:{sha1(passage)[:16]}``
+Key format: ``rerank:{model_name}:{pipeline_version}:{sha1(query)[:16]}:{sha1(passage)[:16]}``
 Value:      float score, serialized as ASCII bytes.
 TTL:        ``RAG_RERANK_CACHE_TTL`` seconds (default 300).
+
+The ``pipeline_version`` component invalidates cached scores whenever the
+chunker / extractor / embedder / context-augmentation tag bumps. Without it,
+a re-ingest with normalized text would let stale rerank scores from the
+old chunking survive for the full TTL window. Mirrors the pattern in
+``ext/services/retrieval_cache.py``.
 
 All operations fail-open: if Redis is unreachable or misconfigured, the
 cache silently returns misses and the reranker falls through to model
@@ -77,10 +83,31 @@ def _ttl() -> int:
         return 300
 
 
-def _key(model: str, query: str, passage: str) -> str:
+def _current_pipeline_version() -> str:
+    """Fetch ``pipeline_version`` lazily so import cost is deferred.
+
+    Falls back to ``"unknown"`` on any failure — the cache still works,
+    it just won't invalidate on pipeline bumps in this edge case. Mirrors
+    ``retrieval_cache._current_model_version``.
+    """
+    try:
+        from ext.services.pipeline_version import current_version
+        return current_version()
+    except Exception:
+        return "unknown"
+
+
+def _key(model: str, query: str, passage: str, pipeline_version: str | None = None) -> str:
+    """Build a cache key.
+
+    ``pipeline_version`` is included so a re-ingest with a bumped
+    chunker/extractor invalidates stale scores. When omitted (callers that
+    haven't been updated), the current pipeline version is fetched lazily.
+    """
     q = hashlib.sha1(query.encode("utf-8", errors="replace")).hexdigest()[:16]
     p = hashlib.sha1((passage or "").encode("utf-8", errors="replace")).hexdigest()[:16]
-    return f"rerank:{model}:{q}:{p}"
+    pv = pipeline_version if pipeline_version is not None else _current_pipeline_version()
+    return f"rerank:{model}:{pv}:{q}:{p}"
 
 
 def get_many(
