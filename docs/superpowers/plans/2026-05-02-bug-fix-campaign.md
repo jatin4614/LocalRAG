@@ -163,6 +163,25 @@ Every behavior change ships behind a flag, default OFF for first deploy. Soak 7 
 
 (Updated as commits land. Newest first.)
 
+### Wave 2 round 3 (3 background agents, smaller charters; 13 fixes + 2 BLOCKED)
+
+- 2026-05-02 `2f5da50` — D-1 §7.5: double-checked locking on bridge singletons.
+- 2026-05-02 `5b7ce80` — D-1 §5.12: RRF dedup key disambiguates doc-summary levels.
+- 2026-05-02 `0a48fbd` — D-1 §5.10: MMR uses np.dot on pre-normalized vectors.
+- 2026-05-02 `85bc0d3` — D-1 §5.7: pipeline_version in rerank cache key.
+- 2026-05-02 `66a1ea6` — E-1 §6.9 SECURITY: html.escape filename in get_source_context (+ patches/0006).
+- 2026-05-02 `40a17ab` — E-1 §6.8 SECURITY: defang `</source>` + `<source` in spotlight.
+- 2026-05-02 `94d866f` — E-1 §6.7: CHAT_MODEL preflight against /v1/models.
+- 2026-05-02 `e2c7f5f` — E-1 §6.5: rename SSE event spacing → sse_event_interval_seconds.
+- 2026-05-02 `33ab962` — E-1 §6.3: record_llm_call into doc_summarizer + query_understanding.
+- 2026-05-02 `4cb65ae` — F-1 §8.12: Jaeger + Loki retention 168h.
+- 2026-05-02 `ead0f8e` — F-1 §8.7 BLOCKED: daily-eval staleness alert needs node-exporter textfile collector.
+- 2026-05-02 `b98e56e` — F-1 §8.4: rag_silent_failure baseline-ramp alert.
+- 2026-05-02 `5c3d850` — F-1 §8.3: rag_retrieval_empty_total counter + alert.
+- 2026-05-02 `52d1614` — F-1 §8.1: Alertmanager service + alerts-celery volume mount.
+- 2026-05-02 (BLOCKED upstream) — E-1 §6.4: user-facing chat-call record_llm_call wrapping; lives in open_webui/main.py, needs middleware-level patch.
+- 2026-05-02 (deferred) — D-1 §7.6: OTel inject for HyDE+contextualizer headers (not committed before agent stop; reassign to batch-2 agent).
+
 - 2026-05-02 `04cd57b` — Round 2 H §9.7+§9.10: .pre-commit-config.yaml (ruff + gitleaks + standard hygiene).
 - 2026-05-02 `a6f303f` — Round 2 H §9.6: targeted mypy stub overrides + flip ignore_missing_imports=false.
 - 2026-05-02 `f302327` — Round 2 H §9.5: xfail-quarantine 2 pre-existing reds + tests/README update.
