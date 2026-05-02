@@ -22,3 +22,31 @@ whisper_service/
 .idea/
 .vscode/
 *.swp
+
+# Agent / session state — never include in build context
+.claude/
+.codex/
+.cursor/
+
+# Secrets — defense in depth (compose/.env is already filtered above, but
+# protect against accidental project-root .env or .env.local)
+.env
+.env.*
+*.pem
+*.key
+
+# Frontend build outputs (rebuilt inside the container)
+node_modules/
+dist/
+build/
+.svelte-kit/
+
+# Operator backups (Wave 3a output, host-side only)
+backups/
+
+# Logs
+*.log
+
+# Migration artefacts that shouldn't ship
+*.dump
+*.sql.gz
