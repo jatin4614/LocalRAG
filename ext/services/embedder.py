@@ -71,15 +71,48 @@ class TEIEmbedder:
         TEI hiccup (GC pause, brief 5xx, network blip) doesn't degrade
         every concurrent request. The decorator is a no-op pass-through
         when ``RAG_TENACITY_RETRY=0``.
+
+        Bug-fix campaign §3.5 — when ``RAG_CB_TEI_ENABLED=1`` the call
+        also consults a per-process circuit breaker keyed ``"tei"``. If
+        the breaker is open (TEI has failed ``RAG_CB_FAIL_THRESHOLD``
+        times in ``RAG_CB_WINDOW_SEC``), the breaker raises
+        :class:`CircuitOpenError` BEFORE the network call so we don't
+        keep hammering a known-broken endpoint. Callers fail-open per
+        CLAUDE.md §1.2 (treat ``CircuitOpenError`` as another transient
+        upstream failure and degrade retrieval gracefully).
+
+        The breaker only counts terminal failures: success → record_success,
+        any exception (including the retry decorator's final reraise) →
+        record_failure. The retry decorator runs INSIDE one breaker call
+        so a single user-facing embed surfaces as one breaker decision,
+        not N (avoids opening the breaker on a single transient blip
+        that the retry would have absorbed).
         """
-        headers = inject_context_into_headers({})
-        r = await self._client.post(
-            "/embed",
-            json={"inputs": batch},
-            headers=headers or None,
-        )
-        r.raise_for_status()
-        return r.json()
+        cb_enabled = os.environ.get("RAG_CB_TEI_ENABLED", "0") == "1"
+        breaker = None
+        if cb_enabled:
+            # Local import — keeps the breaker module out of the import
+            # path when the flag is off (cold-start matters here).
+            from .circuit_breaker import breaker_for
+            breaker = breaker_for("tei")
+            breaker.raise_if_open()
+
+        try:
+            headers = inject_context_into_headers({})
+            r = await self._client.post(
+                "/embed",
+                json={"inputs": batch},
+                headers=headers or None,
+            )
+            r.raise_for_status()
+            out = r.json()
+        except Exception:
+            if breaker is not None:
+                breaker.record_failure()
+            raise
+        if breaker is not None:
+            breaker.record_success()
+        return out
 
     async def _embed_uncached(self, texts: list[str]) -> list[list[float]]:
         """Direct TEI passthrough — bypasses the embed cache. Internal
