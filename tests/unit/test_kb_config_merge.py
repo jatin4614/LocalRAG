@@ -111,6 +111,16 @@ def test_merge_all_valid_keys():
         "doc_summaries": True,
         "intent_routing": True,
         "intent_llm": True,
+        # Phase 6.X — multi-entity decomposition.
+        "top_k": 24,
+        "multi_entity_decompose": True,
+        "entity_text_filter": True,
+        "qu_entity_extract": True,
+        "multi_entity_min_per_entity": 12,
+        # Phase 6.6 — structured chunker switch.
+        "chunking_strategy": "structured",
+        # Phase 6.X — per-KB image-caption gate.
+        "image_captions": True,
     }
     out = merge_configs([cfg])
     for key in VALID_KEYS:
@@ -225,18 +235,35 @@ def test_validate_accepts_all_whitelisted_keys():
         "rerank", "mmr", "context_expand", "spotlight", "semcache",
         "contextualize_on_ingest", "contextualize", "hyde",
         "doc_summaries", "intent_routing", "intent_llm",
+        # Phase 6.X
+        "multi_entity_decompose", "entity_text_filter", "qu_entity_extract",
+        "image_captions",
     }
     _int_sample = {
+        "top_k": 24,
         "rerank_top_k": 30,
         "context_expand_window": 2,
         "hyde_n": 3,
         "chunk_tokens": 800,
         "overlap_tokens": 100,
+        # Phase 6.X
+        "multi_entity_min_per_entity": 12,
     }
-    raw = {key: (True if key in _bool_keys
-                 else _int_sample[key] if key in _int_sample
-                 else 0.5)
-           for key in VALID_KEYS}
+    _string_sample = {
+        # Phase 6.6 — string-typed enum keys.
+        "chunking_strategy": "structured",
+    }
+
+    def _sample_for(key: str):
+        if key in _bool_keys:
+            return True
+        if key in _int_sample:
+            return _int_sample[key]
+        if key in _string_sample:
+            return _string_sample[key]
+        return 0.5
+
+    raw = {key: _sample_for(key) for key in VALID_KEYS}
     out = validate_config(raw)
     assert set(out.keys()) == set(VALID_KEYS)
 

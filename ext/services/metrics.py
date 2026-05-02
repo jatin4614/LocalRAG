@@ -347,6 +347,44 @@ rag_qu_cache_hit_ratio = Gauge(
 )
 
 
+# -----------------------------------------------------------------------
+# Phase 6.X — Multi-entity decomposition (Methods 3 / 4 / 5)
+# -----------------------------------------------------------------------
+# ``rag_entity_extract_total{source="regex|qu|empty"}`` — one increment
+# per call to ``extract_entities``. ``empty`` covers the case where
+# neither path returned anything (single-entity / unstructured queries).
+rag_entity_extract_total = Counter(
+    f"{_NS}_entity_extract_total",
+    "Multi-entity extractor invocations by source path",
+    labelnames=("source",),
+)
+
+# Histogram of the entity-list length returned. The 0 bucket counts
+# extractor calls that returned no entities (single-entity / non-list
+# queries); the >=2 buckets are the queries that will actually be
+# decomposed by Method 3.
+rag_entity_extract_count = Histogram(
+    f"{_NS}_entity_extract_count",
+    "Number of entities extracted from the query",
+    buckets=(0, 1, 2, 3, 4, 5, 6, 7, 8),
+)
+
+# Multi-query decomposer (Method 3) — one increment per fan-out.
+rag_multi_query_decompose_total = Counter(
+    f"{_NS}_multi_query_decompose_total",
+    "Multi-query decomposition fan-outs (Method 3)",
+    labelnames=("outcome",),
+)
+
+# Per-entity Qdrant text-filter (Method 4) — one increment per filtered
+# call so an operator can spot ``filter_empty`` drift via the alert.
+rag_entity_text_filter_total = Counter(
+    f"{_NS}_entity_text_filter_total",
+    "Per-entity text-filter retrieval outcomes (Method 4)",
+    labelnames=("outcome",),
+)
+
+
 @contextmanager
 def time_stage(stage: str) -> Iterator[None]:
     """Wrap a block to record its duration into ``stage_latency{stage="..."}``.

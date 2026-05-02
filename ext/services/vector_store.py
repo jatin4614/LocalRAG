@@ -773,6 +773,7 @@ class VectorStore:
         chat_id: Optional[int | str] = None,
         level: Optional[str] = None,
         shard_keys: Optional[list[str]] = None,
+        text_filter: Optional[str] = None,
     ) -> qm.Filter:
         """Build the standard Qdrant filter for every read path.
 
@@ -841,6 +842,21 @@ class VectorStore:
                     match=qm.MatchAny(any=list(shard_keys)),
                 )
             )
+        # Phase 6.X (Method 4) — per-entity text filter. When set, the
+        # candidate set is restricted to chunks whose ``text`` payload
+        # contains the given substring (Qdrant ``MatchText``). Used by
+        # the multi-query decomposer to guarantee each entity sub-query
+        # only sees chunks that literally name that entity. Default
+        # ``None`` = byte-identical to pre-Phase-6.X. Empty / whitespace
+        # strings are treated as None to avoid sending an empty filter
+        # that would match nothing.
+        if text_filter and text_filter.strip():
+            must_conditions.append(
+                qm.FieldCondition(
+                    key="text",
+                    match=qm.MatchText(text=text_filter.strip()),
+                )
+            )
         must_not_conditions = [
             qm.FieldCondition(key="deleted", match=qm.MatchValue(value=True))
         ]
@@ -876,6 +892,7 @@ class VectorStore:
         level: Optional[str] = None,
         rescore: Optional[bool] = None,
         shard_keys: Optional[list[str]] = None,
+        text_filter: Optional[str] = None,
     ) -> List[Hit]:
         """Dense-only search.
 
@@ -908,6 +925,7 @@ class VectorStore:
             chat_id=chat_id,
             level=level,
             shard_keys=shard_keys,
+            text_filter=text_filter,
         )
         # Warm the sparse cache lazily (cheap, cached on first call) so legacy
         # callers that only use dense still route correctly against hybrid collections.
@@ -968,6 +986,7 @@ class VectorStore:
         level: Optional[str] = None,
         rescore: Optional[bool] = None,
         shard_keys: Optional[list[str]] = None,
+        text_filter: Optional[str] = None,
     ) -> List[Hit]:
         """Server-side RRF fusion of dense + BM25 sparse (+ optional ColBERT) results.
 
@@ -1007,6 +1026,7 @@ class VectorStore:
             chat_id=chat_id,
             level=level,
             shard_keys=shard_keys,
+            text_filter=text_filter,
         )
         indices, values = embed_sparse_query(query_text)
         # P2.4 + P3.2: SearchParams carries hnsw_ef AND (when rescore is on)

@@ -86,6 +86,39 @@ async def _update_doc_status(
         )
 
 
+async def _fetch_kb_rag_config(kb_id: int) -> dict | None:
+    """Read ``knowledge_bases.rag_config`` for a KB.
+
+    Used at task start so the worker can honour per-KB overrides
+    (image_captions, chunking_strategy, contextualize) without
+    requiring the HTTP producer to stash the entire JSONB blob in
+    payload_base. Returns ``None`` on DB error or when the row is
+    absent — caller treats that as "no per-KB override".
+    """
+    db_url = os.environ.get("DATABASE_URL", "")
+    if not db_url:
+        return None
+    if db_url.startswith("postgres://"):
+        db_url = db_url.replace("postgres://", "postgresql+asyncpg://", 1)
+    elif db_url.startswith("postgresql://") and "+asyncpg" not in db_url:
+        db_url = db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    from sqlalchemy import text as _sql
+    from sqlalchemy.ext.asyncio import create_async_engine
+    engine = create_async_engine(db_url, pool_pre_ping=True)
+    try:
+        async with engine.begin() as conn:
+            row = (await conn.execute(
+                _sql("SELECT rag_config FROM knowledge_bases WHERE id = :i"),
+                {"i": int(kb_id)},
+            )).first()
+        if row is None:
+            return None
+        cfg = row[0]
+        return dict(cfg) if cfg else None
+    finally:
+        await engine.dispose()
+
+
 def _blob_root() -> str:
     return os.environ.get("INGEST_BLOB_ROOT", "/var/ingest")
 
@@ -120,6 +153,23 @@ async def _do_ingest(
     chunk_tokens = pb.pop("_chunk_tokens", None)
     overlap_tokens = pb.pop("_overlap_tokens", None)
 
+    # Fetch per-KB rag_config so ingest can honour per-KB overrides
+    # (chunking_strategy, image_captions, contextualize, etc.). The
+    # producer doesn't stash the full rag_config in payload_base because
+    # it's a JSONB blob that may be large; cheaper to look it up here at
+    # task start time. Falls back to None on DB error → ingest sees
+    # env-only behaviour (pre-Phase-6 path, byte-identical).
+    kb_rag_config: dict | None = None
+    kb_id = pb.get("kb_id")
+    if kb_id is not None:
+        try:
+            kb_rag_config = await _fetch_kb_rag_config(int(kb_id))
+        except Exception as exc:  # noqa: BLE001 — fail-open
+            log.warning(
+                "ingest_worker: failed to load rag_config for kb_id=%s: %s",
+                kb_id, exc,
+            )
+
     vs = VectorStore(url=qdrant_url, vector_size=vector_size)
     emb = TEIEmbedder(base_url=tei_url)
     try:
@@ -132,6 +182,7 @@ async def _do_ingest(
             "payload_base": pb,
             "vector_store": vs,
             "embedder": emb,
+            "kb_rag_config": kb_rag_config,
         }
         if chunk_tokens is not None:
             kwargs["chunk_tokens"] = int(chunk_tokens)

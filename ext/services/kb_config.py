@@ -80,6 +80,36 @@ VALID_BOOL_KEYS = frozenset({
     "doc_summaries",
     "intent_routing",
     "intent_llm",
+    # Phase 6.X (multi-entity decomposition — Method 3). When set,
+    # the bridge fans out a multi-entity query into N parallel
+    # retrievals (one per named entity) and merges with a per-entity
+    # quota. Default off; opt in per-KB for corpora with multi-entity
+    # query shapes (military reports listing N brigades, contracts
+    # citing N parties, etc.).
+    "multi_entity_decompose",
+    # Phase 6.X (per-entity Qdrant text filter — Method 4). When set,
+    # each per-entity sub-query in the decompose fan-out adds a
+    # ``must.match.text`` filter on the entity name. Hard precision
+    # boost: chunks not literally naming the entity are excluded.
+    # Pairs naturally with multi_entity_decompose; can be off if you
+    # want decomposition without the lexical hard-cut.
+    "entity_text_filter",
+    # Phase 6.X (QU LLM entity extraction — Method 5). When set, the
+    # bridge prefers ``HybridClassification.entities`` from the QU LLM
+    # (already populated as part of intent classification — no second
+    # LLM call). Off → regex extractor only. Soft-falls to regex on
+    # any QU side error.
+    "qu_entity_extract",
+    # Phase 6.X — per-KB image caption extraction (ingest-only).
+    # When True, the ingest path calls the vision LLM for every image
+    # in PDFs and emits ``chunk_type="image_caption"`` chunks. When
+    # False, all image extraction is suppressed for this KB even if
+    # the global ``RAG_IMAGE_CAPTIONS=1``. Useful for text-only KBs
+    # (security policies with org charts but no critical diagrams)
+    # where the per-image LLM round-trips slow ingest 5-10× and
+    # routinely OOM the worker. Per-KB explicit value (True or False)
+    # wins over the env flag.
+    "image_captions",
 })
 VALID_INT_KEYS = frozenset({
     # Pre-rerank pull cap. Overrides the intent-driven _per_kb default
@@ -101,11 +131,26 @@ VALID_INT_KEYS = frozenset({
     # Bounds enforced in validate_config.
     "chunk_tokens",
     "overlap_tokens",
+    # Phase 6.X (multi-entity decomposition — Method 3). Per-entity
+    # quota floor in ``merge_with_quota``. Each entity is guaranteed
+    # at least this many hits in the merged candidate set (or all of
+    # its hits, whichever is fewer). Default 10. Bounds [1, 50] —
+    # higher than 50 starts crowding out single-entity recall.
+    "multi_entity_min_per_entity",
 })
 VALID_FLOAT_KEYS = frozenset({
     "mmr_lambda",
 })
-VALID_KEYS = VALID_BOOL_KEYS | VALID_INT_KEYS | VALID_FLOAT_KEYS
+# Phase 6.X — string-typed enum keys. ``chunking_strategy`` is the only
+# member today; the validator enforces it's one of
+# ``_VALID_CHUNKING_STRATEGIES`` and silently drops anything else.
+# Keep this small — string sprawl in JSONB is the road to schema rot.
+VALID_STRING_KEYS = frozenset({
+    "chunking_strategy",
+})
+VALID_KEYS = (
+    VALID_BOOL_KEYS | VALID_INT_KEYS | VALID_FLOAT_KEYS | VALID_STRING_KEYS
+)
 
 # Keys that are NOT propagated into the request-scope overlay because the
 # underlying flag is read by the ingest process, not the retrieval hot
@@ -125,6 +170,13 @@ INGEST_ONLY_KEYS = frozenset({
     # not request-time routing — strip it from the flag overlay so it
     # doesn't leak into the retrieval hot path.
     "doc_summaries",
+    # Phase 6.6 — read directly by ``ingest.chunk_text_for_kb`` via
+    # ``get_chunking_strategy``. Not propagated to the flag overlay
+    # because the request hot path never branches on it.
+    "chunking_strategy",
+    # Phase 6.X — read by ``ingest.should_caption_images``. Ingest-side
+    # gate; the request hot path doesn't branch on it.
+    "image_captions",
 })
 
 # Mapping from JSON config key -> RAG_* env var name. Values are stringified
@@ -143,6 +195,15 @@ _KEY_TO_ENV: dict[str, str] = {
     "hyde": "RAG_HYDE",
     "hyde_n": "RAG_HYDE_N",
     "doc_summaries": "RAG_DOC_SUMMARIES",
+    # Phase 6.X — multi-entity decomposition / text filter / QU
+    # entity extract (Methods 3, 4, 5). All four keys are
+    # request-scoped: the bridge reads them via ``flags.get(...)``
+    # before deciding whether to fan out and how many sub-query hits
+    # each entity is guaranteed.
+    "multi_entity_decompose": "RAG_MULTI_ENTITY_DECOMPOSE",
+    "entity_text_filter": "RAG_ENTITY_TEXT_FILTER",
+    "qu_entity_extract": "RAG_QU_ENTITY_EXTRACT",
+    "multi_entity_min_per_entity": "RAG_MULTI_ENTITY_MIN_PER_ENTITY",
     # The QU LLM flags (RAG_QU_*) are cluster-wide and not exposed as
     # per-KB rag_config keys.
 }
@@ -204,6 +265,11 @@ def validate_config(raw: Mapping[str, Any]) -> dict[str, Any]:
                 continue
             if key == "hyde_n" and not (1 <= coerced <= 10):
                 continue
+            # Phase 6.X — multi-entity per-entity floor. Below 1 has no
+            # meaning (no quota); above 50 starts crowding out other
+            # signal at the rerank cut. Out-of-range silently drops.
+            if key == "multi_entity_min_per_entity" and not (1 <= coerced <= 50):
+                continue
             out[key] = coerced
         elif key in VALID_FLOAT_KEYS:
             try:
@@ -216,6 +282,18 @@ def validate_config(raw: Mapping[str, Any]) -> dict[str, Any]:
             if key == "mmr_lambda" and not (0.0 <= coerced_float <= 1.0):
                 continue
             out[key] = coerced_float
+        elif key in VALID_STRING_KEYS:
+            if not isinstance(value, str):
+                continue
+            coerced_str = value.lower().strip()
+            # Enum check per key. ``chunking_strategy`` is the only
+            # string key today; unknown values silently drop so a
+            # hand-edited row never silently switches the chunker on
+            # an admin who didn't expect it.
+            if key == "chunking_strategy":
+                if coerced_str not in _VALID_CHUNKING_STRATEGIES:
+                    continue
+            out[key] = coerced_str
     return out
 
 
@@ -251,6 +329,16 @@ def merge_configs(configs: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
             elif key in VALID_FLOAT_KEYS:
                 prev = merged.get(key)
                 merged[key] = max(float(value), float(prev)) if prev is not None else float(value)
+            elif key in VALID_STRING_KEYS:
+                prev = merged.get(key)
+                # ``chunking_strategy``: ``"structured"`` beats ``"window"`` so a
+                # KB that explicitly opted into structured chunking isn't
+                # silently downgraded by another KB stuck on the default.
+                # Other future string keys: first non-empty wins.
+                if key == "chunking_strategy" and value == "structured":
+                    merged[key] = value
+                elif prev is None:
+                    merged[key] = value
     return merged
 
 

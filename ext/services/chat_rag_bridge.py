@@ -565,6 +565,143 @@ async def _emit(cb: Optional[Callable[[dict], Awaitable[None]]], event: dict) ->
         _record_silent_failure("progress_emit", _err)
 
 
+async def _multi_entity_retrieve(
+    *,
+    entities: list,
+    base_query: str,
+    selected_kbs,
+    chat_id,
+    vector_store,
+    embedder,
+    per_kb_limit: int,
+    total_limit: int,
+    owner_user_id=None,
+    level_filter=None,
+    doc_ids=None,
+    temporal_constraint=None,
+):
+    """Multi-entity decomposed retrieval (Phase 6.X — Methods 3 + 4).
+
+    Fans out one parallel ``retrieve(...)`` call per named entity and
+    merges results with a per-entity quota floor. Each sub-call uses a
+    focus-shifted sub-query (``"<base> (focus on <entity>)"``); when
+    ``RAG_ENTITY_TEXT_FILTER=1`` (Method 4) it also passes
+    ``text_filter=entity`` so Qdrant restricts that bucket to chunks
+    literally naming the entity.
+
+    Per-entity floor comes from ``RAG_MULTI_ENTITY_MIN_PER_ENTITY``
+    (default 10, bounded [1, 50]). The floor is best-effort — when an
+    entity bucket has fewer hits than the floor, we take what exists
+    and let the top-up pass fill remaining slots from other buckets.
+
+    Method 4 fail-open: when the text filter pulls 0 hits for an
+    entity, we retry that entity's sub-query without the filter so a
+    too-strict lexical match doesn't silently leave the entity
+    unrepresented in the final candidate set. The retry is recorded
+    via ``rag_entity_text_filter_total{outcome="filter_empty_retry"}``.
+
+    All sub-calls go through the standard ``retrieve(...)`` so RBAC,
+    temporal filters, level filter, owner filter, and doc-id filter
+    apply unchanged. Only ``query`` and (optionally) ``text_filter``
+    differ across the N parallel calls.
+    """
+    import asyncio as _asyncio
+
+    from .multi_query import build_sub_queries, merge_with_quota
+    from .retriever import retrieve as _retrieve
+
+    pairs = build_sub_queries(base_query, entities)
+    text_filter_on = flags.get("RAG_ENTITY_TEXT_FILTER", "0") == "1"
+    try:
+        floor = int(flags.get("RAG_MULTI_ENTITY_MIN_PER_ENTITY") or "10")
+    except (TypeError, ValueError):
+        floor = 10
+    floor = max(1, min(floor, 50))
+
+    n_kbs = max(1, len(selected_kbs or []))
+    # Each per-entity sub-call asks for up to per_kb_limit chunks per KB.
+    # The total cap is per_kb_limit * n_kbs so an entity bucket isn't
+    # truncated below its KB share before the merge sees it.
+    sub_total = per_kb_limit * n_kbs
+
+    async def _retrieve_one(entity, sub_query, *, with_filter=True):
+        try:
+            return await _retrieve(
+                query=sub_query,
+                selected_kbs=selected_kbs,
+                chat_id=chat_id,
+                vector_store=vector_store,
+                embedder=embedder,
+                per_kb_limit=per_kb_limit,
+                total_limit=sub_total,
+                owner_user_id=owner_user_id,
+                level_filter=level_filter,
+                doc_ids=doc_ids,
+                temporal_constraint=temporal_constraint,
+                text_filter=(entity if (with_filter and text_filter_on) else None),
+            )
+        except Exception as exc:
+            _record_silent_failure(
+                f"multi_entity.retrieve[{str(entity)[:20]}]", exc,
+            )
+            return []
+
+    # Fan out N parallel retrievals — N == len(entities) ≤ 8.
+    raw_buckets = await _asyncio.gather(
+        *(_retrieve_one(e, sq) for (e, sq) in pairs),
+    )
+    per_entity_hits = {
+        e: hits for ((e, _), hits) in zip(pairs, raw_buckets)
+    }
+
+    # Method 4 fail-open. When a per-entity bucket comes back empty
+    # AND the text filter was on, retry that entity without the filter
+    # before declaring it has no data. This guards against a lexical
+    # filter that's too strict for an entity whose canonical surface
+    # form differs from corpus phrasing.
+    if text_filter_on:
+        empty = [e for e, hits in per_entity_hits.items() if not hits]
+        if empty:
+            sub_by_e = dict(pairs)
+            retry = await _asyncio.gather(
+                *(_retrieve_one(e, sub_by_e[e], with_filter=False) for e in empty),
+            )
+            for e, hits in zip(empty, retry):
+                per_entity_hits[e] = hits
+                try:
+                    from .metrics import rag_entity_text_filter_total
+                    rag_entity_text_filter_total.labels(
+                        outcome="filter_empty_retry"
+                    ).inc()
+                except Exception:
+                    pass
+
+    merged = merge_with_quota(
+        per_entity_hits=per_entity_hits,
+        k_min_per_entity=floor,
+        k_total=total_limit,
+    )
+
+    try:
+        from .metrics import (
+            rag_entity_text_filter_total,
+            rag_multi_query_decompose_total,
+        )
+
+        rag_multi_query_decompose_total.labels(outcome="decomposed").inc()
+        rag_entity_text_filter_total.labels(
+            outcome="applied" if text_filter_on else "bypassed"
+        ).inc()
+    except Exception:
+        pass
+
+    logger.info(
+        "rag: multi-entity decompose entities=%d filter=%s floor=%d total=%d -> %d hits",
+        len(entities), text_filter_on, floor, total_limit, len(merged),
+    )
+    return merged
+
+
 async def retrieve_kb_sources(
     kb_config: list,
     query: str,
@@ -1091,26 +1228,81 @@ async def _run_pipeline(
                         if (_hybrid is not None and _hybrid.source == "llm")
                         else None
                     )
+                    # Phase 6.X — multi-entity decomposition gate (Method 3).
+                    # When RAG_MULTI_ENTITY_DECOMPOSE=1 AND the query
+                    # contains ≥2 named entities, fan out one parallel
+                    # retrieve per entity and merge with a per-entity
+                    # quota. Default-off path is byte-identical to
+                    # pre-Phase-6: same single retrieve call, same
+                    # arguments, same return.
+                    _decompose_on = flags.get("RAG_MULTI_ENTITY_DECOMPOSE", "0") == "1"
+                    _entities: list = []
+                    _do_decompose = False
+                    if _decompose_on:
+                        try:
+                            from .entity_extractor import extract_entities
+                            from .multi_query import should_decompose
+
+                            _entities = extract_entities(query, qu_result=_hybrid)
+                            _do_decompose = should_decompose(
+                                entities=_entities,
+                                flag_on=True,
+                                intent=_intent,
+                            )
+                        except Exception as _exc:
+                            _record_silent_failure(
+                                "multi_entity.gate", _exc,
+                            )
+                            _do_decompose = False
+                    if not _do_decompose:
+                        # Telemetry for the "flag on, but query was
+                        # single-entity" case so operators can spot
+                        # corpora where decomposition never fires.
+                        try:
+                            from .metrics import rag_multi_query_decompose_total
+                            rag_multi_query_decompose_total.labels(
+                                outcome="skipped_flag_off"
+                                if not _decompose_on
+                                else "skipped_no_entities"
+                            ).inc()
+                        except Exception:
+                            pass
                     with span("embed.query", path="query"), flags.with_overrides(_retrieve_overrides):
                         # ``retrieve`` internally calls embedder.embed() — the
                         # embed.call span will nest under this embed.query span
                         # giving operators a clear query-embed timing.
-                        raw_hits = await retrieve(
-                            query=_retrieval_query,
-                            selected_kbs=selected_kbs,
-                            chat_id=chat_id,  # NOW PASSED THROUGH
-                            vector_store=_vector_store,
-                            embedder=_embedder,
-                            per_kb_limit=_per_kb,
-                            total_limit=_total,
-                            # P2.2: enforce per-user isolation on chat-scoped hits.
-                            # KB hits are unaffected (retriever only applies the owner
-                            # filter to chat namespaces).
-                            owner_user_id=user_id,
-                            level_filter=_level_filter,
-                            doc_ids=_date_doc_ids,
-                            temporal_constraint=_temporal_constraint,
-                        )
+                        if _do_decompose:
+                            raw_hits = await _multi_entity_retrieve(
+                                entities=_entities,
+                                base_query=_retrieval_query,
+                                selected_kbs=selected_kbs,
+                                chat_id=chat_id,
+                                vector_store=_vector_store,
+                                embedder=_embedder,
+                                per_kb_limit=_per_kb,
+                                total_limit=_total,
+                                owner_user_id=user_id,
+                                level_filter=_level_filter,
+                                doc_ids=_date_doc_ids,
+                                temporal_constraint=_temporal_constraint,
+                            )
+                        else:
+                            raw_hits = await retrieve(
+                                query=_retrieval_query,
+                                selected_kbs=selected_kbs,
+                                chat_id=chat_id,  # NOW PASSED THROUGH
+                                vector_store=_vector_store,
+                                embedder=_embedder,
+                                per_kb_limit=_per_kb,
+                                total_limit=_total,
+                                # P2.2: enforce per-user isolation on chat-scoped hits.
+                                # KB hits are unaffected (retriever only applies the owner
+                                # filter to chat namespaces).
+                                owner_user_id=user_id,
+                                level_filter=_level_filter,
+                                doc_ids=_date_doc_ids,
+                                temporal_constraint=_temporal_constraint,
+                            )
                 _retrieve_ms = int((time.perf_counter() - _tR) * 1000)
                 # B4 — tag the rag.retrieve span with the post-retrieval
                 # numbers so Jaeger shows hits + latency + sharding mode
@@ -1314,11 +1506,23 @@ async def _run_pipeline(
                 try:
                     from .mmr import mmr_rerank_from_hits
                     _mmr_lambda = float(flags.get("RAG_MMR_LAMBDA", "0.7"))
+                    # Phase 6.X — cap the MMR re-embed batch so multi-entity
+                    # decomposition (which can produce 200+ candidates) doesn't
+                    # OOM the GPU shared with TEI / QU / reranker. The
+                    # cross-encoder upstream has already ranked candidates;
+                    # MMR re-orders the top band only. Default 50; set 0 (or
+                    # unset) to restore pre-Phase-6 behaviour (no cap).
+                    try:
+                        _mmr_cap = int(flags.get("RAG_MMR_MAX_INPUT_SIZE") or "50")
+                    except (TypeError, ValueError):
+                        _mmr_cap = 50
+                    _mmr_cap = None if _mmr_cap <= 0 else _mmr_cap
                     _tM = time.perf_counter()
                     with time_stage("mmr"):
                         reranked = await mmr_rerank_from_hits(
                             _retrieval_query, reranked, _embedder,
                             top_k=_final_k, lambda_=_mmr_lambda,
+                            max_input_size=_mmr_cap,
                         )
                     await _emit(progress_cb, {
                         "stage": "mmr", "status": "done",
@@ -1330,6 +1534,23 @@ async def _run_pipeline(
                     # B6: still surface via warning + counter so a broken
                     # MMR (bad lambda, embedder issue) is alertable.
                     _record_silent_failure("mmr_rerank", _err)
+                    # Phase 6.X (Option B) — when MMR fails AND
+                    # ``RAG_MMR_FAIL_TRIM=1``, trim the cross-encoder
+                    # output to ``_final_k`` so downstream context_expand
+                    # doesn't multiply 50 candidates × 3 siblings each
+                    # into a 350K-token blob that the budget evicts down
+                    # to 3 hits. The cross-encoder ordering is preserved;
+                    # we just take its top _final_k. Default 0 = pre-fix
+                    # behaviour (all rerank survivors flow through).
+                    if (
+                        flags.get("RAG_MMR_FAIL_TRIM", "0") == "1"
+                        and len(reranked) > _final_k
+                    ):
+                        reranked = reranked[:_final_k]
+                        logger.info(
+                            "rag: mmr fail-trim active, kept top %d of cross-encoder",
+                            _final_k,
+                        )
                     await _emit(progress_cb, {
                         "stage": "mmr", "status": "error",
                     })
@@ -1358,10 +1579,34 @@ async def _run_pipeline(
                     _window = int(flags.get("RAG_CONTEXT_EXPAND_WINDOW", "1"))
                     _tE = time.perf_counter()
                     _before = len(reranked)
+                    # Phase 6.X (Option C) — cap how many top hits get
+                    # sibling-expanded. context_expand multiplies each
+                    # hit by ~3 (parent + 2 siblings); when the rerank
+                    # set is large (e.g. MMR fail keeps 50), the inflated
+                    # token count blows the budget and only 3 hits
+                    # survive. Cap >0: only the first N hits are sent
+                    # to expand_context; the tail is appended unchanged.
+                    # Default 0 = unlimited (pre-fix behaviour).
+                    try:
+                        _expand_cap = int(flags.get("RAG_CONTEXT_EXPAND_MAX_HITS") or "0")
+                    except (TypeError, ValueError):
+                        _expand_cap = 0
                     with time_stage("expand"):
-                        reranked = await expand_context(
-                            reranked, vs=_vector_store, window=_window,
-                        )
+                        if _expand_cap > 0 and len(reranked) > _expand_cap:
+                            _head = reranked[:_expand_cap]
+                            _tail = reranked[_expand_cap:]
+                            _expanded_head = await expand_context(
+                                _head, vs=_vector_store, window=_window,
+                            )
+                            reranked = list(_expanded_head) + list(_tail)
+                            logger.info(
+                                "rag: context_expand cap active, expanded top %d of %d",
+                                _expand_cap, _before,
+                            )
+                        else:
+                            reranked = await expand_context(
+                                reranked, vs=_vector_store, window=_window,
+                            )
                     await _emit(progress_cb, {
                         "stage": "expand", "status": "done",
                         "ms": int((time.perf_counter() - _tE) * 1000),

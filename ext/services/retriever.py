@@ -142,6 +142,7 @@ async def retrieve(
     level_filter: Optional[str] = None,
     doc_ids: Optional[list[int]] = None,
     temporal_constraint: Optional[dict] = None,
+    text_filter: Optional[str] = None,
 ) -> List[Hit]:
     """Run parallel searches against each selected KB and an optional chat namespace.
 
@@ -283,6 +284,7 @@ async def retrieve(
                         chat_id=chat_filter,
                         level=level_filter,
                         shard_keys=shard_keys,
+                        text_filter=text_filter,
                     )
                 return await vector_store.search(
                     collection, qvec, limit=per_kb_limit, subtag_ids=subtag_ids,
@@ -291,6 +293,7 @@ async def retrieve(
                     chat_id=chat_filter,
                     level=level_filter,
                     shard_keys=shard_keys,
+                    text_filter=text_filter,
                 )
         except Exception:
             return []

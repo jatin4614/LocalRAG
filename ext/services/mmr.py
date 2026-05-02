@@ -107,6 +107,7 @@ async def mmr_rerank_from_hits(
     *,
     top_k: int = 10,
     lambda_: float = 0.7,
+    max_input_size: int | None = None,
 ) -> list[Any]:
     """High-level helper: embed query + passages via embedder, run MMR.
 
@@ -114,14 +115,55 @@ async def mmr_rerank_from_hits(
     (the repository-wide Embedder protocol is already batch, so a single
     TEI call handles all passages + query together). A rare fallback path
     covers older clients that only expose ``embed_batch`` separately.
+
+    ``max_input_size`` (Phase 6.X): caps how many hits are sent to the
+    embedder for diversity scoring. The cross-encoder upstream has
+    already ranked the candidates; MMR's job is to re-order the top
+    band, not the entire candidate set. Passing all 200 hits under
+    multi-entity decomposition can OOM the GPU shared with TEI / QU /
+    reranker. Default ``None`` = no cap (byte-identical to pre-Phase-6
+    behaviour). When set, hits beyond the cap are appended after the
+    MMR-selected slice so we still return ``top_k`` items deterministically
+    even when the cap is below ``top_k``.
     """
     if not hits:
         return []
     if top_k >= len(hits):
         return list(hits)
 
-    with span("mmr.dedupe", input_size=len(hits), top_k=top_k, lambda_=lambda_):
-        return await _mmr_rerank_from_hits_impl(query, hits, embedder, top_k=top_k, lambda_=lambda_)
+    hits_list = list(hits)
+    if (
+        max_input_size is not None
+        and max_input_size > 0
+        and len(hits_list) > max_input_size
+    ):
+        # Run MMR on the top-N slice, append the remainder unchanged so
+        # the caller still has a full list of length up to len(hits).
+        # The cross-encoder ordering of the trimmed slice is preserved
+        # in the appended tail, which keeps the rerank-only quality on
+        # the rest of the candidate set.
+        head = hits_list[:max_input_size]
+        tail = hits_list[max_input_size:]
+        with span(
+            "mmr.dedupe",
+            input_size=len(head),
+            input_truncated=len(hits_list),
+            top_k=top_k,
+            lambda_=lambda_,
+        ):
+            mmr_head = await _mmr_rerank_from_hits_impl(
+                query, head, embedder, top_k=top_k, lambda_=lambda_,
+            )
+        # If MMR returned fewer than top_k (shouldn't happen but defensive),
+        # backfill from the tail to keep the contract.
+        if len(mmr_head) < top_k:
+            mmr_head = mmr_head + tail[: top_k - len(mmr_head)]
+        return mmr_head[:top_k]
+
+    with span("mmr.dedupe", input_size=len(hits_list), top_k=top_k, lambda_=lambda_):
+        return await _mmr_rerank_from_hits_impl(
+            query, hits_list, embedder, top_k=top_k, lambda_=lambda_,
+        )
 
 
 async def _mmr_rerank_from_hits_impl(

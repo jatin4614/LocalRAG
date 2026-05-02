@@ -419,7 +419,35 @@ services:
       RAG_GLOBAL_DRILLDOWN: ${RAG_GLOBAL_DRILLDOWN:-1}
       RAG_GLOBAL_DRILLDOWN_K: ${RAG_GLOBAL_DRILLDOWN_K:-2}
       RAG_GLOBAL_BUDGET_TOKENS: ${RAG_GLOBAL_BUDGET_TOKENS:-22000}
-      RAG_BUDGET_TOKENS: ${RAG_BUDGET_TOKENS:-10000}
+      # Bumped 10000 -> 22000 on 2026-05-01 (Phase 6.X). Multi-entity
+      # decomposition + context_expand inflate per-hit tokens; prior
+      # default evicted down to 3 hits on a 4-brigade query.
+      RAG_BUDGET_TOKENS: ${RAG_BUDGET_TOKENS:-22000}
+      # Cap MMR re-embed batch size. Pairs with multi-entity
+      # decomposition: cross-encoder already ranked the pool, MMR
+      # only diversifies the top band — sending all 200 candidates
+      # to TEI OOMs GPU 1.
+      RAG_MMR_MAX_INPUT_SIZE: ${RAG_MMR_MAX_INPUT_SIZE:-50}
+      # Phase 6.X — Option B: when MMR fails (TEI OOM under multi-entity
+      # decompose), trim cross-encoder output to _final_k before
+      # context_expand. Default 0 preserves pre-fix behaviour.
+      RAG_MMR_FAIL_TRIM: ${RAG_MMR_FAIL_TRIM:-0}
+      # Phase 6.X — Option C: cap how many top hits get sibling-expanded.
+      # Each expand_context call multiplies a hit by 1+2*window chunks,
+      # so 50 hits × window=1 → 150 chunks ≈ 350K tokens. 0 = unlimited.
+      # Default 4 (2026-05-01): focuses sibling richness on top-N
+      # results, preserves the rest unchanged. Beat A and B in trials
+      # because (a) QU LLM doesn't time out (fastembed stays on GPU),
+      # (b) date-filter intent is preserved, (c) only top-4 inflate
+      # before budget eviction.
+      RAG_CONTEXT_EXPAND_MAX_HITS: ${RAG_CONTEXT_EXPAND_MAX_HITS:-4}
+      # Phase 6.X — multi-entity decomposition (Methods 3 / 4 / 5).
+      # All default OFF — opt in per KB via Advanced Settings, or
+      # globally via these env vars. See .env.example for usage notes.
+      RAG_MULTI_ENTITY_DECOMPOSE: ${RAG_MULTI_ENTITY_DECOMPOSE:-0}
+      RAG_ENTITY_TEXT_FILTER: ${RAG_ENTITY_TEXT_FILTER:-0}
+      RAG_QU_ENTITY_EXTRACT: ${RAG_QU_ENTITY_EXTRACT:-0}
+      RAG_MULTI_ENTITY_MIN_PER_ENTITY: ${RAG_MULTI_ENTITY_MIN_PER_ENTITY:-10}
       # Plan B Phase 5.4 — per-document summary tier. When on, each KB
       # ingest emits one ``level=doc`` summary point (chat-model 3-line
       # synopsis, mirrored to kb_documents.doc_summary). Required for
@@ -491,6 +519,12 @@ services:
       # for backfill jobs that need OCR across every KB.
       RAG_OCR_ENABLED: ${RAG_OCR_ENABLED:-0}
       RAG_IMAGE_CAPTIONS: ${RAG_IMAGE_CAPTIONS:-0}
+      # Vision endpoint for image captions. Code default is vllm-vision
+      # (which doesn't exist in this deploy); explicit pass-through is
+      # required to route to vllm-chat / Gemma-4 multimodal.
+      RAG_VISION_URL: ${RAG_VISION_URL:-http://vllm-chat:8000/v1}
+      RAG_VISION_MODEL: ${RAG_VISION_MODEL:-orgchat-chat}
+      RAG_VISION_MAX_TOKENS: ${RAG_VISION_MAX_TOKENS:-800}
       RAG_STRUCTURED_CHUNKER: ${RAG_STRUCTURED_CHUNKER:-0}
       # Plan B Phase 5 — kb_1 alias points to custom-sharded kb_1_v4.
       # Ingest must derive a shard_key per document (filename-first, body
@@ -595,9 +629,22 @@ services:
       # tier; both sides need the same flag + chat-model URL/key/timeout.
       RAG_DOC_SUMMARIES: ${RAG_DOC_SUMMARIES:-1}
       RAG_DOC_SUMMARY_TIMEOUT: ${RAG_DOC_SUMMARY_TIMEOUT:-90}
+      # Phase 6.6 — structured chunker. Async ingest in celery-worker
+      # also calls chunk_text_for_kb, which double-gates on this env
+      # flag plus per-KB rag_config.chunking_strategy="structured".
+      # Without this mapping, async-ingested KBs would silently fall
+      # back to window even when opted in.
+      RAG_STRUCTURED_CHUNKER: ${RAG_STRUCTURED_CHUNKER:-0}
       OPENAI_API_BASE_URL: ${OPENAI_API_BASE_URL:-http://vllm-chat:8000/v1}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-sk-internal-dummy}
       SUMMARY_MODEL: ${SUMMARY_MODEL:-orgchat-chat}
+      # Vision-caption pipeline (Plan B Phase 6.7 + page-render fallback).
+      # The async ingest worker also runs extract_images_as_chunks; it
+      # needs the same vision endpoint + caption-token cap as open-webui.
+      RAG_IMAGE_CAPTIONS: ${RAG_IMAGE_CAPTIONS:-0}
+      RAG_VISION_URL: ${RAG_VISION_URL:-http://vllm-chat:8000/v1}
+      RAG_VISION_MODEL: ${RAG_VISION_MODEL:-orgchat-chat}
+      RAG_VISION_MAX_TOKENS: ${RAG_VISION_MAX_TOKENS:-800}
       # Phase A — offline-mode env. Models are baked into the image (see
       # Dockerfile.celery: fastembed cache at /opt/fastembed_cache,
       # tiktoken cache at /opt/tiktoken-cache). HF_TOKEN is the operator's

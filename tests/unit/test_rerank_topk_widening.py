@@ -132,8 +132,11 @@ def _install_mmr_stub(captured: dict[str, Any]) -> None:
     """Install an ``mmr_rerank_from_hits`` stub that records its ``top_k``."""
     import types
 
-    async def _stub_mmr(query, hits, embedder, *, top_k=10, lambda_=0.7):  # noqa: ARG001
+    async def _stub_mmr(  # noqa: ARG001
+        query, hits, embedder, *, top_k=10, lambda_=0.7, max_input_size=None,
+    ):
         captured.setdefault("mmr_top_k", []).append(top_k)
+        captured.setdefault("mmr_max_input_size", []).append(max_input_size)
         return list(hits)[:top_k]
 
     fake_mod = types.ModuleType("ext.services.mmr")

@@ -924,15 +924,22 @@ const ADV_SCHEMA = [
   { key: 'hyde',                  type: 'bool', label: 'HyDE expansion' },
   { key: 'doc_summaries',         type: 'bool', label: 'Per-doc summaries (ingest-only)' },
   { key: 'intent_routing',        type: 'bool', label: 'Intent routing' },
+  { key: 'multi_entity_decompose', type: 'bool', label: 'Multi-entity decomposition', help: 'Fans out multi-entity queries (numbered/bulleted lists) into one parallel retrieval per entity, then merges with a per-entity quota. Fixes the "low-frequency entity evicted" failure mode.' },
+  { key: 'entity_text_filter',    type: 'bool', label: 'Per-entity text filter', help: 'Adds a Qdrant must.match.text filter on the entity name for each per-entity sub-query. Hard precision boost. Pairs with multi-entity decomposition.' },
+  { key: 'qu_entity_extract',     type: 'bool', label: 'QU LLM entity extraction', help: 'Use entities from the QU LLM (no extra LLM call). Off -> regex extractor only.' },
+  { key: 'image_captions',        type: 'bool', label: 'Image captions on ingest (PDF only)', help: 'Per-KB override for RAG_IMAGE_CAPTIONS. Set OFF for text-only KBs (saves ~10x ingest wall-time, avoids worker OOM). ON for diagram-heavy corpora. Takes effect on next ingest.' },
   // Ints
   { key: 'top_k',                 type: 'int',  label: 'Top-K (pre-rerank pull)', min: 1, max: 200, help: 'Caps per-KB candidates pulled before rerank. Leave blank to inherit intent default (10/30/50). Bump for KBs whose queries enumerate many entities (e.g. 4 brigades) so low-frequency entities are not evicted.' },
   { key: 'rerank_top_k',          type: 'int',  label: 'Rerank top-K (final)',   min: 1, max: 1000, help: 'Final candidate count after rerank. Default 12 from RAG_RERANK_TOP_K.' },
   { key: 'context_expand_window', type: 'int',  label: 'Expand window',        min: 0,   max: 100 },
   { key: 'hyde_n',                type: 'int',  label: 'HyDE expansions',      min: 1,   max: 10 },
+  { key: 'multi_entity_min_per_entity', type: 'int', label: 'Multi-entity per-entity floor', min: 1, max: 50, help: 'Minimum hits each entity contributes to the merged candidate set. Default 10. Higher = stronger guarantee that low-frequency entities survive the rerank cut.' },
   { key: 'chunk_tokens',          type: 'int',  label: 'Chunk tokens (ingest)', min: 100, max: 2000 },
   { key: 'overlap_tokens',        type: 'int',  label: 'Overlap tokens (ingest)', min: 0,   max: 1000 },
   // Floats
   { key: 'mmr_lambda',            type: 'float', label: 'MMR λ',               min: 0,   max: 1, step: 0.05 },
+  // Strings (enum)
+  { key: 'chunking_strategy',     type: 'select', label: 'Chunking strategy (ingest-only)', options: ['window', 'structured'], help: 'window = sliding 800/100 token windows. structured = preserves tables/code as atomic units, segments on headings. Switching requires re-ingest of existing docs.' },
 ];
 
 function toggleAdvanced() {
@@ -978,6 +985,18 @@ function _renderAdvanced(rag_config) {
         document.getElementById(`adv-${f.key}-lbl`).textContent = `${f.label} (${inp.value})`;
       });
       cell.appendChild(inp);
+    } else if (f.type === 'select') {
+      const lbl = el('label', { text: f.label, attrs: { for: `adv-${f.key}` } });
+      cell.appendChild(lbl);
+      const sel = el('select', { attrs: { id: `adv-${f.key}` } });
+      const cur = rag_config[f.key] || (f.options && f.options[0]) || '';
+      for (const opt of (f.options || [])) {
+        const o = el('option', { text: opt, attrs: { value: opt } });
+        if (opt === cur) o.selected = true;
+        sel.appendChild(o);
+      }
+      cell.appendChild(sel);
+      if (f.help) cell.appendChild(el('span', { cls: 'sub', text: f.help }));
     }
     cell.appendChild(el('div', { cls: 'adv-err', attrs: { id: `adv-${f.key}-err` } }));
     grid.appendChild(cell);
@@ -1029,6 +1048,14 @@ function _collectAdvancedPayload() {
         continue;
       }
       payload[f.key] = v;
+    } else if (f.type === 'select') {
+      const raw = (inp.value || '').trim();
+      if (raw === '') continue;
+      if (Array.isArray(f.options) && !f.options.includes(raw)) {
+        errors[f.key] = `must be one of: ${f.options.join(', ')}`;
+        continue;
+      }
+      payload[f.key] = raw;
     }
   }
   return { payload, errors };

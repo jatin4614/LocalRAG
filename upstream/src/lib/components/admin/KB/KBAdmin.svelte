@@ -43,13 +43,19 @@
 		{ key: 'hyde',                  type: 'bool', label: 'HyDE expansion' },
 		{ key: 'doc_summaries',         type: 'bool', label: 'Per-doc summaries (ingest-only)' },
 		{ key: 'intent_routing',        type: 'bool', label: 'Intent routing' },
+		{ key: 'multi_entity_decompose', type: 'bool', label: 'Multi-entity decomposition', help: 'Fans out multi-entity queries (numbered/bulleted lists) into one parallel retrieval per entity, then merges with a per-entity quota. Fixes the "low-frequency entity gets evicted" failure mode.' },
+		{ key: 'entity_text_filter',    type: 'bool', label: 'Per-entity text filter', help: 'Adds a Qdrant must.match.text filter on the entity name for each per-entity sub-query. Hard precision boost. Pairs with multi-entity decomposition.' },
+		{ key: 'qu_entity_extract',     type: 'bool', label: 'QU LLM entity extraction', help: 'Use entities from the QU LLM (no extra LLM call). Off → regex extractor only.' },
+		{ key: 'image_captions',        type: 'bool', label: 'Image captions on ingest (PDF only)', help: 'Per-KB override for RAG_IMAGE_CAPTIONS. Set OFF for text-only KBs whose diagrams are decorative — saves ~10× ingest wall-time and avoids worker OOM on memory-pressured deployments. ON for diagram-heavy corpora (network maps, org charts). Takes effect on the NEXT ingest of new docs.' },
 		{ key: 'top_k',                 type: 'int',  label: 'Top-K (pre-rerank pull)', min: 1, max: 200, help: 'Caps per-KB candidates pulled before rerank. Leave blank to inherit intent default. Bump for KBs whose queries enumerate many entities.' },
 		{ key: 'rerank_top_k',          type: 'int',  label: 'Rerank top-K (final)', min: 1, max: 1000, help: 'Final candidate count after rerank. Default 12 from RAG_RERANK_TOP_K.' },
 		{ key: 'context_expand_window', type: 'int',  label: 'Expand window', min: 0, max: 100 },
 		{ key: 'hyde_n',                type: 'int',  label: 'HyDE expansions', min: 1, max: 10 },
+		{ key: 'multi_entity_min_per_entity', type: 'int', label: 'Multi-entity per-entity floor', min: 1, max: 50, help: 'Minimum hits each entity contributes to the merged candidate set. Default 10. Higher → stronger guarantee that low-frequency entities survive the rerank cut.' },
 		{ key: 'chunk_tokens',          type: 'int',  label: 'Chunk tokens (ingest)', min: 100, max: 2000 },
 		{ key: 'overlap_tokens',        type: 'int',  label: 'Overlap tokens (ingest)', min: 0, max: 1000 },
-		{ key: 'mmr_lambda',            type: 'float', label: 'MMR λ', min: 0, max: 1, step: 0.05, help: 'Lower = more diversity. Default 0.7 favours relevance.' }
+		{ key: 'mmr_lambda',            type: 'float', label: 'MMR λ', min: 0, max: 1, step: 0.05, help: 'Lower = more diversity. Default 0.7 favours relevance.' },
+		{ key: 'chunking_strategy',     type: 'select', label: 'Chunking strategy (ingest-only)', options: ['window', 'structured'], help: 'window = sliding 800/100 token windows (default). structured = preserves tables/code as atomic units, segments on headings. Switching requires re-ingest of existing docs to take effect.' }
 	];
 
 	async function loadAdvancedConfig() {
@@ -63,7 +69,9 @@
 			advConfig = {};
 			for (const f of ADV_SCHEMA) {
 				if (cfg[f.key] != null) advConfig[f.key] = cfg[f.key];
-				else advConfig[f.key] = (f.type === 'bool') ? false : '';
+				else if (f.type === 'bool') advConfig[f.key] = false;
+				else if (f.type === 'select') advConfig[f.key] = (f.options && f.options[0]) || '';
+				else advConfig[f.key] = '';
 			}
 		} catch (e) {
 			advError = 'Could not load: ' + e.message;
@@ -84,6 +92,9 @@
 			} else if (v === '' || v == null || (typeof v === 'string' && v.trim() === '')) {
 				// Empty numeric → omit (inherit process default).
 				continue;
+			} else if (f.type === 'select') {
+				// String enum — pass through as-is.
+				payload[f.key] = String(v);
 			} else {
 				payload[f.key] = (f.type === 'float') ? parseFloat(v) : parseInt(v, 10);
 			}
@@ -100,7 +111,9 @@
 			advConfig = {};
 			for (const f of ADV_SCHEMA) {
 				if (cfg[f.key] != null) advConfig[f.key] = cfg[f.key];
-				else advConfig[f.key] = (f.type === 'bool') ? false : '';
+				else if (f.type === 'bool') advConfig[f.key] = false;
+				else if (f.type === 'select') advConfig[f.key] = (f.options && f.options[0]) || '';
+				else advConfig[f.key] = '';
 			}
 			advStatus = 'Saved.';
 			setTimeout(() => { advStatus = ''; }, 2500);
@@ -113,7 +126,9 @@
 	function resetAdvancedField(key) {
 		const f = ADV_SCHEMA.find((x) => x.key === key);
 		if (!f) return;
-		advConfig[key] = (f.type === 'bool') ? false : '';
+		if (f.type === 'bool') advConfig[key] = false;
+		else if (f.type === 'select') advConfig[key] = (f.options && f.options[0]) || '';
+		else advConfig[key] = '';
 		advConfig = advConfig;
 	}
 
@@ -622,6 +637,19 @@
 																bind:value={advConfig[f.key]}
 																class="w-full"
 															/>
+														{:else if f.type === 'select'}
+															<label class="text-xs font-medium text-gray-600 dark:text-gray-400" for="adv-{f.key}-{selectedKB.id}">
+																{f.label}
+															</label>
+															<select
+																id="adv-{f.key}-{selectedKB.id}"
+																bind:value={advConfig[f.key]}
+																class="bg-gray-50 dark:bg-gray-900 border border-gray-300 dark:border-gray-700 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+															>
+																{#each (f.options || []) as opt}
+																	<option value={opt}>{opt}</option>
+																{/each}
+															</select>
 														{/if}
 														{#if f.help}
 															<span class="text-xs text-gray-400 dark:text-gray-500">{f.help}</span>

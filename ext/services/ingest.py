@@ -108,6 +108,38 @@ def should_contextualize(*, env_flag: str | None, kb_rag_config: dict | None) ->
     return (env_flag or "0") == "1"
 
 
+def should_caption_images(
+    *, env_flag: str | None, kb_rag_config: dict | None,
+) -> bool:
+    """Decide whether to extract+caption images for a given ingest.
+
+    Mirrors :func:`should_contextualize` precedence: per-KB explicit
+    value wins (True or False — both are explicit operator decisions),
+    falling back to the global ``RAG_IMAGE_CAPTIONS`` env flag.
+
+    The reason this matters: per-image vision-LLM round-trips dominate
+    ingest wall-time on PDFs with many diagrams, and routinely OOM the
+    celery worker on memory-pressured deployments. A pure-text KB
+    (e.g., a security-policy doc whose diagrams are decorative) can
+    opt out via ``rag_config.image_captions=false`` while the env
+    default stays on for image-rich corpora.
+
+    Args:
+        env_flag: raw value of ``RAG_IMAGE_CAPTIONS``. Only the literal
+            ``"1"`` enables; everything else (including ``None``)
+            disables.
+        kb_rag_config: the merged per-KB rag_config dict. Looks for the
+            literal key ``"image_captions"``.
+
+    Returns:
+        ``True`` to run image extraction + captioning, ``False`` to
+        skip it (no images extracted, no chunks emitted).
+    """
+    if kb_rag_config and "image_captions" in kb_rag_config:
+        return bool(kb_rag_config["image_captions"])
+    return (env_flag or "0") == "1"
+
+
 def _raptor_enabled() -> bool:
     """Read RAG_RAPTOR at call time via the flags overlay.
 
@@ -334,32 +366,45 @@ async def ingest_bytes(
                 extras["continuation"] = True
             chunk_extras.append(extras)
 
-    # Plan B Phase 6.7 — image-caption chunks. Triple-gated by
-    # ``RAG_IMAGE_CAPTIONS=1`` (default off) inside the helper. PDF only;
-    # other mime types short-circuit because the helper expects PDF bytes.
-    if mime_type == "application/pdf":
+    # Plan B Phase 6.7 — image-caption chunks. Quadruple-gated:
+    # (1) PDF mime, (2) per-KB ``image_captions`` rag_config (if set,
+    # wins absolute), (3) global ``RAG_IMAGE_CAPTIONS=1`` env, (4)
+    # vision service reachable. The per-KB gate runs HERE so a text-
+    # only KB can short-circuit the entire image extraction + vision
+    # LLM round-trip — the helper's internal env gate is left in
+    # place as a final safety net.
+    _do_captions = (
+        mime_type == "application/pdf"
+        and should_caption_images(
+            env_flag=os.environ.get("RAG_IMAGE_CAPTIONS"),
+            kb_rag_config=kb_rag_config,
+        )
+    )
+    if _do_captions:
         try:
             image_chunks = await extract_images_as_chunks(
                 pdf_bytes=data, filename=filename,
             )
         except Exception:  # noqa: BLE001 — fail-open
             image_chunks = []
-        for ic in image_chunks:
-            # Synthesize a minimal block — image lives at its own page,
-            # outside any structural heading. Use the first block as the
-            # fallback "host" for sheet/heading_path so downstream
-            # build_point_payload still gets non-None values where the
-            # block-level structure made sense.
-            fake_block = blocks[0] if blocks else None
-            paired.append((
-                _Chunk(index=len(paired), text=ic["text"]), fake_block,
-            ))
-            extras: dict = {"chunk_type": "image_caption"}
-            if ic.get("page") is not None:
-                extras["page"] = ic["page"]
-            if ic.get("language"):
-                extras["language"] = ic["language"]
-            chunk_extras.append(extras)
+    else:
+        image_chunks = []
+    for ic in image_chunks:
+        # Synthesize a minimal block — image lives at its own page,
+        # outside any structural heading. Use the first block as the
+        # fallback "host" for sheet/heading_path so downstream
+        # build_point_payload still gets non-None values where the
+        # block-level structure made sense.
+        fake_block = blocks[0] if blocks else None
+        paired.append((
+            _Chunk(index=len(paired), text=ic["text"]), fake_block,
+        ))
+        extras: dict = {"chunk_type": "image_caption"}
+        if ic.get("page") is not None:
+            extras["page"] = ic["page"]
+        if ic.get("language"):
+            extras["language"] = ic["language"]
+        chunk_extras.append(extras)
 
     if not paired:
         return 0
