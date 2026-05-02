@@ -169,6 +169,8 @@ WORKDIR /app/backend
 RUN apt-get update && apt-get install -y --no-install-recommends \
       curl ffmpeg pandoc netcat-openbsd \
       tesseract-ocr tesseract-ocr-eng \
+      tesseract-ocr-fra tesseract-ocr-deu tesseract-ocr-jpn \
+      tesseract-ocr-chi-sim tesseract-ocr-hin \
     && rm -rf /var/lib/apt/lists/*
 
 # Bring the entire installed Python tree from the builder. site-packages
