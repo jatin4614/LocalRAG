@@ -243,7 +243,16 @@ def validate_config(raw: Mapping[str, Any]) -> dict[str, Any]:
             # non-negative. Values outside bounds are dropped silently so
             # the KB inherits process defaults rather than ingesting at a
             # corrupt size.
-            if key == "chunk_tokens" and not (100 <= coerced <= 2000):
+            # Wave 2 (review §2.7): RAG_CHUNK_MAX_TOKENS env-driven ceiling.
+            # bge-m3 supports up to 8192; the historical 2000 cap was tied to
+            # cl100k-tokenizer / older models. Operators can raise this when
+            # ingesting long-form docs that benefit from larger chunks.
+            import os as _os_local
+            try:
+                _chunk_max = int(_os_local.environ.get("RAG_CHUNK_MAX_TOKENS", "2000"))
+            except (TypeError, ValueError):
+                _chunk_max = 2000
+            if key == "chunk_tokens" and not (100 <= coerced <= _chunk_max):
                 continue
             if key == "overlap_tokens":
                 # Cross-field check is handled at apply time (ingest reads
@@ -409,8 +418,16 @@ def resolve_chunk_params(
         except (TypeError, ValueError):
             env_chunk_overlap = 100
 
-    chunk_tokens = int(cfg.get("chunk_tokens") or env_chunk_size)
-    overlap_tokens = int(cfg.get("overlap_tokens") or env_chunk_overlap)
+    # Wave 2 (review §2.6): use `if "key" in cfg` precedence — `cfg.get(key)
+    # or env_default` falls through to env when the operator legitimately set
+    # 0 (overlap_tokens=0 is a valid value). Surprising bug if the operator
+    # explicitly disables overlap and the env default re-enables it.
+    chunk_tokens = (
+        int(cfg["chunk_tokens"]) if "chunk_tokens" in cfg else env_chunk_size
+    )
+    overlap_tokens = (
+        int(cfg["overlap_tokens"]) if "overlap_tokens" in cfg else env_chunk_overlap
+    )
 
     # Safety clip — chunker raises if overlap >= chunk_tokens. Clip down
     # rather than raise so one bad row doesn't block a whole reingest.
