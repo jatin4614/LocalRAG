@@ -66,16 +66,18 @@ def test_time_stage_records_positive_duration():
 
 
 def test_retrieval_hits_counter_increments():
-    """retrieval_hits_total increments per KB/path combo."""
-    metrics.retrieval_hits_total.labels(kb="1", path="hybrid").inc()
-    metrics.retrieval_hits_total.labels(kb="1", path="hybrid").inc(2)
+    """retrieval_hits_total increments per (kb_count, kb_primary, path) combo (review §8.6)."""
+    metrics.retrieval_hits_total.labels(kb_count="2", kb_primary="1", path="hybrid").inc()
+    metrics.retrieval_hits_total.labels(kb_count="2", kb_primary="1", path="hybrid").inc(2)
 
     total = 0.0
     for mf in prometheus_client.REGISTRY.collect():
         if mf.name != "rag_retrieval_hits":
             continue
         for s in mf.samples:
-            if s.name == "rag_retrieval_hits_total" and s.labels == {"kb": "1", "path": "hybrid"}:
+            if s.name == "rag_retrieval_hits_total" and s.labels == {
+                "kb_count": "2", "kb_primary": "1", "path": "hybrid",
+            }:
                 total = s.value
     assert total >= 3.0
 

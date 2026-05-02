@@ -1373,15 +1373,25 @@ async def _run_pipeline(
                 })
 
             # Per-hit KB counter. Fails open — any bad payload is silently
-            # tagged as kb="unknown" so the counter is never "missing".
+            # tagged as kb_primary="unknown" so the counter is never "missing".
+            # Review §8.6: labels are (kb_count, kb_primary, path) — kb_count
+            # is the request-level selection size (bounded by platform KB
+            # count); kb_primary is the hit's own kb_id. Replaces the legacy
+            # ``kb`` label that risked becoming a comma-joined cardinality
+            # footgun once downstream code joined selection lists.
             try:
                 _path = "hybrid" if _hybrid_flag else "dense"
+                _kb_count_label = str(len(_kb_ids_for_log))
                 for _h in raw_hits:
                     _payload = getattr(_h, "payload", None) or {}
                     _kb = _payload.get("kb_id")
                     if _kb is None:
                         _kb = "chat" if _payload.get("chat_id") is not None else "unknown"
-                    retrieval_hits_total.labels(kb=str(_kb), path=_path).inc()
+                    retrieval_hits_total.labels(
+                        kb_count=_kb_count_label,
+                        kb_primary=str(_kb),
+                        path=_path,
+                    ).inc()
             except Exception as _err:
                 _record_silent_failure("hit_counter_emit", _err)
 
