@@ -163,6 +163,22 @@ Every behavior change ships behind a flag, default OFF for first deploy. Soak 7 
 
 (Updated as commits land. Newest first.)
 
+### Wave 2 round 5 (4 background agents quota-capped + 5 inline; 9 fixes shipped)
+
+- 2026-05-02 `8cfcb2f` — Inline §11.12: open-webui depends_on tei + vllm-chat healthy.
+- 2026-05-02 `bc2c5d0` — Inline §11.15: rename k8s/ → k8s.future/ + test fix.
+- 2026-05-02 `f124f5a` — Inline §10.8: PYTHONDONTWRITEBYTECODE in openwebui runtime stage.
+- 2026-05-02 `83c66e9` — Inline §2.8: chunk_index=None for doc-summary points.
+- 2026-05-02 `a2fd533` — Inline §2.6 + §2.7: if-key-in-cfg precedence + RAG_CHUNK_MAX_TOKENS env ceiling.
+- 2026-05-02 `839ca09` — G-2 §10.4: openwebui multi-stage build (3 stages).
+- 2026-05-02 `61f2028` — G-2 §10.2: install cu128 torch BEFORE upstream requirements.
+- 2026-05-02 `e5734ce` — B §2.2: real tokenizer in chunker_structured.
+- 2026-05-02 `6fa4911` — B §2.1: CLAUDE.md fix — structured chunker IS wired.
+- (quota-capped) — B residuals: §2.4 pipe-table strict, §2.5 pysbd multilingual.
+- (quota-capped) — G-2 residuals: §10.5 celery req extraction, §10.6 healthchecks, §10.7 BuildKit secrets, §10.9 Tesseract langs.
+- (quota-capped, 0 commits) — E-2: §6.6, §6.10, §6.11, §6.12.
+- (quota-capped, 0 commits) — G-3: §11.4, §11.5, §11.9, §11.11.
+
 ### Wave 2 round 4 (4 background agents, 17 fixes shipped, 1 dedup-skip)
 
 - 2026-05-02 `3bed794` — D-2 §5.15: RAG_TOTAL_BUDGET_SEC pipeline timeout (asyncio.wait_for + degraded fallback).
