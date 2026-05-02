@@ -32,6 +32,29 @@ from .celery_app import app
 log = logging.getLogger("orgchat.ingest_worker")
 
 
+def _safe_truncate(msg: str, max_len: int = 500) -> str:
+    """Truncate a string to a UTF-8 byte budget without splitting codepoints.
+
+    Bug-fix campaign §1.7: the failure-path previously stamped
+    ``error_message`` via ``f"...{exc}"[:500]``. Python's ``str[:N]``
+    slices by codepoints, not bytes, so a 500-codepoint string can hold
+    up to 2000 bytes of CJK / Devanagari / emoji — bypassing the
+    intended size cap. Worse, the sync-upload sibling helper in
+    ``ext/routers/upload.py`` (also named ``_safe_truncate``) treats
+    ``max_len`` as bytes; the two paths produced different
+    ``error_message`` strings on identical errors.
+
+    Mirrors the upload-router helper byte-for-byte: encode → byte slice
+    → decode with ``errors='ignore'`` so a mid-codepoint cut silently
+    drops the dangling partial bytes instead of producing mojibake or
+    a U+FFFD replacement char.
+    """
+    if len(msg.encode("utf-8")) <= max_len:
+        return msg
+    encoded = msg.encode("utf-8")[:max_len]
+    return encoded.decode("utf-8", errors="ignore")
+
+
 # Lazy module-level engine cache. Bug-fix campaign §1.6: prior to this fix,
 # every ``_update_doc_status`` / ``_fetch_kb_rag_config`` call created and
 # disposed a SQLAlchemy engine, costing ~1000 inits on a 1000-doc batch.
@@ -330,7 +353,9 @@ def ingest_blob(
             try:
                 asyncio.run(_update_doc_status(
                     _doc_id, "failed",
-                    error_message=f"{type(exc).__name__}: {exc}"[:500],
+                    error_message=_safe_truncate(
+                        f"{type(exc).__name__}: {exc}", 500,
+                    ),
                 ))
             except Exception:  # noqa: BLE001 — best-effort
                 pass
