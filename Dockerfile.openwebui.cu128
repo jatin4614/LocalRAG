@@ -1,12 +1,27 @@
 # Custom build: upstream Open WebUI + our KB extension
 # CU128 VARIANT — torch cu128 / 2.7+ for Blackwell (sm_120) GPU support.
-# Difference from the production Dockerfile.openwebui:
+#
+# Differences from the production Dockerfile.openwebui:
 #   - torch pulled from --index-url https://download.pytorch.org/whl/cu128
 #   - torch pinned to >=2.7 (first release with Blackwell sm_120 kernels)
 #   - sentence-transformers >=3.3 and transformers >=4.49 (torch 2.7 compat)
+#
+# Multi-stage layout (review §10.4) — single-stage builds carried gcc / g++
+# / build-essential + pip cache + apt list cache into the runtime image
+# (~1.5-2 GB waste). Now:
+#   1. `frontend-build`  : node:22-alpine, builds the SvelteKit frontend.
+#   2. `python-builder`  : python:3.11 + build-essential + gcc/g++,
+#                          installs every Python wheel, runs the model
+#                          pre-download steps (tiktoken + fastembed +
+#                          ColBERT). Produces /usr/local/lib/python3.11
+#                          + /opt/{tiktoken,fastembed}_cache.
+#   3. final stage       : python:3.11-slim-bookworm with ONLY runtime
+#                          apt deps (curl, ffmpeg, pandoc, netcat-openbsd,
+#                          tesseract). Copies site-packages + model caches
+#                          from the builder. No compilers, no apt cache.
 
 ######## Frontend build ########
-FROM node:22-alpine3.20 AS build
+FROM node:22-alpine3.20 AS frontend-build
 WORKDIR /app
 
 COPY upstream/package.json upstream/package-lock.json ./
@@ -17,22 +32,19 @@ COPY upstream/ .
 
 RUN npm run build
 
-######## Backend ########
-FROM python:3.11-slim-bookworm
+######## Python builder (compilers + pre-downloads) ########
+FROM python:3.11-slim-bookworm AS python-builder
 
-ARG UID=0
-ARG GID=0
-
-ENV ENV=prod \
-    PORT=8080 \
-    WEBUI_AUTH=true
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
 WORKDIR /app/backend
 
-# System deps (matching upstream + Plan B Phase 6.3 OCR baseline)
+# Builder-only system deps. gcc/g++/build-essential are needed for any
+# source-only Python wheels (e.g. argon2-cffi, pycrdt). Tesseract is NOT
+# installed here — it's a runtime apt dep in the final stage.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      curl gcc g++ ffmpeg pandoc netcat-openbsd \
-      tesseract-ocr tesseract-ocr-eng \
+      build-essential gcc g++ \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv (fast resolver/installer) first.
@@ -89,13 +101,12 @@ RUN uv pip install --system --no-cache-dir \
     "nvidia-cufft-cu12" \
     "nvidia-curand-cu12"
 
-ENV LD_LIBRARY_PATH=/usr/local/lib/python3.11/site-packages/nvidia/cudnn/lib:/usr/local/lib/python3.11/site-packages/nvidia/cublas/lib:/usr/local/lib/python3.11/site-packages/nvidia/cuda_runtime/lib:/usr/local/lib/python3.11/site-packages/nvidia/cuda_nvrtc/lib:/usr/local/lib/python3.11/site-packages/nvidia/cufft/lib:/usr/local/lib/python3.11/site-packages/nvidia/curand/lib:$LD_LIBRARY_PATH
-
 # Plan B Phase 6.3 — OCR fallback for scanned PDFs.
-# Tesseract apt package is installed above; pytesseract is the Python binding,
-# pymupdf rasterizes pages, pillow handles the in-memory image. Cloud backends
-# (boto3, google-cloud-documentai) are NOT installed by default — operators
-# must opt in per ext/services/ocr.py + docs/runbook/ocr-runbook.md.
+# Tesseract apt package is installed in the final stage; pytesseract is the
+# Python binding, pymupdf rasterizes pages, pillow handles the in-memory
+# image. Cloud backends (boto3, google-cloud-documentai) are NOT installed
+# by default — operators must opt in per ext/services/ocr.py +
+# docs/runbook/ocr-runbook.md.
 RUN uv pip install --system --no-cache-dir \
     pytesseract==0.3.13 \
     pymupdf==1.24.10 \
@@ -122,8 +133,7 @@ RUN uv pip install --system --no-cache-dir \
 # generic template). Also pre-cache o200k_base in case ever needed.
 ENV TIKTOKEN_CACHE_DIR=/opt/tiktoken-cache
 RUN mkdir -p /opt/tiktoken-cache && \
-    python -c "import tiktoken; tiktoken.get_encoding('cl100k_base'); tiktoken.get_encoding('o200k_base')" && \
-    ls -la /opt/tiktoken-cache/
+    python -c "import tiktoken; tiktoken.get_encoding('cl100k_base'); tiktoken.get_encoding('o200k_base')"
 
 # Phase A — pre-download fastembed models (ColBERT + sparse BM25) into
 # /opt/fastembed_cache. Mirrors Dockerfile.celery so worker + open-webui
@@ -139,23 +149,59 @@ LateInteractionTextEmbedding(model_name='colbert-ir/colbertv2.0', cache_dir='/op
 SparseTextEmbedding(model_name='Qdrant/bm25', cache_dir='/opt/fastembed_cache');\
 print('fastembed cache populated')"
 
+######## Final runtime image (no compilers, no apt cache) ########
+FROM python:3.11-slim-bookworm
+
+ARG UID=0
+ARG GID=0
+
+ENV ENV=prod \
+    PORT=8080 \
+    WEBUI_AUTH=true
+
+WORKDIR /app/backend
+
+# Runtime apt deps only. gcc/g++/build-essential are NOT installed (they
+# lived in python-builder). Tesseract OCR baseline (en) is shipped here;
+# multilingual language packs are added in a separate commit (§10.9).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl ffmpeg pandoc netcat-openbsd \
+      tesseract-ocr tesseract-ocr-eng \
+    && rm -rf /var/lib/apt/lists/*
+
+# Bring the entire installed Python tree from the builder. site-packages
+# under /usr/local/lib/python3.11 + console-script entrypoints under
+# /usr/local/bin. The builder used --no-cache-dir so there's no pip
+# wheel cache to leak through.
+COPY --from=python-builder /usr/local/lib/python3.11 /usr/local/lib/python3.11
+COPY --from=python-builder /usr/local/bin /usr/local/bin
+
+# Pre-baked model caches (tiktoken encodings + fastembed ColBERT/BM25).
+COPY --from=python-builder /opt/tiktoken-cache /opt/tiktoken-cache
+COPY --from=python-builder /opt/fastembed_cache /opt/fastembed_cache
+
+ENV TIKTOKEN_CACHE_DIR=/opt/tiktoken-cache \
+    FASTEMBED_CACHE_PATH=/opt/fastembed_cache
+
+# Wire the bundled CUDA libs into LD_LIBRARY_PATH so onnxruntime's dlopen
+# resolves libcublasLt.so.12 / libcudnn.so.9 / etc. without a host CUDA
+# toolkit. (The nvidia-*-cu12 wheels live inside site-packages copied
+# from the builder above.)
+ENV LD_LIBRARY_PATH=/usr/local/lib/python3.11/site-packages/nvidia/cudnn/lib:/usr/local/lib/python3.11/site-packages/nvidia/cublas/lib:/usr/local/lib/python3.11/site-packages/nvidia/cuda_runtime/lib:/usr/local/lib/python3.11/site-packages/nvidia/cuda_nvrtc/lib:/usr/local/lib/python3.11/site-packages/nvidia/cufft/lib:/usr/local/lib/python3.11/site-packages/nvidia/curand/lib:$LD_LIBRARY_PATH
+
 # Phase A — offline mode flags. With tiktoken + fastembed cached above
 # AND the runtime bind-mount of /home/vogic/LocalRAG/volumes/hf-cache
 # providing the bge-reranker-v2-m3 cache, every model load happens from
 # disk. HF_HUB_OFFLINE=1 makes any escapee fail loudly at import time
 # instead of silently fetching at first use.
-#
-# NOT set: HF_HUB_OFFLINE in the build-time RUN that pre-downloads
-# fastembed (downloads happen during the same RUN above, so the model
-# is already on disk by the time these ENVs apply to subsequent layers).
 ENV HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1 \
     HF_DATASETS_OFFLINE=1
 
 # Frontend build output
-COPY --from=build /app/build /app/build
-COPY --from=build /app/CHANGELOG.md /app/CHANGELOG.md
-COPY --from=build /app/package.json /app/package.json
+COPY --from=frontend-build /app/build /app/build
+COPY --from=frontend-build /app/CHANGELOG.md /app/CHANGELOG.md
+COPY --from=frontend-build /app/package.json /app/package.json
 
 # Upstream backend (with our patches already applied)
 COPY upstream/backend/ .
