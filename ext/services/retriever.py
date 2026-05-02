@@ -117,15 +117,33 @@ def merge_kb_results(
     # production hits with sparse payloads (e.g. chat-private docs that
     # don't carry kb_id) would all collapse to the (None, None, None) key
     # and overwrite each other.
+    #
+    # §5.12: doc-summary and RAPTOR-level points carry ``chunk_index=None``
+    # and a non-default ``level`` ("doc", "1", "2", ...). Two such points
+    # for the same (kb_id, doc_id) but different levels (doc-summary +
+    # RAPTOR L1 month, say) used to collide on the (kb_id, doc_id, None)
+    # key and silently overwrite each other. Substitute ``"DOC:{level}"``
+    # for the chunk_index slot when chunk_index is None AND we have a
+    # real doc identity (kb_id+doc_id) so distinct levels stay in distinct
+    # RRF buckets. Regular chunks (chunk_index=0, 1, ...) keep their
+    # integer index — that path is unchanged. Hits without any payload
+    # identity (e.g. chat-private legacy hits with only ``id`` set) still
+    # fall back to the hit id as before.
     rrf_scores: dict = {}
     hit_by_key: dict = {}
     for _kb_id, hits in per_kb.items():
         for rank, h in enumerate(hits):
-            payload_key = (
-                _field(h, "kb_id"),
-                _field(h, "doc_id"),
-                _field(h, "chunk_index"),
-            )
+            kb_id = _field(h, "kb_id")
+            doc_id = _field(h, "doc_id")
+            chunk_idx = _field(h, "chunk_index")
+            if chunk_idx is None and (kb_id is not None or doc_id is not None):
+                # doc-summary / RAPTOR-level point — disambiguate by level
+                # so chunk_index=None doesn't collide across levels.
+                level = _field(h, "level") or "doc"
+                chunk_slot: Any = f"DOC:{level}"
+            else:
+                chunk_slot = chunk_idx
+            payload_key = (kb_id, doc_id, chunk_slot)
             key = payload_key if any(v is not None for v in payload_key) else _field(h, "id")
             rrf_scores[key] = rrf_scores.get(key, 0.0) + 1.0 / (RRF_K + rank + 1)
             hit_by_key[key] = h
