@@ -180,17 +180,23 @@ async def stream_retrieval(
                         yield _sse("done", {})
                         break
                     # First real event → record TTFT on the recorder so
-                    # the canonical histogram gets the observation. TPOT
-                    # is observed manually for subsequent events; the
-                    # recorder's automatic TPOT path needs completion
-                    # tokens (which we don't have for SSE retrieval).
+                    # the canonical histogram gets the observation. For
+                    # subsequent events, observe SSE event spacing into
+                    # ``sse_event_interval_seconds`` (review §6.5).
+                    # Originally this used ``llm_tpot_seconds`` which was
+                    # misleading — the SSE stream never sees actual LLM
+                    # tokens (the chat-LLM call is fired by the frontend
+                    # in parallel and goes through upstream's middleware).
+                    # The new metric is the dedicated home for event
+                    # spacing so the LLM TPOT histogram stays a pure
+                    # measure of streaming-LLM behaviour.
                     _now = perf_counter()
                     try:
                         if _llm_rec._first_token_at is None:
                             _llm_rec.set_first_token_at(_now)
                         elif _last_event_t is not None:
-                            from ..services.metrics import llm_tpot_seconds
-                            llm_tpot_seconds.labels(model=_model).observe(
+                            from ..services.metrics import sse_event_interval_seconds
+                            sse_event_interval_seconds.labels(model=_model).observe(
                                 _now - _last_event_t,
                             )
                     except Exception:
