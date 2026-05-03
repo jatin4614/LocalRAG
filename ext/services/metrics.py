@@ -629,3 +629,26 @@ rag_snapshot_failure_total = Counter(
     "label collection='_list_collections' means the task couldn't list collections at all.",
     labelnames=["collection"],
 )
+
+
+# ---------------------------------------------------------------------------
+# Wave 2 round 6 (review §6.11) — Calibrated abstention.
+#
+# Incremented once per request when ``compute_abstention_prefix`` decides
+# the avg rerank-top-k score is below ``RAG_ABSTENTION_THRESHOLD`` (default
+# 0.1) and ``RAG_ENFORCE_ABSTENTION=1``. The label is the per-request
+# intent (``specific`` | ``global`` | ``metadata`` | ``specific_date``).
+#
+# Operator interpretation:
+#   * Sustained ramp on intent=metadata → catalog drift; KBs no longer
+#     match user queries by metadata.
+#   * Sustained ramp on intent=specific → corpus drift OR a regression in
+#     embedding/rerank quality.
+#   * Persistent caveat tag on user-visible answers → consider lowering the
+#     threshold OR widening retrieval (top_k bump, rerank_top_k bump).
+# ---------------------------------------------------------------------------
+rag_abstention_caveat_added_total = Counter(
+    "rag_abstention_caveat_added_total",
+    "Per-request abstention caveat added to the system prompt (review §6.11)",
+    labelnames=["intent"],
+)
