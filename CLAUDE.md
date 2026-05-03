@@ -118,6 +118,8 @@ ADMIN_EMAIL=… ADMIN_PASSWORD=… .venv/bin/python scripts/seed_admin.py
 
 **Daily**: `docker compose logs -f open-webui celery-worker vllm-chat`; Prometheus 9091; Jaeger 16686; `curl localhost:6333/cluster`.
 
+**Backup / restore**: see `docs/runbook/backup-restore.md`. Daily Qdrant snapshots fire automatically via `ext/workers/snapshot_task.py` (Celery beat, 02:30 UTC). Before risky changes (schema migrations, Qdrant collection changes), the operator MUST run `scripts/backup_postgres.sh` + `scripts/backup_qdrant.sh` and verify via `scripts/restore_drill.sh`.
+
 **Tests**: `.venv/bin/pytest -q` (host `pytest` may not be on PATH). Mandatory CI: 6 isolation tests + RBAC tests + `make eval-baseline` (no >5pp nDCG@10 regression vs committed baseline).
 
 **Image gotchas**: `Dockerfile.celery` is intentionally minimal — heavy reranker/embed live in open-webui. First-time celery image build ~30 min (fastembed onnxruntime). After rebuilding worker, also `docker tag orgchat-celery-worker:latest orgchat-celery-beat:latest` + recreate beat.
