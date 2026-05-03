@@ -643,6 +643,28 @@ rag_snapshot_failure_total = Counter(
 
 
 # ---------------------------------------------------------------------------
+# Bug-fix campaign §1.8 — ingest worker DB status update failure counter.
+#
+# Incremented when ``_update_doc_status`` cannot write the
+# ``kb_documents.ingest_status`` transition (e.g. Postgres outage,
+# cross-loop asyncpg fallout, transient connection error). Paired with
+# a ``log.error`` (replacing the previous silent ``log.warning``) so an
+# operator wires a Prometheus alert and learns about "ingest_status
+# stuck at chunking even though Qdrant has the chunks" within minutes
+# instead of days.
+#
+# label ``stage`` = the status the helper was trying to write
+# (``queued`` | ``chunking`` | ``embedding`` | ``done`` | ``failed``).
+# Cardinality bounded by the CHECK constraint in migration 012.
+# ---------------------------------------------------------------------------
+ingest_status_update_failed_total = Counter(
+    "ingest_status_update_failed_total",
+    "Failures writing kb_documents.ingest_status from the celery ingest worker",
+    labelnames=["stage"],
+)
+
+
+# ---------------------------------------------------------------------------
 # Wave 2 round 6 (review §6.11) — Calibrated abstention.
 #
 # Incremented once per request when ``compute_abstention_prefix`` decides

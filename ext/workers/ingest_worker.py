@@ -65,14 +65,16 @@ def _safe_truncate(msg: str, max_len: int = 500) -> str:
 _engine_singleton: object | None = None
 
 
-def _create_async_engine(db_url: str):
+def _create_async_engine(db_url: str, **kwargs):
     """Thin wrapper around ``sqlalchemy.ext.asyncio.create_async_engine``.
 
     Exists as a separate module attribute so tests can monkeypatch the
     engine factory directly (see ``tests/unit/test_ingest_worker_engine_singleton.py``).
+    Passes through any kwargs (e.g. ``poolclass``) so callers can request
+    a specific pool implementation without re-wiring the factory.
     """
     from sqlalchemy.ext.asyncio import create_async_engine as _ce
-    return _ce(db_url, pool_pre_ping=True)
+    return _ce(db_url, pool_pre_ping=True, **kwargs)
 
 
 def _normalize_db_url() -> str:
@@ -91,6 +93,22 @@ def _get_engine():
     """Return the cached async engine, creating it on first call.
 
     Returns ``None`` when ``DATABASE_URL`` is unset (test or stand-alone mode).
+
+    Bug-fix campaign §1.8: the engine is configured with
+    ``poolclass=NullPool`` so each ``engine.begin()`` opens a fresh
+    asyncpg connection bound to the CURRENT event loop. Celery's prefork
+    workers run every task under a new ``asyncio.run(...)`` scope; with
+    the default ``QueuePool`` the cached pool's connections were pinned
+    to the loop alive at first-fill, and the second task tripped
+    ``RuntimeError: Event loop is closed`` / ``Future ... attached to a
+    different loop`` — silently swallowed by ``_update_doc_status``'s
+    broad except, leaving ``kb_documents.ingest_status`` stuck at
+    ``chunking`` even after Qdrant ingest succeeded.
+
+    NullPool means a per-call connect (~5-10ms locally). Acceptable: the
+    two helpers that go through this engine fire at most ~4 times per
+    ingest task; heavy work (chunking, embedding, upsert) does not touch
+    this engine.
     """
     global _engine_singleton
     if _engine_singleton is not None:
@@ -98,7 +116,8 @@ def _get_engine():
     db_url = _normalize_db_url()
     if not db_url:
         return None
-    _engine_singleton = _create_async_engine(db_url)
+    from sqlalchemy.pool import NullPool
+    _engine_singleton = _create_async_engine(db_url, poolclass=NullPool)
     return _engine_singleton
 
 
@@ -120,6 +139,15 @@ async def _update_doc_status(
     ``status='failed'``) so admins can see WHY a doc failed without
     grepping celery logs. Mirrors the sync upload path in
     ext/routers/upload.py which also stamps error_message on failure.
+
+    Bug-fix campaign §1.8: the failure path was previously
+    ``log.warning`` only — when a cross-loop asyncpg blowup silently
+    dropped every status transition, operators saw "ingest_status stuck
+    at chunking" with NO indication anything was wrong, because there
+    was no DB error in the celery logs at WARNING level (most operators
+    tail at ERROR+ in production). Bumped to ``log.error`` and paired
+    with ``ingest_status_update_failed_total{stage=<status>}`` so a
+    Prometheus alert can fire without grepping logs.
     """
     if doc_id is None:
         return
@@ -140,11 +168,16 @@ async def _update_doc_status(
         async with engine.begin() as conn:
             await conn.execute(_sql(sql), params)
     except Exception as e:  # noqa: BLE001 — best-effort
-        log.warning(
+        log.error(
             "ingest: failed to update kb_documents.ingest_status "
             "doc_id=%s status=%s err=%s",
             doc_id, status, e,
         )
+        try:
+            from ..services.metrics import ingest_status_update_failed_total
+            ingest_status_update_failed_total.labels(stage=status).inc()
+        except Exception:  # noqa: BLE001 — metric must never break worker
+            pass
 
 
 async def _fetch_kb_rag_config(kb_id: int) -> dict | None:
