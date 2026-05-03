@@ -306,6 +306,28 @@ services:
       # the Blackwell-tagged build catches up; until then summaries truncate
       # at 512. Operator can verify by `docker run --gpus all ... --help |
       # grep max-input` against the live image tag.
+      #
+      # 2026-05-03: cap TEI batch sizes so peak GPU forward stays small.
+      # GPU 1 (24 GB) is shared by TEI + reranker + colbert + fastembed +
+      # vllm-qu and routinely sits at ~95% steady-state. TEI's default
+      # max-batch-tokens=16384 / max-client-batch-size=32 was OOM-ing on
+      # bigger ingest fan-outs.
+      #
+      # Iter 1 (4096/8): TEI rejected mid-forward with 422 because batches
+      # of 8 native bge-m3 sequences (each 4096 tok after truncation) sum
+      # to >4096 batch-tokens. Iter 2 (8192/4): TEI rejected on REQUEST
+      # entry with "batch size 32 > maximum allowed batch size 4" because
+      # ext.services.embedder.TEIEmbedder.embed() naturally chunks inputs
+      # into 32-per-request and max-client-batch-size is a hard cap, not
+      # an internal-split hint. Iter 3 (8192/32): per-request slot matches
+      # the client's natural batch; TEI's own max-batch-tokens=8192 still
+      # bounds the per-forward GPU activation peak (TEI auto-splits the
+      # 32-chunk request into ≤8192-token forwards internally as memory
+      # allows). Both 422 trigger paths are now closed.
+      - "--max-batch-tokens"
+      - "8192"
+      - "--max-client-batch-size"
+      - "32"
     volumes:
       - ../volumes/models:/data
     environment:
