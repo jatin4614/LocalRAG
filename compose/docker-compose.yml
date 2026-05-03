@@ -34,6 +34,13 @@ volumes:
   # container restarts so the daily tier-storage cron does not re-fire after
   # every redeploy. Only used by the celery-beat service.
   celery_beat_state: { driver: local }
+  # Wave 3a (review §4.2): backup output directory shared between the
+  # celery-worker (in-container daily Qdrant snapshot task) and the
+  # operator's host. Bind-mounted to ../backups on the host so the
+  # Celery task writes snapshots that `scripts/restore_drill.sh` and
+  # the host-side `backup_qdrant.sh` can read. Compose creates the host
+  # path on demand at `up -d` time.
+  backups: { driver: local }
 
 services:
   postgres:
@@ -756,8 +763,17 @@ services:
       # Override to "CPUExecutionProvider" if a GPU is unavailable; the
       # default falls through to CPU on its own (see _fastembed_providers).
       RAG_FASTEMBED_PROVIDERS: ${RAG_FASTEMBED_PROVIDERS:-CUDAExecutionProvider,CPUExecutionProvider}
+      # Wave 3a (review §4.2) — Qdrant snapshot beat task cron.
+      # Default = daily at 02:30 UTC; offset from blob_gc's 03:17. Empty
+      # / unset → use the in-code default. CLAUDE.md §7 trap: env vars
+      # must be explicitly mapped here OR they never reach the worker.
+      RAG_QDRANT_SNAPSHOT_CRON: ${RAG_QDRANT_SNAPSHOT_CRON:-}
     volumes:
       - ingest_blobs:/var/ingest
+      # Wave 3a (review §4.2) — backups output dir, shared with host.
+      # The Celery snapshot task writes summaries here; operators see
+      # the same files at ./backups/ on the host.
+      - backups:/host-backups:rw
     # Phase A — GPU reservation. Shares GPU 1 with the reranker
     # (open-webui) and the QU LLM (vllm-qu). All three use a small slice
     # of VRAM (colbert ~1.5 GB, sparse <500 MB, reranker ~3 GB,
@@ -804,6 +820,10 @@ services:
       CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/1}
       CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/2}
       RAG_TIER_COLLECTIONS: ${RAG_TIER_COLLECTIONS:-kb_1_v4}
+      # Wave 3a (review §4.2) — beat reads the cron when registering the
+      # schedule entry. Without this passthrough, beat uses the in-code
+      # default regardless of operator override in compose/.env.
+      RAG_QDRANT_SNAPSHOT_CRON: ${RAG_QDRANT_SNAPSHOT_CRON:-}
     volumes:
       - celery_beat_state:/var/celery
     command:
