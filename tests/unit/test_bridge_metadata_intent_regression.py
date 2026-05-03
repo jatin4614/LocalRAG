@@ -5,7 +5,6 @@ on every code path, but _do_decompose was only assigned in the non-metadata
 branch. Result: every metadata-intent query crashed with UnboundLocalError
 and returned 0 KB sources.
 """
-import asyncio
 import os
 from dataclasses import dataclass, field
 from unittest.mock import AsyncMock, MagicMock, patch

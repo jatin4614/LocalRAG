@@ -1546,7 +1546,7 @@ async def _run_pipeline(
                 # doesn't crash when the post-rerank quota check references them.
                 # See docs/superpowers/specs/2026-05-03-retrieval-quality-fix-design.md §1.4.
                 _do_decompose: bool = False
-                _entities: list = []
+                _entities: list[str] = []
                 _entity_floor: int = 0
                 # Tier 2 routing — metadata queries are answered entirely
                 # by the catalog preamble appended later; skipping
