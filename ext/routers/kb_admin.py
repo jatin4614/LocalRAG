@@ -1134,15 +1134,11 @@ async def patch_kb_synonyms(
             detail=f"KB {kb_id} not found",
         )
 
-    # Use SQLAlchemy's type-coercion to avoid the raw `::jsonb` cast which
-    # asyncpg can't parse when combined with named params. Passing the list
-    # directly with `type_coerce` lets the asyncpg dialect serialise it as
-    # JSONB without the raw-SQL cast.
-    from sqlalchemy import type_coerce, update as _update
-    from sqlalchemy.dialects.postgresql import JSONB as _JSONB2
-
     # Build a dialect-neutral JSON type that maps to JSONB on Postgres.
-    _SynonymsType = _JSON().with_variant(_JSONB2, "postgresql")
+    # Using with_variant avoids a raw `::jsonb` cast that asyncpg can't
+    # parse when combined with named params; the asyncpg dialect serialises
+    # the bound list directly as JSONB.
+    _SynonymsType = _JSON().with_variant(_JSONB, "postgresql")
 
     await session.execute(
         _sql(
