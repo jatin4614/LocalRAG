@@ -196,7 +196,14 @@ async def upload_kb_doc(
             mime_type=file.content_type,
             bytes=len(data),
             uploaded_by=user.id,
-            ingest_status="chunking",
+            # Wave 2 (review §1.5): canonical ladder is
+            # pending → queued → chunking → embedding → done | failed.
+            # Upload-time used to stamp `chunking` BEFORE enqueue, then
+            # `queued` after — backwards. Stamp `pending` here; the async
+            # path flips to `queued` when it reaches the celery dispatch
+            # site below; the worker transitions chunking → embedding →
+            # done at the actual stage boundaries.
+            ingest_status="pending",
             # Stamp the pipeline version that will process this upload. Rows
             # inserted before migration 004 ran will carry NULL.
             pipeline_version=current_version(),

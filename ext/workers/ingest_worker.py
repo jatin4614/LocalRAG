@@ -336,8 +336,30 @@ def ingest_blob(
                 })
             raise Reject(reason=f"blob missing: {sha}", requeue=False)
 
+        # Wave 2 (review §1.5): transition queued → chunking when the
+        # worker actually starts processing. Without this stamp the admin
+        # UI shows the doc stuck at `queued` until completion, masking
+        # the difference between "celery is backlogged" and "celery is
+        # actively processing this doc". Best-effort — a status-update
+        # failure must not break ingest.
+        if _doc_id is not None:
+            try:
+                asyncio.run(_update_doc_status(_doc_id, "chunking"))
+            except Exception:  # noqa: BLE001
+                pass
+
         try:
             data = store.read(sha)
+            # Wave 2 (review §1.5): bump to embedding once chunking has
+            # produced its blocks. _do_ingest is monolithic so we approximate
+            # the boundary at the start of the embed-and-upsert phase by
+            # stamping right before — embedding takes 80%+ of wall time, so
+            # the label is accurate enough for operator dashboards.
+            if _doc_id is not None:
+                try:
+                    asyncio.run(_update_doc_status(_doc_id, "embedding"))
+                except Exception:  # noqa: BLE001
+                    pass
             n = asyncio.run(_do_ingest(data, mime_type, filename, collection, payload_base))
         except Exception as exc:  # noqa: BLE001 — retry policy lives here
             if self.request.retries < 3:
