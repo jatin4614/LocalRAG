@@ -1,7 +1,9 @@
 """Embedder protocol + deterministic StubEmbedder + TEI HTTP client."""
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import logging
 import os
 import struct
 from functools import lru_cache
@@ -10,11 +12,109 @@ from typing import Optional, Protocol
 import httpx
 
 from .obs import inject_context_into_headers, span
-from .retry_policy import with_transient_retry
+
+log = logging.getLogger(__name__)
 
 
 class Embedder(Protocol):
     async def embed(self, texts: list[str]) -> list[list[float]]: ...
+
+
+# --- Embedder redundancy helpers ------------------------------------------
+# 2026-05-03: TEIEmbedder.embed gained a retry-with-halving redundancy
+# layer to absorb transient TEI 424s (CUDA OOM under shared-GPU
+# pressure). These helpers live at module scope so they're trivially
+# testable and have no implicit ``self`` dependencies.
+
+# Retryable HTTP status codes from TEI:
+#   424 — TEI maps the underlying CUDA OOM to a "Failed Dependency"
+#         response. This is THE production trigger for the 2026-05-03
+#         redundancy work.
+#   429 — rate limit; vLLM and TEI both emit it under load.
+#   5xx — generic server error (502/503/504 = upstream / gateway issues
+#         that frequently self-heal in seconds).
+# 4xx other than 424/429 are NOT retryable: 400/401/403/404/422 are
+# permanent input/auth/route problems and retrying just amplifies
+# pressure. Surface them so the operator notices.
+_RETRYABLE_STATUS = frozenset({424, 429, 500, 502, 503, 504})
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    """True if an embedder failure may succeed on a subsequent attempt.
+
+    Retryable network exceptions cover the typical transient failure
+    modes: ``ReadTimeout`` (TEI stalled past the client timeout),
+    ``ConnectError`` (TCP refused — TEI restarting),
+    ``RemoteProtocolError`` (connection dropped mid-response),
+    ``ReadError`` (peer reset). Other ``httpx.RequestError`` subclasses
+    fall through as non-retryable so we don't mask real client bugs.
+    """
+    if isinstance(
+        exc,
+        (
+            httpx.TimeoutException,
+            httpx.ConnectError,
+            httpx.ReadError,
+            httpx.RemoteProtocolError,
+        ),
+    ):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in _RETRYABLE_STATUS
+    return False
+
+
+def _classify_retry_reason(exc: BaseException | None) -> str:
+    """Bucket an exception into a low-cardinality reason label.
+
+    Buckets: ``"424"`` (TEI OOM, the prod trigger), ``"429"`` (rate
+    limit), ``"5xx"`` (other server errors), ``"network"`` (timeouts /
+    connection drops), ``"unknown"`` (defensive — never expected since
+    callers filter via :func:`_is_retryable` first).
+    """
+    if exc is None:
+        return "unknown"
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        if status == 424:
+            return "424"
+        if status == 429:
+            return "429"
+        if 500 <= status < 600:
+            return "5xx"
+        return "unknown"
+    if isinstance(
+        exc,
+        (
+            httpx.TimeoutException,
+            httpx.ConnectError,
+            httpx.ReadError,
+            httpx.RemoteProtocolError,
+        ),
+    ):
+        return "network"
+    return "unknown"
+
+
+def _size_bucket(n: int) -> str:
+    """Bucket a batch size into a power-of-two label class.
+
+    Buckets: ``"1"``, ``"2-4"``, ``"5-8"``, ``"9-16"``, ``"17-32"``,
+    ``"33+"``. Bounded cardinality even if some pathological caller
+    embeds huge batches (the upper bound is a single bucket label, not
+    a per-size label).
+    """
+    if n <= 1:
+        return "1"
+    if n <= 4:
+        return "2-4"
+    if n <= 8:
+        return "5-8"
+    if n <= 16:
+        return "9-16"
+    if n <= 32:
+        return "17-32"
+    return "33+"
 
 
 class StubEmbedder:
@@ -63,30 +163,52 @@ class TEIEmbedder:
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    @with_transient_retry(attempts=3, base_sec=0.5)
     async def _embed_batch(self, batch: list[str]) -> list[list[float]]:
-        """POST one TEI batch (≤ ``_max_batch`` inputs).
+        """POST one TEI batch (≤ ``_max_batch`` inputs) — single shot.
 
-        Wrapped with the shared transient-error retry policy so a single
-        TEI hiccup (GC pause, brief 5xx, network blip) doesn't degrade
-        every concurrent request. The decorator is a no-op pass-through
-        when ``RAG_TENACITY_RETRY=0``.
+        Pure HTTP: no retry, no breaker. The retry + halving wrapper
+        :meth:`_embed_with_redundancy` provides redundancy; the
+        circuit-breaker integration lives in :meth:`_embed_dispatch`
+        (one breaker decision per user-facing :meth:`embed` call, not
+        per inner retry).
 
-        Bug-fix campaign §3.5 — when ``RAG_CB_TEI_ENABLED=1`` the call
-        also consults a per-process circuit breaker keyed ``"tei"``. If
-        the breaker is open (TEI has failed ``RAG_CB_FAIL_THRESHOLD``
-        times in ``RAG_CB_WINDOW_SEC``), the breaker raises
-        :class:`CircuitOpenError` BEFORE the network call so we don't
-        keep hammering a known-broken endpoint. Callers fail-open per
-        CLAUDE.md §1.2 (treat ``CircuitOpenError`` as another transient
-        upstream failure and degrade retrieval gracefully).
+        2026-05-03: the prior tenacity ``@with_transient_retry``
+        decorator was removed because the new
+        :meth:`_embed_with_redundancy` superset (retry + halving + 424
+        coverage) replaces it. The per-call breaker integration also
+        moved out (was here, now wraps the entire redundancy cascade)
+        so one user-visible embed surfaces as one breaker decision —
+        the old contract from §3.5 is preserved.
+        """
+        headers = inject_context_into_headers({})
+        r = await self._client.post(
+            "/embed",
+            json={"inputs": batch},
+            headers=headers or None,
+        )
+        r.raise_for_status()
+        return r.json()
 
-        The breaker only counts terminal failures: success → record_success,
-        any exception (including the retry decorator's final reraise) →
-        record_failure. The retry decorator runs INSIDE one breaker call
-        so a single user-facing embed surfaces as one breaker decision,
-        not N (avoids opening the breaker on a single transient blip
-        that the retry would have absorbed).
+    async def _embed_dispatch(
+        self, batch: list[str]
+    ) -> list[list[float]]:
+        """Outer entry per per-batch embed — wraps the redundancy
+        cascade in a single circuit-breaker decision.
+
+        Bug-fix campaign §3.5 (preserved): when ``RAG_CB_TEI_ENABLED=1``
+        the call consults a per-process circuit breaker keyed
+        ``"tei"``. If the breaker is open (TEI has failed
+        ``RAG_CB_FAIL_THRESHOLD`` times in ``RAG_CB_WINDOW_SEC``), the
+        breaker raises :class:`CircuitOpenError` BEFORE any retry chatter
+        so we don't keep hammering a known-broken endpoint. Callers
+        fail-open per CLAUDE.md §1.2.
+
+        Critical contract (unchanged across the 2026-05-03 rewrite):
+        ONE user-facing embed call → ONE breaker decision. The retry +
+        halving cascade runs INSIDE the breaker call so a single
+        transient blip the redundancy absorbs counts as exactly one
+        breaker success, not N (avoids tripping the breaker on intra-
+        request retries the redundancy layer was designed to absorb).
         """
         cb_enabled = os.environ.get("RAG_CB_TEI_ENABLED", "0") == "1"
         breaker = None
@@ -98,14 +220,7 @@ class TEIEmbedder:
             breaker.raise_if_open()
 
         try:
-            headers = inject_context_into_headers({})
-            r = await self._client.post(
-                "/embed",
-                json={"inputs": batch},
-                headers=headers or None,
-            )
-            r.raise_for_status()
-            out = r.json()
+            out = await self._embed_with_redundancy(batch)
         except Exception:
             if breaker is not None:
                 breaker.record_failure()
@@ -113,6 +228,136 @@ class TEIEmbedder:
         if breaker is not None:
             breaker.record_success()
         return out
+
+    async def _embed_with_redundancy(
+        self, batch: list[str]
+    ) -> list[list[float]]:
+        """Wrap :meth:`_embed_batch` with retry-then-halve redundancy.
+
+        Failure mode being mitigated: GPU 1 (24 GB shared TEI + reranker
+        + colbert + fastembed + vllm-qu) runs at ~95% steady-state.
+        Under fast-changing GPU pressure TEI's per-forward activation
+        can OOM and return ``424``
+        (``DriverError(CUDA_ERROR_OUT_OF_MEMORY)``). Pre-fix that single
+        424 failed the entire ingest task with no retry.
+
+        Strategy:
+        1. Per-call retry budget at the SAME batch size. Up to
+           ``RAG_EMBED_MAX_RETRIES`` (default 3) attempts with
+           exponential backoff (0.5s, 1s, 2s).
+        2. Retryable HTTP statuses: 424, 429, 500, 502, 503, 504.
+           Retryable network exceptions: ``ReadTimeout``,
+           ``ConnectError``, ``RemoteProtocolError``, ``ReadError``.
+           Anything else (400/401/403/404/422 + non-network exceptions)
+           surfaces immediately — those are real input/auth bugs, not
+           transient pressure.
+        3. After the retry budget at the current batch size is exhausted
+           AND ``len(batch) > 1``: halve the batch and recurse on each
+           half, then concatenate the results in order. Halving
+           naturally lowers TEI's per-forward memory pressure.
+        4. Recursion floor at ``len(batch) == 1``: if a single text
+           still can't go through, raise — that's a real per-chunk
+           problem (TEI down, network partition, or a chunk that
+           genuinely won't fit).
+
+        Order preservation: the first half of the input always lands at
+        positions ``[0:len/2]`` of the output, the second half at
+        ``[len/2:]``. Embedding-to-text alignment is load-bearing for
+        the downstream Qdrant upsert (deterministic UUIDv5 IDs derive
+        from chunk_index), so we MUST not reorder under any retry path.
+        """
+        if not batch:
+            return []
+        try:
+            max_retries = int(os.environ.get("RAG_EMBED_MAX_RETRIES", "3"))
+        except (TypeError, ValueError):
+            max_retries = 3
+        max_retries = max(1, max_retries)
+
+        # Same-batch retry loop with exponential backoff.
+        last_exc: BaseException | None = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                out = await self._embed_batch(batch)
+                if attempt > 1:
+                    # We recovered after >=1 failed attempt at this batch
+                    # size — bump the recovered counter for the original
+                    # cause so operators can trend the redundancy
+                    # absorbing real pressure.
+                    self._record_retry(
+                        outcome="recovered",
+                        reason=_classify_retry_reason(last_exc),
+                    )
+                return out
+            except Exception as exc:  # noqa: BLE001 — gate on retryability
+                if not _is_retryable(exc):
+                    raise
+                last_exc = exc
+                if attempt < max_retries:
+                    log.info(
+                        "embedder: retry attempt=%d batch=%d reason=%s",
+                        attempt + 1, len(batch), type(exc).__name__,
+                    )
+                    # Exponential backoff: 0.5s, 1s, 2s (capped); the
+                    # caller-provided fast_sleep fixture in tests
+                    # short-circuits this to ~0.
+                    await asyncio.sleep(0.5 * (2 ** (attempt - 1)))
+
+        # Retry budget exhausted at this batch size. Decide: halve or
+        # raise.
+        assert last_exc is not None  # loop only exits via raise above
+        reason = _classify_retry_reason(last_exc)
+        self._record_retry(outcome="exhausted", reason=reason)
+
+        if len(batch) <= 1:
+            # Recursion floor — surface the original retryable error.
+            log.warning(
+                "embedder: exhausted at batch=1 reason=%s — surfacing",
+                type(last_exc).__name__,
+            )
+            raise last_exc
+
+        # Halve and recurse. Order preserved: first half at [0:mid],
+        # second half at [mid:].
+        mid = len(batch) // 2
+        new_size = mid  # the new per-call batch length
+        log.info(
+            "embedder: halving batch %d → %d reason=%s",
+            len(batch), new_size, type(last_exc).__name__,
+        )
+        self._record_halving(new_size)
+
+        first = await self._embed_with_redundancy(batch[:mid])
+        second = await self._embed_with_redundancy(batch[mid:])
+        return first + second
+
+    @staticmethod
+    def _record_retry(*, outcome: str, reason: str) -> None:
+        """Bump ``embedder_retry_total{outcome,reason}``.
+
+        Fail-open: any metric error is swallowed so the redundancy path
+        is never disturbed by an exporter misconfiguration.
+        """
+        try:
+            from .metrics import embedder_retry_total
+            embedder_retry_total.labels(outcome=outcome, reason=reason).inc()
+        except Exception:  # noqa: BLE001 — metric must never break ingest
+            pass
+
+    @staticmethod
+    def _record_halving(new_batch_size: int) -> None:
+        """Bump ``embedder_halving_total{batch_size_class}``.
+
+        Label is a coarse power-of-two bucket of the NEW batch size so
+        the metric stays low-cardinality even under exotic input batches.
+        """
+        try:
+            from .metrics import embedder_halving_total
+            embedder_halving_total.labels(
+                batch_size_class=_size_bucket(new_batch_size),
+            ).inc()
+        except Exception:  # noqa: BLE001 — metric must never break ingest
+            pass
 
     async def _embed_uncached(self, texts: list[str]) -> list[list[float]]:
         """Direct TEI passthrough — bypasses the embed cache. Internal
@@ -123,7 +368,7 @@ class TEIEmbedder:
         out: list[list[float]] = []
         for i in range(0, len(texts), self._max_batch):
             batch = texts[i : i + self._max_batch]
-            out.extend(await self._embed_batch(batch))
+            out.extend(await self._embed_dispatch(batch))
         return out
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
@@ -173,7 +418,7 @@ class TEIEmbedder:
         ):
             for i in range(0, len(texts), self._max_batch):
                 batch = texts[i : i + self._max_batch]
-                out.extend(await self._embed_batch(batch))
+                out.extend(await self._embed_dispatch(batch))
             return out
 
 

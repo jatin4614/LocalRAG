@@ -94,11 +94,23 @@ async def test_breaker_disabled_when_flag_off(monkeypatch):
 @pytest.mark.asyncio
 async def test_success_resets_failures(monkeypatch):
     """A success after one failure should reset the failure counter so
-    the breaker doesn't trip on intermittent blips. Drives 1 fail then 1
-    success against the same embedder; subsequent calls should still go
-    through (breaker stays closed).
+    the breaker doesn't trip on intermittent blips.
+
+    2026-05-03 update: the embedder gained a retry-with-halving
+    redundancy layer (``_embed_with_redundancy``) that absorbs single
+    transient blips BEFORE the breaker sees them. So the test no longer
+    drives one failed user-call + one successful user-call — instead it
+    asserts that intermittent failures don't surface to the user OR
+    open the breaker. The breaker's failure-reset semantics remain
+    unchanged; this test pins the higher-order property "intermittent
+    blips don't trip the breaker."
     """
-    # Build a transport that fails once, then succeeds.
+    # Disable the test-fixture override — let the new redundancy layer
+    # actually retry instead of single-shotting.
+    monkeypatch.setenv("RAG_TENACITY_RETRY", "1")
+
+    # Build a transport that fails once, then succeeds. The redundancy
+    # layer will retry the 503 at the same batch size and pick up the 200.
     state = {"calls": 0}
 
     def handler(request):
@@ -110,11 +122,16 @@ async def test_success_resets_failures(monkeypatch):
     transport = httpx.MockTransport(handler)
     emb = TEIEmbedder(base_url="http://tei", transport=transport)
 
-    with pytest.raises(httpx.HTTPStatusError):
-        await emb.embed(["x"])
-
-    out = await emb.embed(["y"])
+    # The redundancy layer retries the 503 → embed succeeds on the same
+    # user call. Net effect: zero user-visible failures from one TEI blip.
+    out = await emb.embed(["x"])
     assert out == [[0.1, 0.2, 0.3]]
+    assert state["calls"] == 2  # raw 503 + raw 200
+
+    # Subsequent calls still work; breaker stayed closed (one redundancy-
+    # absorbed blip is exactly one breaker success per 2026-05-03 contract).
+    out2 = await emb.embed(["y"])
+    assert out2 == [[0.1, 0.2, 0.3]]
 
 
 @pytest.mark.asyncio

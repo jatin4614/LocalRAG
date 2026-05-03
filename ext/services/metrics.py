@@ -685,3 +685,45 @@ rag_abstention_caveat_added_total = Counter(
     "Per-request abstention caveat added to the system prompt (review §6.11)",
     labelnames=["intent"],
 )
+
+
+# ---------------------------------------------------------------------------
+# 2026-05-03 — TEIEmbedder redundancy layer (retry-with-halving).
+#
+# Background: GPU 1 (24 GB shared by TEI + reranker + colbert + fastembed +
+# vllm-qu) runs at ~95% steady-state. When the celery ingest worker fans a
+# batch at TEI, TEI's per-forward activation can spike the GPU and the
+# forward returns 424 (`DriverError(CUDA_ERROR_OUT_OF_MEMORY)`). Pre-fix,
+# this failed the whole ingest with no retry — operator had to re-upload.
+#
+# Fix: ``TEIEmbedder.embed`` now retries up to ``RAG_EMBED_MAX_RETRIES``
+# times at the same batch size; on exhaustion it halves the batch and
+# recurses (down to batch=1 floor). These two counters let operators
+# verify the redundancy fired and trend its frequency.
+#
+# ``embedder_retry_total`` — bumped on every retry attempt with its
+# outcome label. ``recovered`` = a subsequent attempt at the same (or
+# halved) batch succeeded; ``exhausted`` = the entire retry budget at
+# this batch size was used up and we're about to halve (or raise at
+# batch=1). reason label buckets the cause: 424 (TEI OOM, the prod
+# trigger), 429 (rate limit), 5xx (other server error), network
+# (timeout / connection reset).
+#
+# ``embedder_halving_total`` — bumped each time a batch is halved.
+# batch_size_class label is a power-of-two bucket of the NEW batch size
+# so high-cardinality input batches don't blow up the metric. A sustained
+# ramp on size_class="1" is a smell — it means TEI can't even handle a
+# single chunk, which is usually a model misload or the chunk itself is
+# pathological (post-OCR garbage / huge token count).
+# ---------------------------------------------------------------------------
+embedder_retry_total = Counter(
+    "embedder_retry_total",
+    "TEIEmbedder retry attempts by outcome and reason (review 2026-05-03)",
+    labelnames=["outcome", "reason"],
+)
+
+embedder_halving_total = Counter(
+    "embedder_halving_total",
+    "TEIEmbedder batch halving events by power-of-two size bucket",
+    labelnames=["batch_size_class"],
+)
