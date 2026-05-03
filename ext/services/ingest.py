@@ -335,6 +335,195 @@ def build_point_payload(
     return payload
 
 
+# ---------------------------------------------------------------------------
+# Block coalescing — fix for extractor↔chunker tiny-block pathology.
+#
+# DOCX (and to a lesser extent MD) extractors emit one ExtractedBlock per
+# Word paragraph. On routine business prose, paragraphs run ~30 tokens
+# (median 116 chars on the 2026 Jan/Feb/Mar/Apr corpus), and the per-block
+# chunking loop in ``ingest_bytes`` then calls the 800-token window chunker
+# with a single tiny string — emitting one tiny chunk per paragraph. The
+# Apr 26.docx file produced 2,796 chunks; concatenating all blocks first
+# and feeding the same window chunker yields ~184 chunks (15x reduction).
+#
+# The fix: walk the extracted blocks BEFORE the per-block chunking loop and
+# merge adjacent small prose blocks (sharing ``heading_path``) up to a soft
+# cap. This restores recall on global / non-decomposed retrieval queries
+# without changing the chunker, the structured-chunker contract, or any
+# downstream payload shape.
+#
+# Constraints (preserved by the merge rules below):
+#  * Non-prose blocks (``kind != "prose"`` — tables, future code/image
+#    captions) stay atomic — the structured-chunker contract is preserved
+#    and so is the existing tabular metadata flow.
+#  * Heading boundaries are respected — a section break in the source
+#    interrupts the merge run so chunks remain structurally coherent for
+#    heading-aware retrieval.
+#  * Pages — the merged block keeps the first non-None ``page`` so
+#    citation surfaces don't lose page hints.
+#
+# Both thresholds are env-overridable so an operator can tune for an
+# unusual corpus without a code change.
+# ---------------------------------------------------------------------------
+
+# Default thresholds. A block under MIN is considered a coalesce candidate;
+# coalescing stops when the running merge reaches MAX (so the 800-token
+# window chunker downstream still has room to split if it needs to).
+_BLOCK_MIN_TOKENS_DEFAULT = 200
+_BLOCK_MAX_TOKENS_DEFAULT = 600
+
+
+def _coalesce_block_min_tokens() -> int:
+    """Read ``RAG_INGEST_BLOCK_MIN_TOKENS`` at call time.
+
+    Anything that fails to parse silently falls back to the default — the
+    coalescer is best-effort and shouldn't crash ingest on a malformed env.
+    """
+    try:
+        return int(os.environ.get(
+            "RAG_INGEST_BLOCK_MIN_TOKENS",
+            str(_BLOCK_MIN_TOKENS_DEFAULT),
+        ))
+    except ValueError:
+        return _BLOCK_MIN_TOKENS_DEFAULT
+
+
+def _coalesce_block_max_tokens() -> int:
+    """Read ``RAG_INGEST_BLOCK_MAX_TOKENS`` at call time."""
+    try:
+        return int(os.environ.get(
+            "RAG_INGEST_BLOCK_MAX_TOKENS",
+            str(_BLOCK_MAX_TOKENS_DEFAULT),
+        ))
+    except ValueError:
+        return _BLOCK_MAX_TOKENS_DEFAULT
+
+
+def _coalesce_small_blocks(blocks):
+    """Merge runs of small adjacent prose blocks into bigger blocks.
+
+    Walks ``blocks`` once, accumulating a run when each block:
+      (a) is prose (``kind == "prose"``),
+      (b) is "small" (token count below the min threshold),
+      (c) shares ``heading_path`` with the run leader, AND
+      (d) keeping it would not push the merged token count above the cap.
+
+    A merged block inherits the leader's ``heading_path`` and ``sheet``,
+    and the first non-None ``page`` seen in the run (so citations still
+    have a page hint when later blocks happen to carry the page metadata
+    a None-page-leader doesn't). ``kind`` stays ``"prose"``.
+
+    The function is pure: ``blocks`` is not mutated. Returns a new list.
+    Default behavior for a single block, an already-large block, or a
+    non-prose block is byte-identical pass-through.
+    """
+    if not blocks:
+        return []
+
+    from .extractor import ExtractedBlock as _EB
+
+    min_tokens = _coalesce_block_min_tokens()
+    max_tokens = _coalesce_block_max_tokens()
+
+    # Local tokenizer handle — the same one chunker / budget use, so the
+    # token budget the coalescer enforces matches what downstream sees.
+    from .budget import get_tokenizer
+    enc = get_tokenizer()
+
+    def _tcount(text: str) -> int:
+        return len(enc.encode(text))
+
+    out: list = []
+    # Active run state: None when no run is open. When open, we hold the
+    # leader's metadata + a list of source texts and the running token tally.
+    run: dict | None = None
+
+    def _flush_run() -> None:
+        """Emit the active run as a single merged block, then reset."""
+        nonlocal run
+        if run is None:
+            return
+        if len(run["texts"]) == 1:
+            # Single block in the run — emit it byte-identical (preserves the
+            # exact ExtractedBlock object reference where possible).
+            out.append(run["leader"])
+        else:
+            merged_text = "\n\n".join(run["texts"])
+            out.append(_EB(
+                text=merged_text,
+                page=run["page"],
+                heading_path=list(run["heading_path"]),
+                sheet=run["sheet"],
+                kind="prose",
+            ))
+        run = None
+
+    for b in blocks:
+        # Atomic: any non-prose block (table, future code/image_caption)
+        # interrupts the run and passes through verbatim.
+        if getattr(b, "kind", "prose") != "prose":
+            _flush_run()
+            out.append(b)
+            continue
+
+        b_tokens = _tcount(b.text)
+
+        # Above the small threshold: already big enough on its own. Flush
+        # whatever run we had and emit this block atomic.
+        if b_tokens >= min_tokens:
+            _flush_run()
+            out.append(b)
+            continue
+
+        # Small prose block — try to extend or open a run.
+        if run is None:
+            run = {
+                "leader": b,
+                "texts": [b.text],
+                "tokens": b_tokens,
+                "heading_path": list(b.heading_path),
+                "page": b.page,
+                "sheet": b.sheet,
+            }
+            continue
+
+        # Heading change — different section. Flush and start a fresh run.
+        if list(b.heading_path) != run["heading_path"]:
+            _flush_run()
+            run = {
+                "leader": b,
+                "texts": [b.text],
+                "tokens": b_tokens,
+                "heading_path": list(b.heading_path),
+                "page": b.page,
+                "sheet": b.sheet,
+            }
+            continue
+
+        # Cap check: if extending would exceed the max, flush + start fresh
+        # with this block as the new run leader.
+        if run["tokens"] + b_tokens > max_tokens:
+            _flush_run()
+            run = {
+                "leader": b,
+                "texts": [b.text],
+                "tokens": b_tokens,
+                "heading_path": list(b.heading_path),
+                "page": b.page,
+                "sheet": b.sheet,
+            }
+            continue
+
+        # Extend the run.
+        run["texts"].append(b.text)
+        run["tokens"] += b_tokens
+        if run["page"] is None and b.page is not None:
+            run["page"] = b.page
+
+    _flush_run()
+    return out
+
+
 async def ingest_bytes(
     *,
     data: bytes,
@@ -361,6 +550,14 @@ async def ingest_bytes(
     blocks = extract(data, mime_type, filename)
     if not blocks:
         return 0
+
+    # Pre-chunk pass: merge runs of small adjacent prose blocks so the
+    # 800-token window chunker downstream gets to pack across paragraphs.
+    # Without this, DOCX paragraphs (median ~30 tokens) each become a single
+    # tiny chunk — 15x chunk inflation observed on the 2026 corpus.
+    # Non-prose (tables / future code+image_caption) blocks pass through
+    # atomic; the structured-chunker contract is preserved.
+    blocks = _coalesce_small_blocks(blocks)
 
     # Plan B Phase 5.2 — derive a per-document shard_key once when temporal
     # sharding is enabled. The same key is stamped on every chunk's payload

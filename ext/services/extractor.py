@@ -43,12 +43,20 @@ class ExtractedBlock:
     Fields that a given format can't supply stay at their default
     (``None`` / ``[]``). Consumers should treat missing metadata as "unknown"
     rather than inventing values.
+
+    ``kind`` is consumed by ``ext.services.ingest._coalesce_small_blocks`` to
+    decide which blocks may merge. Defaults to ``"prose"`` (the common case).
+    Extractors that emit non-prose structural blocks (e.g., docx tables → TSV
+    rows; xlsx sheets → TSV rows) stamp ``kind="table"`` so the coalescer
+    leaves them atomic. Adding a new value here is non-breaking — the
+    coalescer treats anything other than ``"prose"`` as atomic.
     """
 
     text: str
     page: Optional[int] = None  # 1-based PDF page number; None for non-paginated types.
     heading_path: list[str] = field(default_factory=list)  # DOCX/MD heading stack, root -> leaf.
     sheet: Optional[str] = None  # XLSX worksheet name; None otherwise.
+    kind: str = "prose"  # "prose" | "table" | future: "code" | "image_caption"
 
 
 # ---------------------------------------------------------------------------
@@ -341,7 +349,11 @@ def _blocks_docx(data: bytes) -> list[ExtractedBlock]:
                 rows.append("\t".join(cells))
         if rows:
             blocks.append(
-                ExtractedBlock(text="\n".join(rows), heading_path=list(heading_stack))
+                ExtractedBlock(
+                    text="\n".join(rows),
+                    heading_path=list(heading_stack),
+                    kind="table",
+                )
             )
 
     return blocks
@@ -362,7 +374,9 @@ def _blocks_xlsx(data: bytes) -> list[ExtractedBlock]:
             # Skip empty sheets entirely; keeps the output aligned with
             # legacy flat behaviour which produced no bytes for such sheets.
             continue
-        blocks.append(ExtractedBlock(text="\n".join(rows), sheet=ws.title))
+        blocks.append(ExtractedBlock(
+            text="\n".join(rows), sheet=ws.title, kind="table",
+        ))
     return blocks
 
 
