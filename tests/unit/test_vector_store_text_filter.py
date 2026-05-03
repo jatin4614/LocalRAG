@@ -41,11 +41,13 @@ class TestTextFilterClause:
 
     def test_text_filter_added(self) -> None:
         flt = VectorStore._build_filter(text_filter="32 Inf Bde")
-        assert _has_text_clause(flt) == "32 Inf Bde"
+        # 2026-05-03: lowercased at query time for case-insensitive MatchText
+        assert _has_text_clause(flt) == "32 inf bde"
 
     def test_text_filter_trimmed(self) -> None:
         flt = VectorStore._build_filter(text_filter="  32 Inf Bde  ")
-        assert _has_text_clause(flt) == "32 Inf Bde"
+        # 2026-05-03: strip + lowercase both applied
+        assert _has_text_clause(flt) == "32 inf bde"
 
     def test_text_filter_alongside_other_filters(self) -> None:
         flt = VectorStore._build_filter(
@@ -53,8 +55,8 @@ class TestTextFilterClause:
             owner_user_id=42,
             text_filter="32 Inf Bde",
         )
-        # text filter present
-        assert _has_text_clause(flt) == "32 Inf Bde"
+        # text filter present (lowercased)
+        assert _has_text_clause(flt) == "32 inf bde"
         # subtag + owner clauses still present
         keys = {
             getattr(c, "key", None) for c in (flt.must or [])

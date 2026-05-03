@@ -960,10 +960,17 @@ class VectorStore:
         # strings are treated as None to avoid sending an empty filter
         # that would match nothing.
         if text_filter and text_filter.strip():
+            # 2026-05-03 fix: lowercase before MatchText so user's casing variants
+            # (e.g. "75 INF bde" vs "75 Inf Bde") all match the same corpus chunks.
+            # Defense in depth — the lowercase payload index (scripts/apply_text_index.py)
+            # provides the proper Qdrant-side fix; this guarantees correctness even
+            # on collections where the operator hasn't run that script yet.
+            # Spec: docs/superpowers/specs/2026-05-03-retrieval-quality-fix-design.md §4.1
+            normalized = text_filter.strip().lower()
             must_conditions.append(
                 qm.FieldCondition(
                     key="text",
-                    match=qm.MatchText(text=text_filter.strip()),
+                    match=qm.MatchText(text=normalized),
                 )
             )
         must_not_conditions = [
