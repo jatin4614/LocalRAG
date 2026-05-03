@@ -157,8 +157,16 @@ print('fastembed cache populated')"
 ######## Final runtime image (no compilers, no apt cache) ########
 FROM python:3.11-slim-bookworm
 
-ARG UID=0
-ARG GID=0
+# Wave 1b (review §10.1): drop root in the runtime image. Previous
+# `ARG UID=0 / GID=0` was carried forward from upstream but never
+# consumed (no useradd, no USER directive) so every container ran as
+# uid=0 — a single RCE in any Python dep escalated to host-level
+# write on bind mounts. Pin to 1000:1000 so the same numeric IDs
+# also align with the shared /var/ingest volume between open-webui
+# and celery-worker (review §11.10), and let operators override at
+# build time if their host has a different conventional non-root UID.
+ARG UID=1000
+ARG GID=1000
 
 ENV ENV=prod \
     PORT=8080 \
@@ -218,6 +226,16 @@ COPY upstream/backend/ .
 # Our extension code
 COPY ext/ /app/ext/
 COPY scripts/ /app/scripts/
+
+# Wave 1b (review §10.1): create the orgchat user + drop root. Done at
+# the END so all earlier RUN/COPY layers stay root-owned (apt + pip wrote
+# to /usr/local; chown on /app and /app/backend covers the writable
+# runtime dirs). The chown is best-effort (`|| true`) because some paths
+# may not exist on every variant of this image. Operator must rebuild +
+# verify each container boots with `docker exec orgchat-open-webui id`.
+RUN groupadd -g ${GID} orgchat && useradd -u ${UID} -g ${GID} -m -s /bin/bash orgchat && \
+    chown -R ${UID}:${GID} /app /app/backend 2>/dev/null || true
+USER ${UID}:${GID}
 
 EXPOSE 8080
 

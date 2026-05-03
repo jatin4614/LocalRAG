@@ -15,3 +15,22 @@ RUN pip install --no-cache-dir --upgrade \
 
 # Sanity — fail build if import breaks something in vllm
 RUN python3 -c "import vllm, transformers; print(f'vllm={vllm.__version__} transformers={transformers.__version__}')"
+
+# Wave 1b (review §10.1): drop root. The vllm/vllm-openai base image
+# uses /root/.cache/huggingface for the HF cache; compose mounts
+# volumes/models read-write into /root/.cache/huggingface/hub on the
+# host side. We chmod /root + /root/.cache so UID 1000 can traverse
+# in and read the bind-mounted weights (HF_HUB_OFFLINE=1 means no
+# writes are required at runtime; the host bind dir is operator-
+# managed). The nvidia container runtime grants /dev/nvidia* via
+# cgroup permissions not file UIDs, so the GPU is still reachable
+# from a non-root container. Operator MUST verify after rebuild
+# with `docker exec orgchat-vllm-chat nvidia-smi`; if the GPU is
+# invisible, the upstream image has a root-only init step we must
+# revisit (revert by removing the USER line below).
+ARG UID=1000
+ARG GID=1000
+RUN groupadd -g ${GID} orgchat && useradd -u ${UID} -g ${GID} -m -s /bin/bash orgchat && \
+    mkdir -p /root/.cache/huggingface/hub && \
+    chmod 755 /root && chmod -R a+rX /root/.cache 2>/dev/null || true
+USER ${UID}:${GID}
