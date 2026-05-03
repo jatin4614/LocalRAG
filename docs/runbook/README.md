@@ -3,6 +3,7 @@
 Operational reference for the LocalRAG retrieval pipeline. Each phase of Plan A/B fills in its own sections.
 
 ## Contents
+- [Cold-start runbook](cold-start.md) — first-time bring-up on a fresh host (host UID prep, shared volume chowns, secrets dir)
 - [SLO document](slo.md) — latency / cost / error / quality budgets
 - [Flag reference](flag-reference.md) — every RAG_* env flag, default, runtime-safe-to-toggle status
 - [Plan B flag reference](plan-b-flag-reference.md) — Plan B Phase 4/5/6 additions and audit decisions

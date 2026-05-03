@@ -106,11 +106,17 @@ Live state post-Phase-5: `kb_1_v4` (2705 pts, alias target) | `kb_1_v3` (Phase 5
 
 ## 8. Operator runbook
 
-**Cold start**:
+**Cold start** (long-form: `docs/runbook/cold-start.md`):
 ```bash
 cd compose && cp .env.example .env  # edit DOMAIN, ADMIN_*, *_SECRET_KEY, HF_TOKEN
 HF_HUB_OFFLINE=0 docker compose -p orgchat up -d vllm-chat tei vllm-qu  # first-time download only
 docker compose -p orgchat up -d
+# Wave 1b (review §11.10): one-shot UID alignment for the shared /var/ingest
+# volume between open-webui (producer) and celery-worker (consumer). After
+# the USER 1000:1000 baked into the images (review §10.1), the named volume
+# may still be root-owned from its first creation; chown once.
+docker compose -p orgchat run --rm --user root open-webui \
+    chown -R 1000:1000 /var/ingest /app/backend/data/uploads /root/.cache/huggingface
 .venv/bin/python scripts/apply_migrations.py
 ADMIN_EMAIL=… ADMIN_PASSWORD=… .venv/bin/python scripts/seed_admin.py
 .venv/bin/python scripts/apply_analyst_config.py  # idempotent — seeds RAG_TEMPLATE + system prompt
