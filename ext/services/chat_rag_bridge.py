@@ -967,6 +967,27 @@ def _apply_entity_quota(
 
     # Step 3 — final sort by cross-encoder score desc, capped.
     selected.sort(key=lambda h: float(getattr(h, "score", 0.0) or 0.0), reverse=True)
+
+    # Phase 3 / 2026-05-03 — observability bump.
+    try:
+        from .metrics import rag_multi_entity_coverage_total
+        counts = {e: 0 for e in entities}
+        for hit in selected:
+            text_low = ((hit.payload or {}).get("text") or "").lower()
+            for e in entities:
+                if e.lower() in text_low:
+                    counts[e] += 1
+                    break  # one entity attribution per chunk
+        n_zero = sum(1 for c in counts.values() if c == 0)
+        n_partial = sum(1 for c in counts.values() if 0 < c < per_entity_floor)
+        outcome = "empty" if n_zero else ("partial" if n_partial else "full")
+        rag_multi_entity_coverage_total.labels(
+            outcome=outcome, entity_count=str(len(entities)),
+        ).inc()
+    except Exception:
+        # Telemetry is fail-open; never break retrieval on counter error.
+        pass
+
     return selected[:final_k]
 
 

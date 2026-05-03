@@ -445,6 +445,27 @@ rag_multi_entity_rerank_quota_total = Counter(
     labelnames=("outcome",),
 )
 
+# 2026-05-03 — per-entity coverage outcome counter (Phase 3).
+# Bumped once per call to ``_apply_entity_quota`` that actually executed
+# quota logic (entities non-empty, per_entity_floor > 0). Three outcome
+# buckets:
+#   full    — every entity met its floor (typically 3 chunks)
+#   partial — at least one entity got <floor but >0 chunks
+#   empty   — at least one entity got 0 chunks (the failure mode this
+#             entire spec was written to fix; alert on this label)
+# entity_count label: str(len(entities)) — low-cardinality, bounded by
+# the decomposer's max entity count (typically ≤8).
+# Spec: docs/superpowers/specs/2026-05-03-retrieval-quality-fix-design.md §6.1
+rag_multi_entity_coverage_total = Counter(
+    f"{_NS}_multi_entity_coverage_total",
+    "Per-entity coverage outcome of the multi-entity rerank quota. "
+    "outcome=full when every entity met its floor; "
+    "outcome=partial when at least one entity got <floor but >0 chunks; "
+    "outcome=empty when at least one entity got 0 chunks. "
+    "Spec: docs/superpowers/specs/2026-05-03-retrieval-quality-fix-design.md §6.1",
+    labelnames=("outcome", "entity_count"),
+)
+
 
 @contextmanager
 def time_stage(stage: str) -> Iterator[None]:
