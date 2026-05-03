@@ -520,6 +520,15 @@ class VectorStore:
         cb_cache = getattr(self, "_colbert_cache", None)
         if cb_cache is not None:
             cb_cache.pop(name, None)
+        # Wave 2 (review §4.4): the sharding cache is a third sibling
+        # populated lazily — without this pop, a recreated collection
+        # with different sharding mode (e.g. legacy → custom-shard, or
+        # custom-shard → legacy) would inherit the stale boolean until
+        # the process restarts. Same defensive getattr pattern as the
+        # colbert cache above.
+        sh_cache = getattr(self, "_sharding_cache", None)
+        if sh_cache is not None:
+            sh_cache.pop(name, None)
 
     async def _refresh_sparse_cache(self, name: str) -> bool:
         """Ask Qdrant whether ``name`` has the ``bm25`` sparse named vector.
