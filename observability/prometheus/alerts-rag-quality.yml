@@ -94,7 +94,12 @@ groups:
       # casing/synonyms work.
       # Spec: docs/superpowers/specs/2026-05-03-retrieval-quality-fix-design.md §6.2
       - alert: MultiEntityCoverageEmpty
-        expr: rate(rag_multi_entity_coverage_total{outcome="empty"}[15m]) > 0.05
+        expr: |
+          (
+            sum(rate(rag_multi_entity_coverage_total{outcome="empty"}[15m]))
+            /
+            sum(rate(rag_multi_entity_coverage_total[15m]))
+          ) > 0.05
         for: 10m
         labels: {severity: warning, component: rag}
         annotations:
@@ -102,7 +107,7 @@ groups:
           description: |
             Either entity_text_filter regressed, the synonym table is
             stale, or a new corpus added an unfamiliar abbreviation.
-            Cross-reference rag_multi_entity_decompose_total for context.
+            Cross-reference rag_multi_query_decompose_total for context.
             The failing entity name is NOT in the metric label
             (cardinality concern); inspect open-webui logs for "rag:
             multi-entity rerank quota active" lines to see which entity
