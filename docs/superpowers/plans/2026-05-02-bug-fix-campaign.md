@@ -163,6 +163,26 @@ Every behavior change ships behind a flag, default OFF for first deploy. Soak 7 
 
 (Updated as commits land. Newest first.)
 
+### Wave 3 batch 1 (5 agents spawned, 4 stalled at watchdog; 7 fixes via inline finish)
+
+- 2026-05-03 `7779340` — Inline §1.4: partial UNIQUE index on kb_documents (kb_id, blob_sha) + dedup pre-step + 409 in upload route.
+- 2026-05-03 `fa33768` — Inline §4.6: migration 009 no-op placeholder filling the chronology gap.
+- 2026-05-03 `83e14cd` — Inline §1.5: corrected status ladder transitions at upload + worker boundaries.
+- 2026-05-03 `174df28` — Inline §4.4: pop `_sharding_cache` on `delete_collection`.
+- 2026-05-03 `efdf6fd` — Inline §4.7: align canonical HNSW config with vector_store defaults.
+- 2026-05-03 `94903c8` — Inline §11.10: align runtime UID 1000:1000 across shared-volume services.
+- 2026-05-03 `e433eae` — W6G §10.1: drop root via USER 1000:1000 in 7 Dockerfiles (cherry-picked).
+
+### Wave 3 batch 1 deferred to a focused future pass:
+- **§4.3** soft-delete propagation (complex): mark Qdrant points `deleted=true` when postgres soft-deletes a doc.
+- **§9.9** reembed_all checkpoint file (operator quality).
+- **§2.5** pysbd multilingual sentence splitter (needs new pip dep).
+- **§6.10 / §6.11** RAG_ENFORCE_CITATIONS / RAG_ENFORCE_ABSTENTION (LLM-output post-processing complexity).
+- **§6.4** chat-call recording (upstream patch).
+- **§11.5** Docker secrets (compose-wide; needs operator-side coord).
+- **§3d** intent unification refactor (chat_rag_bridge.py, flag-gated).
+- **§3e** _run_pipeline registry refactor (flag-gated, biggest surgery).
+
 ### Wave 2 round 6 (9 inline fixes — finish small remaining items)
 
 - 2026-05-03 `6d1fb9f` — Inline §6.12: LLM circuit breaker on doc_summarizer (RAG_CB_LLM_ENABLED=0 default).
