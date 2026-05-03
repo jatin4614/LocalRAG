@@ -70,3 +70,36 @@ def test_empty_coverage_bumps_empty_outcome():
     )
     after = _read("empty", "2")
     assert after == before + 1
+
+
+def test_counter_measures_returned_slice_not_pre_cap_pool():
+    """When final_k < len(selected), counter must reflect the LLM-facing slice.
+
+    6 hits: 3 about 75 Inf Bde (scores 0.95/0.94/0.93), 3 about 5 PoK Bde
+    (scores 0.50/0.45/0.40).  Per-entity floor=3 so both entities are quota'd
+    into `selected` (all 6 hits).  final_k=3 caps the returned slice to the
+    top-3 by score — all of which are 75 Inf Bde.  5 PoK Bde gets zero chunks
+    in the LLM-facing slice, so the counter outcome must be 'empty', not 'full'.
+    """
+    hits = [
+        _hit(1, 0.95, "75 Inf Bde 1"),
+        _hit(2, 0.94, "75 Inf Bde 2"),
+        _hit(3, 0.93, "75 Inf Bde 3"),
+        _hit(4, 0.50, "5 PoK Bde 1"),
+        _hit(5, 0.45, "5 PoK Bde 2"),
+        _hit(6, 0.40, "5 PoK Bde 3"),
+    ]
+    before_full = _read("full", "2")
+    before_empty = _read("empty", "2")
+    out = _apply_entity_quota(
+        reranked=hits, entities=["75 Inf Bde", "5 PoK Bde"],
+        per_entity_floor=3, final_k=3,  # cap at 3 — drops all 5 PoK hits
+    )
+    after_full = _read("full", "2")
+    after_empty = _read("empty", "2")
+    # Sanity: returned slice has 3 chunks, all 75 Inf Bde.
+    assert len(out) == 3
+    assert all("75 Inf Bde" in h.payload["text"] for h in out)
+    # Counter must measure the slice, not the pre-cap pool.
+    assert after_empty == before_empty + 1, "expected empty bucket bumped"
+    assert after_full == before_full, "full bucket should NOT be bumped"

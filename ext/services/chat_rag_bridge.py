@@ -969,10 +969,12 @@ def _apply_entity_quota(
     selected.sort(key=lambda h: float(getattr(h, "score", 0.0) or 0.0), reverse=True)
 
     # Phase 3 / 2026-05-03 — observability bump.
+    # Count attribution on the returned slice (selected[:final_k]), not the
+    # full candidate pool, so the counter reflects what the LLM actually sees.
     try:
         from .metrics import rag_multi_entity_coverage_total
         counts = {e: 0 for e in entities}
-        for hit in selected:
+        for hit in selected[:final_k]:
             text_low = ((hit.payload or {}).get("text") or "").lower()
             for e in entities:
                 if e.lower() in text_low:
