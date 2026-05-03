@@ -1541,6 +1541,13 @@ async def _run_pipeline(
                 chat_id=str(chat_id) if chat_id else "",
             ):
                 _tR = time.perf_counter()
+                # 2026-05-03 fix: initialize multi-entity quota variables upfront so the
+                # metadata-intent path (which short-circuits before the decompose block)
+                # doesn't crash when the post-rerank quota check references them.
+                # See docs/superpowers/specs/2026-05-03-retrieval-quality-fix-design.md §1.4.
+                _do_decompose: bool = False
+                _entities: list = []
+                _entity_floor: int = 0
                 # Tier 2 routing — metadata queries are answered entirely
                 # by the catalog preamble appended later; skipping
                 # retrieval saves a Qdrant round-trip and avoids feeding
