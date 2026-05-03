@@ -42,6 +42,33 @@ volumes:
   # path on demand at `up -d` time.
   backups: { driver: local }
 
+# Wave 1b (review §11.5): docker secrets. Backed by host files under
+# compose/secrets/ (NEVER committed — see compose/secrets/.gitignore).
+# Each secret is mounted at /run/secrets/<name> inside the consuming
+# container; services that natively support the `_FILE` convention
+# (postgres, qdrant) read the path directly. open-webui's
+# WEBUI_SECRET_KEY does NOT have a `_FILE` convention upstream, so it
+# still falls back to the env-var path; mounting the secret here makes
+# it available to a future entrypoint wrapper or to operator-side
+# `docker exec` for rotation.
+#
+# Files are OPTIONAL: if compose/secrets/<name> doesn't exist on the
+# host, `docker compose up` fails fast with "secret <name>: file
+# /path/to/secret not found". Operators who haven't migrated yet
+# can comment out this block + the per-service `secrets:` lists OR
+# just create the files with the same values they already have in
+# .env. See compose/secrets/README.md for the migration recipe and
+# how scripts/bootstrap.sh degrades gracefully when the dir is absent.
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password
+  webui_secret_key:
+    file: ./secrets/webui_secret_key
+  rag_admin_token:
+    file: ./secrets/rag_admin_token
+  qdrant_api_key:
+    file: ./secrets/qdrant_api_key
+
 services:
   postgres:
     image: postgres:15-alpine
@@ -52,8 +79,19 @@ services:
     cpus: 2
     environment:
       POSTGRES_USER:     ${POSTGRES_USER}
+      # Wave 1b (review §11.5): POSTGRES_PASSWORD_FILE takes precedence over
+      # POSTGRES_PASSWORD when set; postgres reads the file at startup so
+      # the cleartext value never appears in `docker inspect`. Both are
+      # set so operators who haven't migrated to compose/secrets/ keep the
+      # env-var path. If compose/secrets/postgres_password is missing,
+      # docker compose fails fast at `up`; operators can either create
+      # the file (`echo "$POSTGRES_PASSWORD" > compose/secrets/postgres_password`)
+      # or remove the `secrets:` mapping below to opt out entirely.
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
       POSTGRES_DB:       ${POSTGRES_DB}
+    secrets:
+      - postgres_password
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ../ext/db/migrations:/docker-entrypoint-initdb.d:ro
@@ -102,6 +140,14 @@ services:
       # also need QDRANT_API_KEY in their env to keep working — see
       # docs/superpowers/plans/2026-05-02-bug-fix-campaign.md (Wave 2 G).
       QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:-}
+    # Wave 1b (review §11.5): mount the api-key secret at /run/secrets/
+    # qdrant_api_key. Qdrant's settings system doesn't have a native
+    # `_FILE` convention so QDRANT__SERVICE__API_KEY still consumes the
+    # env var above; the mounted secret is available for an entrypoint
+    # wrapper or for operator-side `docker exec orgchat-qdrant cat /run/
+    # secrets/qdrant_api_key` during rotation.
+    secrets:
+      - qdrant_api_key
     # First (and only) peer in a single-node cluster must advertise its
     # P2P URI so consensus can initialize. Inside the orgchat compose
     # network, the service is reachable as http://qdrant:6335.
@@ -659,6 +705,17 @@ services:
       RAG_BUDGET_TOKENIZER: ${RAG_BUDGET_TOKENIZER:-gemma-4}
       RAG_BUDGET_TOKENIZER_MODEL: ${RAG_BUDGET_TOKENIZER_MODEL:-QuantTrio/gemma-4-31B-it-AWQ}
       SESSION_SECRET: ${SESSION_SECRET}
+    # Wave 1b (review §11.5): mount the JWT signing key + admin token + qdrant
+    # api key as files under /run/secrets/. open-webui's WEBUI_SECRET_KEY does
+    # NOT have a `_FILE` convention upstream so it still consumes the env var
+    # above; the mounted secret is available for an entrypoint wrapper if/when
+    # the operator wants to source from disk (e.g. for in-place rotation
+    # without restarting the container). Same for RAG_ADMIN_TOKEN /
+    # QDRANT_API_KEY — both consumed by ext/services/* via os.environ.
+    secrets:
+      - webui_secret_key
+      - rag_admin_token
+      - qdrant_api_key
     volumes:
       - ../volumes/uploads:/app/backend/data/uploads
       - ../volumes/hf-cache:/root/.cache/huggingface
@@ -787,6 +844,15 @@ services:
       # / unset → use the in-code default. CLAUDE.md §7 trap: env vars
       # must be explicitly mapped here OR they never reach the worker.
       RAG_QDRANT_SNAPSHOT_CRON: ${RAG_QDRANT_SNAPSHOT_CRON:-}
+    # Wave 1b (review §11.5): the celery-worker also talks to qdrant +
+    # postgres so it gets the same secrets mounted as open-webui. Same
+    # caveat about no-`_FILE` upstream consumption — env vars above
+    # still drive the actual config; the secret files are available
+    # for entrypoint wrappers / rotation.
+    secrets:
+      - postgres_password
+      - qdrant_api_key
+      - rag_admin_token
     volumes:
       - ingest_blobs:/var/ingest
       # Wave 3a (review §4.2) — backups output dir, shared with host.
