@@ -17,19 +17,203 @@ The active tokenizer is whatever ``RAG_BUDGET_TOKENIZER`` selects in
 chat-model alias (e.g. ``gemma-4``), chunk sizing tracks the real prompt
 token count instead of being off by ~10-15% — which previously evicted
 relevant chunks from the budget pass.
+
+Multilingual sentence splitting (review §2.5):
+The default sentence splitter is the English-centric regex ``_SENT``,
+which only sees ``.``, ``!``, ``?`` followed by whitespace. That misses
+the Devanagari danda (``।``), the Chinese / Japanese full-stop (``。``),
+the Arabic full-stop, etc. — and over-splits French / German "Dr.",
+"M.", "z.B." abbreviations.
+
+When the operator sets ``RAG_PYSBD_ENABLED=1`` (default OFF), the walker
+delegates to :mod:`pysbd` (Python Sentence Boundary Disambiguation),
+which has language-specific rules for the 23 languages it supports.
+The language is sniffed cheaply from the first ~512 chars by counting
+Unicode-block hits (Devanagari → ``hi``, CJK → ``zh``, Cyrillic →
+``ru``, Arabic → ``ar``, Hangul → ``ja`` heuristic, otherwise ``en``).
+
+The flag ships default-OFF because pysbd's segmentation differs from
+the regex by a few-percent of edge cases — a good audit trail to keep
+even when the team eventually flips it on. If pysbd is missing from
+the environment, the import is wrapped in try/except so the chunker
+silently falls back to the regex (graceful degradation; no hard
+runtime dependency).
 """
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import List
+from typing import List, Optional
 
 
 # Paragraph break: two (or more) newlines, possibly with whitespace between.
 _PARA = re.compile(r"\n\s*\n")
 # Sentence break: whitespace following a terminator .!?  (English-centric; good enough for P0.)
+# Wave 3-f review §2.5: superseded by pysbd when ``RAG_PYSBD_ENABLED=1`` AND
+# the import succeeds. See ``_split_sentences`` for the dispatch.
 _SENT = re.compile(r"(?<=[.!?])\s+")
+
+
+# --- pysbd integration (§2.5) ----------------------------------------------
+#
+# We probe the import lazily so the regex path doesn't pay any cost if the
+# operator hasn't installed pysbd. The import is also wrapped in try/except
+# so a missing wheel in an air-gapped deploy degrades gracefully to the
+# regex rather than blocking ingest.
+
+# Sentinels — None means "not yet probed", False means "probed and absent".
+_PYSBD_PROBED: Optional[object] = None  # the module if loaded, False if missing
+
+
+def _pysbd_module():
+    """Return the pysbd module, or False if unavailable. Cached per process."""
+    global _PYSBD_PROBED
+    if _PYSBD_PROBED is not None:
+        return _PYSBD_PROBED
+    try:
+        import pysbd  # type: ignore[import-not-found]
+
+        _PYSBD_PROBED = pysbd
+    except Exception:
+        # ImportError, AttributeError, anything from a borked wheel — treat
+        # as absent. Logging here would spam every chunk_text call; the
+        # operator sees "not splitting multilingually" as a behavior, not
+        # an error, which is the correct contract for a soft dependency.
+        _PYSBD_PROBED = False  # type: ignore[assignment]
+    return _PYSBD_PROBED
+
+
+def _pysbd_enabled() -> bool:
+    """Truthy when the operator opted in via env AND pysbd is importable."""
+    if os.environ.get("RAG_PYSBD_ENABLED", "0").strip().lower() not in {"1", "true", "yes"}:
+        return False
+    return bool(_pysbd_module())
+
+
+# Unicode-block to pysbd-language-code mapping. The first matching block
+# wins; the order is roughly population-weighted so the common cases (zh,
+# hi) hit early. We deliberately do NOT call out to a real language
+# detector (langdetect / lingua) — those are 10-50 MB deps and overkill
+# for picking between 23 segmenters at chunk time. The block sniff is
+# free, deterministic, and good enough; misclassified text just gets the
+# English segmenter, which is also fine.
+_LANG_RANGES: tuple[tuple[str, range], ...] = (
+    ("hi", range(0x0900, 0x097F + 1)),  # Devanagari (Hindi, Marathi)
+    ("zh", range(0x4E00, 0x9FFF + 1)),  # CJK Unified Ideographs
+    ("ja", range(0x3040, 0x30FF + 1)),  # Hiragana + Katakana (Japanese)
+    ("ar", range(0x0600, 0x06FF + 1)),  # Arabic
+    ("ru", range(0x0400, 0x04FF + 1)),  # Cyrillic
+    ("el", range(0x0370, 0x03FF + 1)),  # Greek
+    ("hy", range(0x0530, 0x058F + 1)),  # Armenian
+    ("am", range(0x1200, 0x137F + 1)),  # Ethiopic (Amharic)
+)
+
+
+def _sniff_language(text: str, *, sample_chars: int = 512) -> str:
+    """Return a pysbd language code (``en`` default).
+
+    Scans up to ``sample_chars`` of ``text`` and tallies hits per
+    Unicode block. Picks the highest-count block; ties go to the order
+    in ``_LANG_RANGES``. Returns ``en`` when nothing notable is found.
+
+    O(min(N, sample_chars)). Deliberately tiny — runs once per
+    ``chunk_text`` call, not once per sentence.
+    """
+    sample = text[:sample_chars]
+    if not sample:
+        return "en"
+    counts: dict[str, int] = {}
+    for ch in sample:
+        cp = ord(ch)
+        for code, rng in _LANG_RANGES:
+            if cp in rng:
+                counts[code] = counts.get(code, 0) + 1
+                break
+    if not counts:
+        return "en"
+    # Highest count wins; on tie, _LANG_RANGES order is preserved by the
+    # max() with a key that breaks ties via the table's index.
+    order = {code: i for i, (code, _) in enumerate(_LANG_RANGES)}
+    best = max(counts.items(), key=lambda kv: (kv[1], -order.get(kv[0], 99)))
+    # Require at least 5% of the *actual sampled text* to be in this
+    # script before switching off English. Threshold scales with sample
+    # length, not the cap, so a short Hindi passage isn't dismissed
+    # for failing an absolute character-count floor. Below 5% the bulk
+    # is Latin and pysbd's English rules will perform better than any
+    # minority language.
+    threshold = max(3, len(sample) // 20)
+    if best[1] < threshold:
+        return "en"
+    return best[0]
+
+
+@lru_cache(maxsize=32)
+def _pysbd_segmenter(language: str):
+    """Return a cached pysbd Segmenter for ``language``.
+
+    Constructing a segmenter loads regex tables; cache per language so
+    repeat calls are cheap. ``clean=False`` keeps the returned strings
+    untouched (we want to preserve trailing whitespace for offset math).
+    """
+    pysbd = _pysbd_module()
+    if not pysbd:
+        return None
+    try:
+        return pysbd.Segmenter(language=language, clean=False)
+    except Exception:
+        # Unknown / unsupported language — fall back to English so the
+        # caller doesn't have to special-case it.
+        try:
+            return pysbd.Segmenter(language="en", clean=False)
+        except Exception:
+            return None
+
+
+def _pysbd_split_paragraph(para_text: str):
+    """Yield ``(rel_start, rel_end, sentence_text)`` from ``para_text``
+    using pysbd. Mirrors the shape ``_iter_regions`` returns so the
+    walker doesn't care which path produced the offsets.
+
+    Falls back to the regex path on any pysbd failure or when pysbd
+    isn't installed — the caller can rely on the same surface.
+    """
+    seg = _pysbd_segmenter(_sniff_language(para_text))
+    if seg is None:
+        # pysbd unavailable; fall through.
+        for region in _iter_regions(_SENT, para_text):
+            yield region
+        return
+    try:
+        # pysbd returns the sentences in order with their leading
+        # whitespace preserved (because clean=False). We re-derive
+        # offsets by walking the original paragraph text and matching
+        # each returned sentence as a substring from the cursor onward.
+        # That avoids depending on pysbd's internal char-tracking which
+        # has changed between versions.
+        cursor = 0
+        for sent in seg.segment(para_text):
+            if not sent:
+                continue
+            stripped = sent.strip()
+            if not stripped:
+                continue
+            try:
+                idx = para_text.index(stripped, cursor)
+            except ValueError:
+                # Defensive: if pysbd mutated the text in any way,
+                # fall back to the regex split for this paragraph.
+                for region in _iter_regions(_SENT, para_text):
+                    yield region
+                return
+            yield idx, idx + len(stripped), stripped
+            cursor = idx + len(stripped)
+    except Exception:
+        # Any pysbd runtime failure → regex fallback. Don't let a
+        # third-party splitter take down ingest.
+        for region in _iter_regions(_SENT, para_text):
+            yield region
 
 
 @dataclass(frozen=True)
@@ -75,9 +259,22 @@ def _walk_sentences(text: str):
     Splits on paragraph breaks first, then sentence terminators. Preserves
     absolute character offsets in the original ``text`` so chunk offsets
     can be computed without any decode-and-count tricks.
+
+    Sentence-splitter dispatch (review §2.5): when ``RAG_PYSBD_ENABLED=1``
+    AND pysbd is importable, paragraphs are routed through pysbd's
+    language-specific segmenter (Hindi danda ``।``, Chinese ``。``,
+    French abbreviations, etc.). Otherwise the legacy English-centric
+    regex ``_SENT`` runs unchanged. The pysbd path is always allowed to
+    fall back to the regex on a per-paragraph basis if a runtime error
+    pops up — see ``_pysbd_split_paragraph``.
     """
+    use_pysbd = _pysbd_enabled()
     for para_start, _para_end, para_text in _iter_regions(_PARA, text):
-        for rel_start, _rel_end, sent_text in _iter_regions(_SENT, para_text):
+        if use_pysbd:
+            sent_iter = _pysbd_split_paragraph(para_text)
+        else:
+            sent_iter = _iter_regions(_SENT, para_text)
+        for rel_start, _rel_end, sent_text in sent_iter:
             # Strip leading whitespace but keep the offset accurate.
             leading = len(sent_text) - len(sent_text.lstrip())
             stripped = sent_text.strip()
