@@ -726,11 +726,15 @@ services:
       - qdrant_api_key
     volumes:
       - ../volumes/uploads:/app/backend/data/uploads
-      - ../volumes/hf-cache:/root/.cache/huggingface
+      # 2026-05-03: post-§10.1 image runs as USER 1000:1000 with HOME=/home/orgchat;
+      # /root/ is mode 700 root-owned so the user can't traverse it. Mount HF
+      # cache at the user's HOME instead — transformers/huggingface_hub default
+      # to $HOME/.cache/huggingface so no env override is needed.
+      - ../volumes/hf-cache:/home/orgchat/.cache/huggingface
       # Bind the gemma model dir from volumes/models into the HF cache
       # subpath so AutoTokenizer.from_pretrained finds it offline. Mounted
       # read-only — open-webui must never mutate the model store.
-      - ../volumes/models/models--QuantTrio--gemma-4-31B-it-AWQ:/root/.cache/huggingface/hub/models--QuantTrio--gemma-4-31B-it-AWQ:ro
+      - ../volumes/models/models--QuantTrio--gemma-4-31B-it-AWQ:/home/orgchat/.cache/huggingface/hub/models--QuantTrio--gemma-4-31B-it-AWQ:ro
       - ingest_blobs:/var/ingest
     depends_on:
       postgres:

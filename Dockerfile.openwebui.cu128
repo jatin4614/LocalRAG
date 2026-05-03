@@ -69,7 +69,11 @@ RUN pip install --no-cache-dir uv
 # 2.7-2.10 cover sm_120 Blackwell kernel support without that dep.
 # Drop the upper bound when pypi.nvidia.com stabilises OR when the
 # operator pre-mirrors the wheel into a local pip index.
-RUN uv pip install --system --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 \
+# 2026-05-03: bumped UV_HTTP_TIMEOUT to 600s — torch 2.10 transitively
+# pulls nvidia-cusparselt-cu12 (~287 MB) from pypi.nvidia.com, which has
+# been timing out on uv's default 30s. The egress is up but slow during
+# build; longer timeout dodges the issue without forcing a wheel-mirror.
+RUN UV_HTTP_TIMEOUT=600 uv pip install --system --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 \
     'torch>=2.7,<2.11'
 
 # Upstream Python deps — torch is now already-satisfied (cu128 wheel above).
