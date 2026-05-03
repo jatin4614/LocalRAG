@@ -221,6 +221,9 @@ _KEY_TO_ENV: dict[str, str] = {
     # The QU LLM flags (RAG_QU_*) are cluster-wide and not exposed as
     # per-KB rag_config keys.
 }
+# Note: `synonyms` is intentionally NOT in _KEY_TO_ENV. The synonym
+# table has no env-level analogue (it's per-KB only); kb_config.py
+# threads it via the merged dict, not via the request-scoped env overlay.
 
 
 def validate_config(raw: Mapping[str, Any]) -> dict[str, Any]:
@@ -378,20 +381,15 @@ def merge_configs(configs: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
                 elif prev is None:
                     merged[key] = value
             elif key in VALID_LIST_KEYS:
-                # 2026-05-03 — Phase 2 / Item 4. Synonyms: union of all
+                # 2026-05-03 — Phase 2 / Item 4. Synonyms: concatenate all
                 # equivalence-class lists across selected KBs. Additive —
                 # if KB-A defines brigade variants and KB-B defines unit
                 # variants, a multi-KB query should see both tables.
-                if key not in merged:
-                    merged[key] = list(value)
-                else:
-                    # Extend with classes not already present (identity by
-                    # first element to avoid duplicating identical classes).
-                    existing_heads = {cls[0] for cls in merged[key] if cls}
-                    for cls in value:
-                        if cls and cls[0] not in existing_heads:
-                            merged[key].append(cls)
-                            existing_heads.add(cls[0])
+                # Duplicates are harmless: expand_entity returns a set so
+                # identical members across classes are naturally deduped at
+                # call time. Simpler than any class-merging algorithm and
+                # avoids the head-based dedup bug (see review of 5c3c6ae).
+                merged[key] = merged.get(key, []) + list(value)
     return merged
 
 

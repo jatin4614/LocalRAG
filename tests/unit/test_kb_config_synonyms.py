@@ -4,6 +4,7 @@ import pytest
 
 from ext.services.kb_config import (
     expand_entity,
+    merge_configs,
     validate_config,
     config_to_env_overrides,
     VALID_BOOL_KEYS,
@@ -24,10 +25,18 @@ def test_expand_entity_basic():
 
 
 def test_expand_entity_case_insensitive_membership():
-    """User can type with any casing; class match is case-insensitive."""
+    """User can type with any casing; class match is case-insensitive.
+    Returns the entire class plus the input form (set semantics dedup
+    when input is already in the class)."""
     classes = [["5 PoK", "5 POK", "Pakistan-Occupied Kashmir"]]
-    assert "Pakistan-Occupied Kashmir" in expand_entity("5 pok", classes)
-    assert "5 PoK" in expand_entity("5 POK", classes)
+    # Input "5 pok" is NOT literally in the class — gets added to result
+    assert expand_entity("5 pok", classes) == {
+        "5 pok", "5 PoK", "5 POK", "Pakistan-Occupied Kashmir"
+    }
+    # Input "5 POK" IS in the class — set dedupes, result equals the class exactly
+    assert expand_entity("5 POK", classes) == {
+        "5 PoK", "5 POK", "Pakistan-Occupied Kashmir"
+    }
 
 
 def test_expand_entity_not_in_any_class_returns_self_only():
@@ -70,3 +79,15 @@ def test_config_to_env_overrides_serializes_mode():
     """entity_text_filter_mode flows into RAG_ENTITY_TEXT_FILTER_MODE env."""
     out = config_to_env_overrides({"entity_text_filter_mode": "boost"})
     assert out == {"RAG_ENTITY_TEXT_FILTER_MODE": "boost"}
+
+
+def test_merge_configs_unions_synonyms_across_kbs():
+    """Multi-KB queries with overlapping synonym classes don't lose variants."""
+    cfg_a = {"synonyms": [["5 PoK", "5 POK"]]}
+    cfg_b = {"synonyms": [["5 PoK", "Pakistan-Occupied Kashmir"]]}
+    merged = merge_configs([cfg_a, cfg_b])
+    # Both classes' variants must be reachable. Either separate classes
+    # in the merged list or merged into one — either is fine, as long as
+    # expand_entity("5 PoK", merged["synonyms"]) recovers all 3 variants.
+    out = expand_entity("5 PoK", merged["synonyms"])
+    assert {"5 PoK", "5 POK", "Pakistan-Occupied Kashmir"} <= out
