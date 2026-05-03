@@ -173,8 +173,8 @@ Every behavior change ships behind a flag, default OFF for first deploy. Soak 7 
 - 2026-05-03 `94903c8` — Inline §11.10: align runtime UID 1000:1000 across shared-volume services.
 - 2026-05-03 `e433eae` — W6G §10.1: drop root via USER 1000:1000 in 7 Dockerfiles (cherry-picked).
 
-### Wave 3 batch 1 deferred to a focused future pass:
-- **§4.3** soft-delete propagation (complex): mark Qdrant points `deleted=true` when postgres soft-deletes a doc.
+### Wave 3 batch 1 deferred status (resolved later):
+- **§4.3** ALREADY ADDRESSED. Audit confirmed every soft-delete path cascades cleanly: `delete_kb` drops the entire Qdrant collection (`kb_admin.py:397-`), `delete_document` hard-deletes per-doc Qdrant points (`kb_admin.py:818`), subtag delete cascades to docs + Qdrant. Search-side `must_not.match(deleted=True)` filter is already in place at `vector_store.py:901-902`. The review's concern about "legacy points without the field" is the EXPECTED behavior — those points are live; the field defaults to `false` which is correct.
 - **§9.9** reembed_all checkpoint file (operator quality).
 - **§2.5** pysbd multilingual sentence splitter (needs new pip dep).
 - **§6.10 / §6.11** RAG_ENFORCE_CITATIONS / RAG_ENFORCE_ABSTENTION (LLM-output post-processing complexity).
