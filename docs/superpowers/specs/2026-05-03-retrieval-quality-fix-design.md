@@ -156,7 +156,7 @@ Phase 1 (~1 day)               Phase 2 (~3-5 days)             Phase 3 (~1-2 day
 | `ext/services/multi_query.py` | 2 | `_apply_entity_quota` accepts optional `entity_variants_map` for the boost-mode score adjustment |
 | `ext/services/kb_config.py` | 2 | new key `entity_text_filter_mode` ("filter" \| "boost"); new key `synonyms` (list of equivalence classes); `expand_entity()` helper |
 | `ext/services/metrics.py` | 3 | `rag_multi_entity_coverage_total{outcome,entity_count}` counter |
-| `ext/db/migrations/013_kb_synonyms.sql` | 2 | adds `synonyms` JSONB column to `knowledge_bases` |
+| `ext/db/migrations/017_kb_synonyms.sql` | 2 | adds `synonyms` JSONB column to `knowledge_bases` |
 | `scripts/apply_text_index.py` | 1 | one-shot operator script — adds the lowercase text index to every KB collection |
 | `scripts/edit_kb_synonyms.py` | 2 | operator CLI to seed/edit per-KB synonym table |
 | `ext/routers/kb_admin.py` | 2 | `PATCH /api/kb/{kb_id}/synonyms` (admin-only) |
@@ -368,7 +368,7 @@ queries (operator judgment), flip env default to `boost`.
 #### 5.2.1 Storage
 
 New JSONB column `synonyms` on `knowledge_bases`. Migration
-`013_kb_synonyms.sql`:
+`017_kb_synonyms.sql`:
 
 ```sql
 ALTER TABLE knowledge_bases
@@ -444,7 +444,7 @@ Used in two places, both via `_build_filter` reading the per-KB
 
 ### 5.3 Phase 2 deliverables
 
-- Migration `013_kb_synonyms.sql` (idempotent)
+- Migration `017_kb_synonyms.sql` (idempotent)
 - `kb_config.expand_entity()` + `kb_config.VALID_BOOL_KEYS` adds
   `entity_text_filter_mode`; `kb_config.VALID_KEYS` adds `synonyms`
 - `vector_store._build_filter` uses variants set + `should` clause when
@@ -649,7 +649,7 @@ Trigger the alert deliberately to verify it routes correctly:
 
 1. **Land Phase 1** in one PR. Deploy. Run §6.3 step 1.
 2. If brigade-query hits look good, **land Phase 2** in a second PR.
-   Deploy. Apply migration `013_kb_synonyms.sql` via
+   Deploy. Apply migration `017_kb_synonyms.sql` via
    `scripts/apply_migrations.py`. Seed synonyms via §6.3 step 2.
 3. Manually compare `MODE=filter` vs `MODE=boost` on 3 representative
    queries (operator judgment). If `boost` is at least as good, flip env
