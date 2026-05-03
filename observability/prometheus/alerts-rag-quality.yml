@@ -84,3 +84,26 @@ groups:
             briefly down, Postgres latency spike during catalog_render,
             or a recent change to kb_documents schema breaking the
             metadata path.
+
+      # 2026-05-03 — entity-coverage failure detection. Pairs with the
+      # rag_multi_entity_coverage_total counter (commit b17d168 / Task 12)
+      # which buckets every multi-entity request as full / partial / empty
+      # based on whether each named entity got the floor of chunks in
+      # the final pool. outcome=empty means at least one entity got 0
+      # chunks — the failure mode that motivated the entity_text_filter
+      # casing/synonyms work.
+      # Spec: docs/superpowers/specs/2026-05-03-retrieval-quality-fix-design.md §6.2
+      - alert: MultiEntityCoverageEmpty
+        expr: rate(rag_multi_entity_coverage_total{outcome="empty"}[15m]) > 0.05
+        for: 10m
+        labels: {severity: warning, component: rag}
+        annotations:
+          summary: "Multi-entity queries returning 0 hits for at least one entity (>5% rate)"
+          description: |
+            Either entity_text_filter regressed, the synonym table is
+            stale, or a new corpus added an unfamiliar abbreviation.
+            Cross-reference rag_multi_entity_decompose_total for context.
+            The failing entity name is NOT in the metric label
+            (cardinality concern); inspect open-webui logs for "rag:
+            multi-entity rerank quota active" lines to see which entity
+            has the empty bucket.
