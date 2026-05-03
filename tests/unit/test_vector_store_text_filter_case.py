@@ -33,7 +33,7 @@ def test_build_filter_text_filter_strips_whitespace_and_lowercases():
     """Trailing/leading whitespace plus mixed case both normalised."""
     vs = VectorStore.__new__(VectorStore)
     f = vs._build_filter(text_filter="  5 PoK Bde  ")
-    text_conditions = [c for c in f.must if c.key == "text"]
+    text_conditions = [c for c in f.must if hasattr(c, "key") and c.key == "text"]
     assert text_conditions[0].match.text == "5 pok bde"
 
 
