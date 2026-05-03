@@ -1,6 +1,7 @@
 """HTTP admin routes for KB CRUD. Admin-only."""
 from __future__ import annotations
 
+import json
 import logging
 import os
 from collections import Counter
@@ -1092,3 +1093,77 @@ async def kb_health(
         newest_chunk_uploaded_at=newest_uploaded_at,
         failed_docs=failed,
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 / Item 4 — per-KB synonyms PATCH endpoint
+# ---------------------------------------------------------------------------
+
+class SynonymsPatch(BaseModel):
+    synonyms: list[list[str]]
+
+
+@router.patch("/{kb_id}/synonyms")
+async def patch_kb_synonyms(
+    kb_id: int,
+    body: SynonymsPatch,
+    user: CurrentUser = Depends(require_admin),
+    session: AsyncSession = Depends(_get_session),
+) -> dict:
+    """Replace the per-KB synonyms equivalence-class table.
+
+    Spec: docs/superpowers/specs/2026-05-03-retrieval-quality-fix-design.md §5.2.4
+
+    Validates that the body is a list of lists of strings (Pydantic
+    enforces the outer+inner list types; the explicit check below
+    guards against dicts/None slipping through before serialisation).
+    Returns 403 for non-admin, 400 for bad shape, 404 for missing KB,
+    200 + echo for success.
+    """
+    # Explicit inner validation: Pydantic's list[list[str]] rejects non-str
+    # scalars at parse time, but a fully opaque JSON value (dicts, None
+    # inside the inner list) would surface here rather than cleanly.
+    if not isinstance(body.synonyms, list) or not all(
+        isinstance(c, list) and all(isinstance(s, str) for s in c)
+        for c in body.synonyms
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="synonyms must be a list of lists of strings",
+        )
+
+    from sqlalchemy import text as _sql, bindparam
+    from sqlalchemy.dialects.postgresql import JSONB as _JSONB
+    from sqlalchemy.types import JSON as _JSON
+
+    # 404 check — verify KB exists and is not soft-deleted.
+    exists = (await session.execute(
+        _sql("SELECT 1 FROM knowledge_bases WHERE id = :i AND deleted_at IS NULL"),
+        {"i": kb_id},
+    )).scalar()
+    if not exists:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"KB {kb_id} not found",
+        )
+
+    # Use SQLAlchemy's type-coercion to avoid the raw `::jsonb` cast which
+    # asyncpg can't parse when combined with named params. Passing the list
+    # directly with `type_coerce` lets the asyncpg dialect serialise it as
+    # JSONB without the raw-SQL cast.
+    from sqlalchemy import type_coerce, update as _update
+    from sqlalchemy.dialects.postgresql import JSONB as _JSONB2
+
+    # Build a dialect-neutral JSON type that maps to JSONB on Postgres.
+    _SynonymsType = _JSON().with_variant(_JSONB2, "postgresql")
+
+    await session.execute(
+        _sql(
+            "UPDATE knowledge_bases SET synonyms = :s WHERE id = :i"
+        ).bindparams(
+            bindparam("s", value=body.synonyms, type_=_SynonymsType),
+            bindparam("i", value=kb_id),
+        )
+    )
+    await session.commit()
+    return {"kb_id": kb_id, "synonyms": body.synonyms}
