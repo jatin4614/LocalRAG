@@ -79,15 +79,14 @@ services:
     cpus: 2
     environment:
       POSTGRES_USER:     ${POSTGRES_USER}
-      # Wave 1b (review §11.5): POSTGRES_PASSWORD_FILE takes precedence over
-      # POSTGRES_PASSWORD when set; postgres reads the file at startup so
-      # the cleartext value never appears in `docker inspect`. Both are
-      # set so operators who haven't migrated to compose/secrets/ keep the
-      # env-var path. If compose/secrets/postgres_password is missing,
-      # docker compose fails fast at `up`; operators can either create
-      # the file (`echo "$POSTGRES_PASSWORD" > compose/secrets/postgres_password`)
-      # or remove the `secrets:` mapping below to opt out entirely.
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      # Wave 1b (review §11.5): file-backed secret keeps the cleartext
+      # password out of `docker inspect`. Postgres rejects when BOTH
+      # POSTGRES_PASSWORD and POSTGRES_PASSWORD_FILE are set, so the
+      # env-var form is intentionally NOT included here. Bootstrap
+      # populates compose/secrets/postgres_password from the .env value
+      # (scripts/bootstrap.sh, idempotent). To opt out of file-based
+      # secrets, swap the next line for `POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}`
+      # and drop the `secrets:` block below.
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
       POSTGRES_DB:       ${POSTGRES_DB}
     secrets:
@@ -299,14 +298,14 @@ services:
       - "${EMBED_MODEL}"
       - "--port"
       - "80"
-      # Wave 1a (review §3.1): default --max-input-length is 512, which
-      # silently truncates RAPTOR L1+ summaries and per-doc summaries
-      # (often 800-2000 tok of synthesized text) at the embed step.
-      # bge-m3 supports up to 8192. One-line fix; no data migration required,
-      # but to RE-EQUALIZE existing summary embeddings operators must run
-      # scripts/reembed_all.py against the affected docs.
-      - "--max-input-length"
-      - "8192"
+      # Wave 1a (review §3.1): TEI default --max-input-length is 512, which
+      # silently truncates RAPTOR L1+ summaries and per-doc summaries.
+      # bge-m3 supports up to 8192.
+      # NOTE: The Blackwell-specific image `:120-1.9` (Feb 2026 build)
+      # does NOT recognize --max-input-length. Upgrade to TEI ≥ 1.10 when
+      # the Blackwell-tagged build catches up; until then summaries truncate
+      # at 512. Operator can verify by `docker run --gpus all ... --help |
+      # grep max-input` against the live image tag.
     volumes:
       - ../volumes/models:/data
     environment:
@@ -488,7 +487,16 @@ services:
     #                        /root/.cache/huggingface
     # After that, every restart preserves the host uid mapping.
     # See docs/runbook/cold-start.md for the cold-start checklist.
-    user: "1000:1000"
+    #
+    # NOTE: the `user: "1000:1000"` directive below is COMMENTED until the
+    # cu128 openwebui image is rebuilt with the USER 1000 baked in (the
+    # currently-deployed `:cu128-test` image was built before §10.1 added
+    # the directive — its /app/backend layout is root-owned and the runtime
+    # crashes with PermissionError at /app/backend/data/cache when forced
+    # to 1000 from compose). After rebuild succeeds (gated on pypi.nvidia.com
+    # egress recovering — see Dockerfile.openwebui.cu128 §10.2 commit), flip
+    # this back on.
+    # user: "1000:1000"
     ports:
       # Wave 1a (review §11.2): bound to loopback. End-users go through
       # Caddy on :8443 (HTTPS, with WEBUI_SECRET_KEY-signed JWT). Direct
