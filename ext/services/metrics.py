@@ -611,3 +611,21 @@ RAG_SYSTEM_PROMPT_VERSION = Gauge(
     "Active analyst system prompt version (hash label = sha256[:12] of prompt)",
     labelnames=["hash"],
 )
+
+
+# ---------------------------------------------------------------------------
+# Wave 3a (review §4.2) — Qdrant snapshot task failure counter.
+#
+# Incremented once per per-collection snapshot failure (label = collection
+# name) AND once with collection="_list_collections" if the task can't even
+# list collections (Qdrant unreachable). Pair with the Celery beat schedule
+# in ext/workers/snapshot_task.py — a non-zero rate means the daily 02:30
+# safety-net snapshot is silently failing for one or more collections, which
+# erodes the rollback architecture's Layer 4 (data restore from snapshot).
+# ---------------------------------------------------------------------------
+rag_snapshot_failure_total = Counter(
+    "rag_snapshot_failure_total",
+    "Per-collection failures from the daily Qdrant snapshot task. "
+    "label collection='_list_collections' means the task couldn't list collections at all.",
+    labelnames=["collection"],
+)

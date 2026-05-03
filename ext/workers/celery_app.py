@@ -25,6 +25,9 @@ app = Celery(
         # Phase 4: weekly golden-set eval. The module registers its own
         # beat_schedule entry; inert unless celery beat is running.
         "ext.workers.scheduled_eval",
+        # Wave 3a (review §4.2): daily per-collection Qdrant snapshot.
+        # Registers its own beat_schedule entry; inert unless beat runs.
+        "ext.workers.snapshot_task",
     ],
 )
 
