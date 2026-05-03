@@ -25,3 +25,28 @@ groups:
         annotations:
           summary: "Celery upload p95 latency > 30s"
           description: "Worker may be saturated or slow."
+
+      # 2026-05-03 — silent stuck-at-chunking detection. The ingest worker
+      # writes kb_documents.ingest_status via _update_doc_status; if that
+      # write fails (asyncpg loop binding, PG transient down, schema drift),
+      # the actual chunk+upsert work still completes in Qdrant but the DB
+      # row stays at the previous status forever. Operator sees "stuck at
+      # chunking" in the admin UI even though retrieval works. Counter is
+      # bumped from ext/workers/ingest_worker.py:_update_doc_status's
+      # exception path (commit ebe4fee).
+      - alert: IngestStatusUpdateFailing
+        expr: rate(ingest_status_update_failed_total[5m]) > 0
+        for: 5m
+        labels: {severity: warning, component: ingest}
+        annotations:
+          summary: "celery-worker can't write kb_documents.ingest_status (stage={{ $labels.stage }})"
+          description: |
+            Ingest is silently completing but the kb_documents row is
+            stuck at the prior status. Failing stage label is the target
+            status the write was attempting (chunking/embedding/done).
+            Check celery-worker logs for "ingest: failed to update
+            kb_documents.ingest_status" — the original exception is
+            attached. Most-likely culprits historically: asyncpg
+            connection loop binding (commit ebe4fee NullPool fix), PG
+            connection saturation, or a kb_documents schema migration
+            that hasn't been applied.
