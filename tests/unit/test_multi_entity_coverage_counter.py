@@ -103,3 +103,26 @@ def test_counter_measures_returned_slice_not_pre_cap_pool():
     # Counter must measure the slice, not the pre-cap pool.
     assert after_empty == before_empty + 1, "expected empty bucket bumped"
     assert after_full == before_full, "full bucket should NOT be bumped"
+
+
+def test_chunk_mentioning_two_entities_attributed_to_first_match():
+    """First-match-wins: a chunk that contains BOTH entity strings counts
+    toward only the FIRST entity in the `entities` list. This documents
+    the convention encoded by the `break` after attribution.
+    """
+    before_empty = _read("empty", "2")
+    hits = [
+        _hit(1, 0.9, "75 Inf Bde and 5 PoK Bde joint patrol"),
+        _hit(2, 0.8, "75 Inf Bde and 5 PoK Bde drill"),
+        _hit(3, 0.7, "75 Inf Bde and 5 PoK Bde meeting"),
+    ]
+    _apply_entity_quota(
+        reranked=hits, entities=["75 Inf Bde", "5 PoK Bde"],
+        per_entity_floor=2, final_k=3,
+    )
+    # All 3 chunks attribute to first entity ("75 Inf Bde"); second
+    # entity ("5 PoK Bde") gets 0 → outcome=empty.
+    # If first-match weren't enforced, both would attribute to both →
+    # outcome=full, which would be wrong.
+    after_empty = _read("empty", "2")
+    assert after_empty == before_empty + 1

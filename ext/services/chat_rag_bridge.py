@@ -976,6 +976,9 @@ def _apply_entity_quota(
         counts = {e: 0 for e in entities}
         for hit in selected[:final_k]:
             text_low = ((hit.payload or {}).get("text") or "").lower()
+            # TODO: when per-KB synonyms wire into the bridge's _multi_entity_retrieve
+            # (future task), use kb_config.expand_entity(e, kb_synonyms) here so a
+            # chunk matched via synonym still counts toward the entity's coverage.
             for e in entities:
                 if e.lower() in text_low:
                     counts[e] += 1
@@ -986,9 +989,8 @@ def _apply_entity_quota(
         rag_multi_entity_coverage_total.labels(
             outcome=outcome, entity_count=str(len(entities)),
         ).inc()
-    except Exception:
-        # Telemetry is fail-open; never break retrieval on counter error.
-        pass
+    except Exception as err:
+        _record_silent_failure("multi_entity_coverage_counter", err)
 
     return selected[:final_k]
 
