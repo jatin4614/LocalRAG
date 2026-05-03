@@ -15,16 +15,81 @@ from .vector_store import CHAT_PRIVATE_COLLECTION, Hit, VectorStore
 logger = logging.getLogger(__name__)
 
 
+def _is_qdrant_auth_error(err: BaseException) -> bool:
+    """True iff ``err`` looks like a Qdrant auth/permission failure (401/403).
+
+    Wave 3 (2026-05-03): used by ``_record_silent_failure`` to escalate
+    auth-shaped failures on ``retrieve.per_kb_search`` from WARNING to
+    ERROR + a dedicated counter label, so an operator notices in
+    minutes rather than days. The in-prod symptom of NOT escalating was
+    that Qdrant 401'd every search → empty hit list → the LLM answered
+    from the system prompt + hallucinations for hours under cover of a
+    "healthy" pipeline.
+
+    Defensive about the import path / exception class — string-match
+    fallback covers exotic transports (e.g., aiohttp wrappers) that
+    raise something other than ``UnexpectedResponse`` but still embed
+    "Unauthorized" / "Forbidden" in their repr.
+    """
+    try:
+        from qdrant_client.http.exceptions import UnexpectedResponse
+        if isinstance(err, UnexpectedResponse) and err.status_code in (401, 403):
+            return True
+    except Exception:
+        pass
+    if getattr(err, "status_code", None) in (401, 403):
+        return True
+    rep = repr(err)
+    return "Unauthorized" in rep or "Forbidden" in rep
+
+
 def _record_silent_failure(stage: str, err: BaseException) -> None:
     """Mirror chat_rag_bridge._record_silent_failure for retriever-side
-    swallow paths. Cannot import that helper without a circular dep."""
+    swallow paths. Cannot import that helper without a circular dep.
+
+    Default behaviour (preserved): WARNING-level log + bump
+    ``RAG_SILENT_FAILURE.labels(stage=stage)``. This is the right shape
+    for the long tail of legitimate fail-open paths (rerank model down,
+    HyDE timeout, etc.) where the request degrades gracefully without
+    operator intervention.
+
+    Wave 3 escalation (2026-05-03): when ``stage == retrieve.per_kb_search``
+    AND the underlying error looks like Qdrant auth/permission (401/403),
+    log at ERROR and ALSO bump
+    ``RAG_SILENT_FAILURE.labels(stage="retrieve.per_kb_search.auth_error")``
+    so a Prometheus alert can fire on the dedicated label without
+    missing the (often legitimate) per-kb-search noise on the original
+    label. Why both counters: dashboards already key on the original
+    label, so we leave it intact.
+
+    NOTE: this function still does NOT raise. Fail-open semantics are
+    preserved deliberately — flipping to fail-closed (so a Qdrant outage
+    surfaces as a 5xx instead of "the LLM hallucinated") is a separate
+    decision. The combination of ERROR log + dedicated counter is what
+    gets a human looking at the box in <5 minutes.
+    """
+    is_per_kb_auth = stage == "retrieve.per_kb_search" and _is_qdrant_auth_error(err)
     try:
-        logger.warning("retriever: %s failed (%s): %r", stage, type(err).__name__, err)
+        if is_per_kb_auth:
+            logger.error(
+                "qdrant auth/permission failure for stage=%s — RAG retrieval is "
+                "silently empty; verify QDRANT_API_KEY propagation (err=%s: %r)",
+                stage, type(err).__name__, err,
+            )
+        else:
+            logger.warning(
+                "retriever: %s failed (%s): %r",
+                stage, type(err).__name__, err,
+            )
     except Exception:
         pass
     try:
         from .metrics import RAG_SILENT_FAILURE
         RAG_SILENT_FAILURE.labels(stage=stage).inc()
+        if is_per_kb_auth:
+            # Dedicated label so alerts can scope to auth failures
+            # without firing on every transient KB miss.
+            RAG_SILENT_FAILURE.labels(stage="retrieve.per_kb_search.auth_error").inc()
     except Exception:
         pass
 

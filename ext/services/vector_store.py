@@ -10,8 +10,36 @@ from typing import Iterable, List, Optional
 import httpx
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http import models as qm
+from qdrant_client.http.exceptions import UnexpectedResponse
 
 from .circuit_breaker import CircuitOpenError, breaker_for
+
+
+def _is_collection_missing_error(exc: BaseException) -> bool:
+    """True iff ``exc`` indicates the collection is permanently missing (HTTP 404).
+
+    Used by the three lazy "does this collection have feature X?" caches
+    (``_refresh_sparse_cache`` / ``_refresh_colbert_cache`` /
+    ``_is_custom_sharded``) to distinguish between:
+
+    * 404 — collection genuinely doesn't exist → cache ``False`` so we
+      stop probing on every retrieval (legitimate fail-closed path).
+    * Anything else (401/403/5xx/network/timeout) — transient. Return
+      ``False`` for the current call but DO NOT poison the cache, so the
+      next call re-probes and recovers automatically once Qdrant is
+      healthy again.
+
+    Pre-fix (2026-05-03 incident): a brief auth misconfiguration window
+    caused every ``get_collection`` call to return 401. The bare
+    ``except Exception`` in each cache wrote ``False`` permanently and
+    search continued to use the wrong vector shape until ``open-webui``
+    was restarted. The defensive ``getattr`` covers exotic transports
+    that wrap UnexpectedResponse or set ``status_code`` on a different
+    exception type.
+    """
+    if isinstance(exc, UnexpectedResponse) and exc.status_code == 404:
+        return True
+    return getattr(exc, "status_code", None) == 404
 from .metrics import qdrant_search_latency_seconds, qdrant_upsert_latency_seconds
 from .obs import span
 from time import perf_counter as _perf_counter
@@ -271,8 +299,23 @@ class VectorStore:
                 method is not None
                 and str(method).lower().endswith("custom")
             )
-        except Exception:
-            is_custom = False
+        except Exception as exc:
+            # Wave 3 (2026-05-03): only cache False on a permanent answer
+            # (404 → collection truly missing). Transient errors
+            # (401/403/5xx/network) MUST NOT poison the cache or the
+            # process will silently misroute upserts/searches forever.
+            # See ``_is_collection_missing_error`` docstring for context.
+            if _is_collection_missing_error(exc):
+                self._sharding_cache[name] = False
+                return False
+            import logging as _log
+            _log.getLogger(__name__).warning(
+                "_is_custom_sharded(%s) transient failure (%s); "
+                "skipping cache write so next call re-probes",
+                name,
+                type(exc).__name__,
+            )
+            return False
         self._sharding_cache[name] = is_custom
         return is_custom
 
@@ -540,8 +583,21 @@ class VectorStore:
             return self._sparse_cache[name]
         try:
             info = await self._client.get_collection(collection_name=name)
-        except Exception:
-            self._sparse_cache[name] = False
+        except Exception as exc:
+            # Wave 3 (2026-05-03): cache poisoning fix — see
+            # ``_is_collection_missing_error`` docstring. Only a 404 caches
+            # False permanently; everything else is transient and must
+            # leave the cache empty so the next call re-probes.
+            if _is_collection_missing_error(exc):
+                self._sparse_cache[name] = False
+                return False
+            import logging as _log
+            _log.getLogger(__name__).warning(
+                "_refresh_sparse_cache(%s) transient failure (%s); "
+                "skipping cache write so next call re-probes",
+                name,
+                type(exc).__name__,
+            )
             return False
         sparse = getattr(info.config.params, "sparse_vectors", None) if info and info.config else None
         has = bool(sparse) and _SPARSE_NAME in sparse
@@ -574,8 +630,20 @@ class VectorStore:
             return self._colbert_cache[name]
         try:
             info = await self._client.get_collection(collection_name=name)
-        except Exception:
-            self._colbert_cache[name] = False
+        except Exception as exc:
+            # Wave 3 (2026-05-03): cache poisoning fix — see
+            # ``_is_collection_missing_error`` docstring. Same shape as
+            # ``_refresh_sparse_cache`` and ``_is_custom_sharded``.
+            if _is_collection_missing_error(exc):
+                self._colbert_cache[name] = False
+                return False
+            import logging as _log
+            _log.getLogger(__name__).warning(
+                "_refresh_colbert_cache(%s) transient failure (%s); "
+                "skipping cache write so next call re-probes",
+                name,
+                type(exc).__name__,
+            )
             return False
         has = False
         try:
