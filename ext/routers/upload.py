@@ -208,8 +208,36 @@ async def upload_kb_doc(
             # inserted before migration 004 ran will carry NULL.
             pipeline_version=current_version(),
         )
-        session.add(doc)
-        await session.flush()
+        # Wave 2 (review §1.4): catch IntegrityError from the new
+        # uniq_kb_doc_blob_sha partial unique index — return 409 with
+        # the prior doc_id so the user sees "already uploaded" instead
+        # of an opaque 500.
+        try:
+            session.add(doc)
+            await session.flush()
+        except Exception as exc:  # noqa: BLE001 — DB-driver-specific
+            from sqlalchemy.exc import IntegrityError
+            if isinstance(exc, IntegrityError) and "uniq_kb_doc_blob_sha" in str(exc).lower():
+                # Look up the existing doc_id for this (kb_id, blob_sha).
+                # blob_sha would be in the SHA computation site downstream;
+                # if not yet computed, the index can't have caught it — so
+                # we know blob_sha is present here.
+                existing = (await session.execute(
+                    select(KBDocument).where(
+                        KBDocument.kb_id == kb_id,
+                        KBDocument.blob_sha == doc.blob_sha,
+                        KBDocument.deleted_at.is_(None),
+                    )
+                )).scalar_one_or_none()
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    detail={
+                        "error": "duplicate",
+                        "message": "this file (sha) is already in this KB",
+                        "doc_id": existing.id if existing else None,
+                    },
+                )
+            raise
 
         # P2.2: stamp the uploading admin's id on every chunk as an audit trail.
         # Retrieval does NOT filter KB collections by owner (KBs stay shared across
