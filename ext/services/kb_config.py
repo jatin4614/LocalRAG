@@ -87,12 +87,19 @@ VALID_BOOL_KEYS = frozenset({
     # query shapes (military reports listing N brigades, contracts
     # citing N parties, etc.).
     "multi_entity_decompose",
-    # Phase 6.X (per-entity Qdrant text filter — Method 4). When set,
-    # each per-entity sub-query in the decompose fan-out adds a
-    # ``must.match.text`` filter on the entity name. Hard precision
-    # boost: chunks not literally naming the entity are excluded.
-    # Pairs naturally with multi_entity_decompose; can be off if you
-    # want decomposition without the lexical hard-cut.
+    # 2026-05-04 — entity_text_filter is KNOWN HARMFUL on case-mixed corpora.
+    # Qdrant's MatchText against the unindexed text payload is case-sensitive,
+    # so a user typing "75 INF bde" produces tokens that don't match the
+    # corpus's "75 Inf Bde" / "75 INF BDE" — entity sub-queries return 0 hits
+    # and the per-entity rerank quota has nothing to take a quota from.
+    # Confirmed empirically 2026-05-04 (KB 2 brigade query): with the filter
+    # OFF, vector search alone returns 60+ grounded bullets across all 4
+    # brigades; with it ON, two brigades return empty.
+    # RECOMMENDED: keep this key OFF (don't set in rag_config). The DB
+    # default omits it, so new KBs are safe by default. Phase 2 of the
+    # 2026-05-03 retrieval-quality plan adds a soft-boost replacement that
+    # isn't brittle to casing/abbreviation variants.
+    # Spec: docs/superpowers/specs/2026-05-03-retrieval-quality-fix-design.md §1
     "entity_text_filter",
     # Phase 6.X (QU LLM entity extraction — Method 5). When set, the
     # bridge prefers ``HybridClassification.entities`` from the QU LLM
