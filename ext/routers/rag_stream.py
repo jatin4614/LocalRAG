@@ -48,8 +48,9 @@ from typing import AsyncIterator, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
-from ..services import chat_rag_bridge
+from ..services import chat_rag_bridge, citation_checker
 from ..services.auth import CurrentUser, get_current_user
 from ..services.obs import span
 
@@ -229,6 +230,61 @@ async def stream_retrieval(
         media_type="text/event-stream",
         headers=headers,
     )
+
+
+# ---------------------------------------------------------------------------
+# §6.10 — Inline citation enforcement endpoint.
+#
+# Flag-gated by RAG_ENFORCE_CITATIONS (default 0 — pass-through). When ON,
+# accepts a complete LLM response + the sources used to build the prompt and
+# returns the response with [unverified] tags prepended to factual sentences
+# that lack any 3-token shingle overlap with the sources.
+#
+# Wired here (not inside the SSE stream) because the chat-LLM response itself
+# is fired by the frontend in parallel and goes through upstream's chat
+# middleware — this endpoint is the canonical post-LLM boundary that
+# upstream patches and frontend wrappers can call to apply the check.
+#
+# Fail-open by design: any internal exception in the checker logs a warning
+# and returns the input response unchanged.
+# ---------------------------------------------------------------------------
+class CheckCitationsRequest(BaseModel):
+    """Request body for /api/rag/check_citations."""
+
+    response: str
+    sources: list = []
+    intent: str = "specific"
+
+
+class CheckCitationsResponse(BaseModel):
+    """Response from /api/rag/check_citations."""
+
+    response: str
+
+
+@router.post("/check_citations", response_model=CheckCitationsResponse)
+async def check_citations(
+    body: CheckCitationsRequest,
+    user: CurrentUser = Depends(get_current_user),
+) -> CheckCitationsResponse:
+    """Apply ``citation_checker.enforce_citations`` to a complete LLM response.
+
+    The whole check is wrapped in a try/except so a malformed sources blob
+    or any internal error returns the original response unchanged — the
+    caller MUST be able to ship the response to the user even if this
+    endpoint malfunctions.
+    """
+    try:
+        out = citation_checker.enforce_citations(
+            body.response, body.sources or [], intent=body.intent,
+        )
+    except Exception as exc:  # pragma: no cover - belt-and-suspenders
+        log.warning(
+            "rag_stream: check_citations fail-open (%s): %r",
+            type(exc).__name__, exc,
+        )
+        out = body.response
+    return CheckCitationsResponse(response=out)
 
 
 __all__ = ["router"]
