@@ -16,8 +16,11 @@ RUN npm run build
 ######## Backend ########
 FROM python:3.11-slim-bookworm
 
-ARG UID=0
-ARG GID=0
+# Wave 1b (review §10.1): drop root. See Dockerfile.openwebui.cu128
+# header comment for rationale (UID=1000 default aligns with the
+# shared /var/ingest volume mapping; review §11.10).
+ARG UID=1000
+ARG GID=1000
 
 ENV ENV=prod \
     PORT=8080 \
@@ -81,6 +84,11 @@ COPY upstream/backend/ .
 # Our extension code
 COPY ext/ /app/ext/
 COPY scripts/ /app/scripts/
+
+# Wave 1b (review §10.1): create the orgchat user + drop root.
+RUN groupadd -g ${GID} orgchat && useradd -u ${UID} -g ${GID} -m -s /bin/bash orgchat && \
+    chown -R ${UID}:${GID} /app /app/backend 2>/dev/null || true
+USER ${UID}:${GID}
 
 EXPOSE 8080
 

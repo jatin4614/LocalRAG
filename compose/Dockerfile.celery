@@ -90,6 +90,18 @@ ENV HF_HUB_OFFLINE=1 \
 # Project source. Only ext/ is needed for the worker.
 COPY ext/ /app/ext/
 
+# Wave 1b (review §10.1): drop root. UID 1000 also matches the open-webui
+# image so they can share /var/ingest without UID/GID confusion (review
+# §11.10). The chown covers /app + the cache dirs the runtime user must
+# write/read; everything else (site-packages, /opt/tiktoken-cache,
+# /opt/fastembed_cache prepopulated read paths) is fine root-owned and
+# world-readable.
+ARG UID=1000
+ARG GID=1000
+RUN groupadd -g ${GID} orgchat && useradd -u ${UID} -g ${GID} -m -s /bin/bash orgchat && \
+    chown -R ${UID}:${GID} /app /opt/tiktoken-cache /opt/fastembed_cache 2>/dev/null || true
+USER ${UID}:${GID}
+
 # Wave 2 (review §10.6): worker liveness for compose healthchecks.
 # `celery inspect ping` returns OK iff the worker has the broker
 # connection AND its event loop is responsive. 30s interval is gentle
