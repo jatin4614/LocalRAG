@@ -62,8 +62,15 @@ RUN pip install --no-cache-dir uv
 # the cu128 wheel first means later `pip install -r requirements.txt`
 # resolves it as already-satisfied (look for "Requirement already satisfied:
 # torch" in the build log).
+# Pin upper bound to <2.11 because torch 2.11 added a hard dep on
+# nvidia-nvshmem-cu12 (~600MB wheel from pypi.nvidia.com) which has
+# been intermittently un-fetchable from this host's egress (3-retry
+# timeout × 125s × 2 build attempts = 4+ min of wasted build time).
+# 2.7-2.10 cover sm_120 Blackwell kernel support without that dep.
+# Drop the upper bound when pypi.nvidia.com stabilises OR when the
+# operator pre-mirrors the wheel into a local pip index.
 RUN uv pip install --system --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 \
-    'torch>=2.7'
+    'torch>=2.7,<2.11'
 
 # Upstream Python deps — torch is now already-satisfied (cu128 wheel above).
 COPY upstream/backend/requirements.txt ./requirements.txt
