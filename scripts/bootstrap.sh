@@ -43,6 +43,11 @@ set -a; source compose/.env; set +a
 # verified the keys EXISTED — a blank-fill operator run would happily ship the
 # defaults to production where Qdrant is reachable on the LAN with no auth and
 # WEBUI_SECRET_KEY signs JWTs with a string everyone has the source for.
+#
+# Wave 1b (review §11.5): when compose/secrets/ exists, prefer the file-backed
+# secrets path (each file is the literal value, mounted at /run/secrets/<name>
+# inside the consuming container). Wave 1a's env-var-based rejection is kept
+# as the fallback so existing operators don't break — bootstrap auto-detects.
 REJECTED=0
 check_secret() {
   local key="$1" val="$2"
@@ -51,17 +56,46 @@ check_secret() {
     REJECTED=1
   fi
 }
-check_secret SESSION_SECRET    "${SESSION_SECRET:-}"
-check_secret WEBUI_SECRET_KEY  "${WEBUI_SECRET_KEY:-}"
-check_secret ADMIN_PASSWORD    "${ADMIN_PASSWORD:-}"
-check_secret POSTGRES_PASSWORD "${POSTGRES_PASSWORD:-}"
-# QDRANT_API_KEY is OPTIONAL — empty / unset means Qdrant runs without auth
-# (current default). If set, it must NOT be the placeholder. If you want to
-# enable Qdrant auth, generate one with `openssl rand -base64 32`.
-if [[ -n "${QDRANT_API_KEY:-}" ]]; then
-  check_secret QDRANT_API_KEY "$QDRANT_API_KEY"
+check_secret_file() {
+  local label="$1" path="$2"
+  if [[ ! -s "$path" ]]; then
+    echo "!! compose/secrets: $label file is missing or empty ($path)" >&2
+    REJECTED=1
+  fi
+}
+if [[ -d compose/secrets ]]; then
+  say "compose/secrets/ detected — using file-backed secrets path (review §11.5)"
+  # File-backed secrets path. Verify each of the four secrets is non-empty;
+  # docker compose would otherwise fail later at `up` with a "secret X not
+  # found" error. We don't validate placeholders here (operators populate
+  # these by hand or via openssl rand — see compose/secrets/README.md),
+  # only existence + non-emptiness.
+  check_secret_file POSTGRES_PASSWORD compose/secrets/postgres_password
+  check_secret_file WEBUI_SECRET_KEY  compose/secrets/webui_secret_key
+  check_secret_file RAG_ADMIN_TOKEN   compose/secrets/rag_admin_token
+  check_secret_file QDRANT_API_KEY    compose/secrets/qdrant_api_key
+  # SESSION_SECRET + ADMIN_PASSWORD do NOT have file-backed equivalents
+  # in the current docker-compose.yml; they stay env-only and still go
+  # through the placeholder check.
+  check_secret SESSION_SECRET "${SESSION_SECRET:-}"
+  check_secret ADMIN_PASSWORD "${ADMIN_PASSWORD:-}"
+else
+  # Legacy env-var path (Wave 1a behaviour preserved verbatim).
+  check_secret SESSION_SECRET    "${SESSION_SECRET:-}"
+  check_secret WEBUI_SECRET_KEY  "${WEBUI_SECRET_KEY:-}"
+  check_secret ADMIN_PASSWORD    "${ADMIN_PASSWORD:-}"
+  check_secret POSTGRES_PASSWORD "${POSTGRES_PASSWORD:-}"
+  # QDRANT_API_KEY is OPTIONAL — empty / unset means Qdrant runs without auth
+  # (current default). If set, it must NOT be the placeholder. If you want to
+  # enable Qdrant auth, generate one with `openssl rand -base64 32`.
+  if [[ -n "${QDRANT_API_KEY:-}" ]]; then
+    check_secret QDRANT_API_KEY "$QDRANT_API_KEY"
+  fi
 fi
 # DATABASE_URL embeds POSTGRES_PASSWORD; spot-check the literal too.
+# Applies to BOTH paths — even with file-backed POSTGRES_PASSWORD, the admin
+# scripts (apply_migrations.py, seed_admin.py) read DATABASE_URL from env
+# directly and need the real value here.
 if [[ "${DATABASE_URL:-}" == *change-me-* ]]; then
   echo "!! compose/.env: DATABASE_URL still contains 'change-me-…' (rotate POSTGRES_PASSWORD AND DATABASE_URL together)" >&2
   REJECTED=1
@@ -72,6 +106,7 @@ if [[ $REJECTED -eq 1 ]]; then
   echo "  openssl rand -base64 32        # for SESSION_SECRET / WEBUI_SECRET_KEY / QDRANT_API_KEY" >&2
   echo "  openssl rand -base64 24        # for ADMIN_PASSWORD / POSTGRES_PASSWORD" >&2
   echo "Then edit compose/.env (and rebuild DATABASE_URL with the new pg password)." >&2
+  echo "OR migrate to the file-backed path — see compose/secrets/README.md." >&2
   exit 1
 fi
 
