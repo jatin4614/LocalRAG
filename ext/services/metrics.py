@@ -434,6 +434,17 @@ rag_entity_text_filter_total = Counter(
     labelnames=("outcome",),
 )
 
+# 2026-05-03 — per-entity rerank quota (multi-entity fix). Counts each
+# trim-site decision so an operator can confirm the quota is actually
+# firing on multi-entity queries. ``applied`` = quota replaced the
+# entity-blind ``reranked[:final_k]`` slice; ``skipped`` = single-entity
+# / global / metadata path or floor=0.
+rag_multi_entity_rerank_quota_total = Counter(
+    f"{_NS}_multi_entity_rerank_quota_total",
+    "Multi-entity rerank quota outcomes at the post-rerank trim site",
+    labelnames=("outcome",),
+)
+
 
 @contextmanager
 def time_stage(stage: str) -> Iterator[None]:

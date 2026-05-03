@@ -880,6 +880,96 @@ def _estimate_reserved_tokens(*, n_hits: int, intent: str) -> int:
     return _system_prompt_tokens() + 800 + 40 + (30 * max(0, int(n_hits)))
 
 
+def _apply_entity_quota(
+    *,
+    reranked: list,
+    entities: list,
+    per_entity_floor: int,
+    final_k: int,
+) -> list:
+    """Build the post-rerank pool with a per-entity floor (multi-entity fix).
+
+    Backstop for the 75 Inf Bde / 5 PoK Bde eviction case (smoke test
+    2026-05-03). The plain ``reranked[:final_k]`` trim is global-score
+    top-k — entity-blind. When multi-entity decompose was active and one
+    entity's chunks happened to score below the dominant entity's tail,
+    the trim silently evicted the entire entity bucket. The LLM then
+    answered "no information for X" even though direct Qdrant scrolls
+    showed matching content.
+
+    Algorithm:
+      1. **Quota pass.** For each entity in ``entities``, walk
+         ``reranked`` in cross-encoder order and pick the top
+         ``per_entity_floor`` hits whose ``payload["text"]`` contains
+         the entity name (case-insensitive substring). If an entity has
+         FEWER than ``per_entity_floor`` matching chunks in
+         ``reranked``, take what's available — don't pad. The
+         "no info for X" answer is then accurate, not a quota artefact.
+      2. **Top-up pass.** Fill remaining slots up to ``final_k`` with
+         the next-highest-score hits not already picked.
+      3. **Dedup by id.** A chunk that mentions two entities counts once.
+      4. **Final order.** Sort the result by score desc so the LLM sees
+         the same "earlier == more relevant" contract as the legacy trim.
+      5. **Cap at ``final_k``.**
+
+    Pure function — no I/O, no logging side-effects. Bridge call site
+    handles telemetry. ``per_entity_floor=0`` OR ``entities=[]``
+    short-circuits to ``reranked[:final_k]`` (quota disabled).
+    """
+    if not reranked:
+        return []
+    if not entities or per_entity_floor <= 0:
+        return list(reranked[:final_k])
+
+    # Pre-lowercase entity names once.
+    entity_needles = [(e, str(e).lower()) for e in entities]
+
+    selected_ids: set = set()
+    selected: list = []
+
+    # Step 1 — quota pass. For each entity, take its top per_entity_floor
+    # matches in cross-encoder order. Same chunk matching multiple entities
+    # only enters the result once (first entity that picks it wins, but
+    # subsequent entities can still walk past it without double counting).
+    for _entity, needle in entity_needles:
+        taken = 0
+        for hit in reranked:
+            if taken >= per_entity_floor:
+                break
+            if hit.id in selected_ids:
+                # Already in pool from another entity bucket — counts toward
+                # this entity's quota too (same chunk mentions both names).
+                payload = getattr(hit, "payload", None) or {}
+                text = payload.get("text") if isinstance(payload, dict) else None
+                if text and needle in str(text).lower():
+                    taken += 1
+                continue
+            payload = getattr(hit, "payload", None) or {}
+            text = payload.get("text") if isinstance(payload, dict) else None
+            if not text:
+                continue
+            if needle in str(text).lower():
+                selected_ids.add(hit.id)
+                selected.append(hit)
+                taken += 1
+
+    # Step 2 — top-up pass. Fill remaining slots by next-best score
+    # from the original reranked list (cross-encoder order). Skip
+    # already-selected hits.
+    if len(selected) < final_k:
+        for hit in reranked:
+            if len(selected) >= final_k:
+                break
+            if hit.id in selected_ids:
+                continue
+            selected_ids.add(hit.id)
+            selected.append(hit)
+
+    # Step 3 — final sort by cross-encoder score desc, capped.
+    selected.sort(key=lambda h: float(getattr(h, "score", 0.0) or 0.0), reverse=True)
+    return selected[:final_k]
+
+
 async def _emit(cb: Optional[Callable[[dict], Awaitable[None]]], event: dict) -> None:
     """Call the progress callback, swallowing any errors so a broken SSE
     client never breaks retrieval. No-op when cb is None."""
@@ -1857,6 +1947,22 @@ async def _run_pipeline(
                     _n_shards_k = len(_shard_keys_for_constraint(_tc_for_k))
                     if _n_shards_k > 1:
                         _final_k = max(_final_k, 8 * _n_shards_k)
+            # 2026-05-03 — multi-entity rerank quota bump. When the
+            # decompose path was active (>=2 entities), the static
+            # _final_k=12 is too tight: the post-rerank trim would cut
+            # by global score and silently evict low-frequency entities
+            # (smoke test: 75 Inf Bde / 5 PoK Bde returned empty even
+            # though Qdrant scrolls confirmed matching chunks). Bump
+            # _final_k to n_entities * floor so the per-entity quota
+            # (applied in the trim site below) has slots to work with.
+            # RAG_MULTI_ENTITY_RERANK_FLOOR=0 disables the bump and the
+            # quota; pre-fix behaviour is restored.
+            try:
+                _entity_floor = int(flags.get("RAG_MULTI_ENTITY_RERANK_FLOOR") or "3")
+            except (TypeError, ValueError):
+                _entity_floor = 3
+            if _do_decompose and _entities and _entity_floor > 0:
+                _final_k = max(_final_k, len(_entities) * _entity_floor)
             _rerank_top_k_env = flags.get("RAG_RERANK_TOP_K")
             _mmr_on = flags.get("RAG_MMR", "0") == "1" and not (_intent == "global")
             if _rerank_top_k_env is not None:
@@ -1973,11 +2079,33 @@ async def _run_pipeline(
                         flags.get("RAG_MMR_FAIL_TRIM", "0") == "1"
                         and len(reranked) > _final_k
                     ):
-                        reranked = reranked[:_final_k]
-                        logger.info(
-                            "rag: mmr fail-trim active, kept top %d of cross-encoder",
-                            _final_k,
-                        )
+                        if _do_decompose and _entities and _entity_floor > 0:
+                            reranked = _apply_entity_quota(
+                                reranked=reranked,
+                                entities=list(_entities),
+                                per_entity_floor=_entity_floor,
+                                final_k=_final_k,
+                            )
+                            logger.info(
+                                "rag: multi-entity rerank quota active "
+                                "(mmr fail-trim) — entities=%d floor=%d final_k=%d",
+                                len(_entities), _entity_floor, _final_k,
+                            )
+                            try:
+                                from .metrics import (
+                                    rag_multi_entity_rerank_quota_total,
+                                )
+                                rag_multi_entity_rerank_quota_total.labels(
+                                    outcome="applied"
+                                ).inc()
+                            except Exception:
+                                pass
+                        else:
+                            reranked = reranked[:_final_k]
+                            logger.info(
+                                "rag: mmr fail-trim active, kept top %d of cross-encoder",
+                                _final_k,
+                            )
                     await _emit(progress_cb, {
                         "stage": "mmr", "status": "error",
                     })
@@ -1985,7 +2113,42 @@ async def _run_pipeline(
                 # No MMR — trim rerank's extra candidates (e.g. RAG_RERANK_TOP_K
                 # set by operator) back to _final_k so downstream budget sees the
                 # same count as the pre-P2 pipeline.
-                reranked = reranked[:_final_k]
+                #
+                # 2026-05-03 — multi-entity quota fix. When decompose was
+                # active, plain top-by-score trim is entity-blind and can
+                # silently evict low-frequency entities (75 Inf Bde / 5 PoK
+                # Bde smoke test). Use the per-entity quota helper so each
+                # entity gets at least RAG_MULTI_ENTITY_RERANK_FLOOR (default
+                # 3) chunks in the post-rerank pool. Entity-blind trim is
+                # preserved for the non-decompose path.
+                if _do_decompose and _entities and _entity_floor > 0:
+                    reranked = _apply_entity_quota(
+                        reranked=reranked,
+                        entities=list(_entities),
+                        per_entity_floor=_entity_floor,
+                        final_k=_final_k,
+                    )
+                    logger.info(
+                        "rag: multi-entity rerank quota active — "
+                        "entities=%d floor=%d final_k=%d",
+                        len(_entities), _entity_floor, _final_k,
+                    )
+                    try:
+                        from .metrics import rag_multi_entity_rerank_quota_total
+                        rag_multi_entity_rerank_quota_total.labels(
+                            outcome="applied"
+                        ).inc()
+                    except Exception:
+                        pass
+                else:
+                    reranked = reranked[:_final_k]
+                    try:
+                        from .metrics import rag_multi_entity_rerank_quota_total
+                        rag_multi_entity_rerank_quota_total.labels(
+                            outcome="skipped"
+                        ).inc()
+                    except Exception:
+                        pass
                 await _emit(progress_cb, {
                     "stage": "mmr", "status": "skipped", "reason": "flag_off",
                 })
