@@ -429,6 +429,20 @@ services:
     logging: *rotated-logging
     mem_limit: 8g
     cpus: 4
+    # Wave 1b (review §11.10): align the runtime UID with the celery-worker
+    # so the shared /var/ingest volume (producer here, consumer there) is
+    # owned by the same numeric uid:gid on both sides. Matches the
+    # `USER 1000:1000` baked into Dockerfile.openwebui.cu128 (review §10.1)
+    # — duplicating it here is belt-and-braces: if the image somehow ships
+    # without the USER directive, compose still drops root.
+    #
+    # First-time setup (one-shot, idempotent):
+    #   docker compose -p orgchat run --rm --user root open-webui \
+    #     chown -R 1000:1000 /var/ingest /app/backend/data/uploads \
+    #                        /root/.cache/huggingface
+    # After that, every restart preserves the host uid mapping.
+    # See docs/runbook/cold-start.md for the cold-start checklist.
+    user: "1000:1000"
     ports:
       # Wave 1a (review §11.2): bound to loopback. End-users go through
       # Caddy on :8443 (HTTPS, with WEBUI_SECRET_KEY-signed JWT). Direct
@@ -705,6 +719,11 @@ services:
     logging: *rotated-logging
     mem_limit: 8g
     cpus: 4
+    # Wave 1b (review §11.10): consumer side of the /var/ingest pipe.
+    # Must match the open-webui producer's UID so the worker can read
+    # blobs written by the chat container. See open-webui service block
+    # above for the one-shot chown command and docs/runbook/cold-start.md.
+    user: "1000:1000"
     environment:
       DATABASE_URL: ${DATABASE_URL}
       CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/1}
@@ -815,6 +834,10 @@ services:
     logging: *rotated-logging
     mem_limit: 512m
     cpus: 1
+    # Wave 1b (review §11.10): same image as celery-worker, same drop-root.
+    # Beat owns the celery_beat_state volume — that schedule file must be
+    # writable by uid 1000.
+    user: "1000:1000"
     environment:
       DATABASE_URL: ${DATABASE_URL}
       CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/1}
