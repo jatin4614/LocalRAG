@@ -145,11 +145,23 @@ VALID_FLOAT_KEYS = frozenset({
 # member today; the validator enforces it's one of
 # ``_VALID_CHUNKING_STRATEGIES`` and silently drops anything else.
 # Keep this small — string sprawl in JSONB is the road to schema rot.
+# 2026-05-03 — Phase 2 / Item 4. ``entity_text_filter_mode`` added:
+# "filter" | "boost" controls whether entity_text_filter hard-excludes
+# non-matching chunks or applies a Python-side rerank-score boost.
 VALID_STRING_KEYS = frozenset({
     "chunking_strategy",
+    "entity_text_filter_mode",  # NEW: "filter" | "boost"
+})
+# 2026-05-03 — Phase 2 / Item 4. ``synonyms`` is a list of equivalence
+# classes for entity-name expansion. Used by future query-rewrite work;
+# the column is in DB already (migration 017) and the per-KB key threads
+# it through. No env var — consumed via per-request payload.
+VALID_LIST_KEYS = frozenset({
+    "synonyms",
 })
 VALID_KEYS = (
-    VALID_BOOL_KEYS | VALID_INT_KEYS | VALID_FLOAT_KEYS | VALID_STRING_KEYS
+    VALID_BOOL_KEYS | VALID_INT_KEYS | VALID_FLOAT_KEYS
+    | VALID_STRING_KEYS | VALID_LIST_KEYS
 )
 
 # Keys that are NOT propagated into the request-scope overlay because the
@@ -204,6 +216,8 @@ _KEY_TO_ENV: dict[str, str] = {
     "entity_text_filter": "RAG_ENTITY_TEXT_FILTER",
     "qu_entity_extract": "RAG_QU_ENTITY_EXTRACT",
     "multi_entity_min_per_entity": "RAG_MULTI_ENTITY_MIN_PER_ENTITY",
+    # 2026-05-03 — Phase 2 / Item 4. entity_text_filter mode toggle.
+    "entity_text_filter_mode": "RAG_ENTITY_TEXT_FILTER_MODE",
     # The QU LLM flags (RAG_QU_*) are cluster-wide and not exposed as
     # per-KB rag_config keys.
 }
@@ -295,14 +309,29 @@ def validate_config(raw: Mapping[str, Any]) -> dict[str, Any]:
             if not isinstance(value, str):
                 continue
             coerced_str = value.lower().strip()
-            # Enum check per key. ``chunking_strategy`` is the only
-            # string key today; unknown values silently drop so a
-            # hand-edited row never silently switches the chunker on
-            # an admin who didn't expect it.
+            # Enum check per key. Unknown values silently drop so a
+            # hand-edited row never silently switches behaviour on an
+            # admin who didn't expect it.
             if key == "chunking_strategy":
                 if coerced_str not in _VALID_CHUNKING_STRATEGIES:
                     continue
+            elif key == "entity_text_filter_mode":
+                # 2026-05-03 — Phase 2 / Item 4.
+                if coerced_str not in _VALID_ENTITY_TEXT_FILTER_MODES:
+                    continue
             out[key] = coerced_str
+        elif key in VALID_LIST_KEYS:
+            # 2026-05-03 — Phase 2 / Item 4. synonyms — list of lists of
+            # strings; drop on any malformation so a bad row never reaches
+            # the retrieval hot path.
+            if not isinstance(value, list):
+                continue
+            if not all(
+                isinstance(cls, list) and all(isinstance(s, str) for s in cls)
+                for cls in value
+            ):
+                continue
+            out[key] = value
     return out
 
 
@@ -348,6 +377,21 @@ def merge_configs(configs: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
                     merged[key] = value
                 elif prev is None:
                     merged[key] = value
+            elif key in VALID_LIST_KEYS:
+                # 2026-05-03 — Phase 2 / Item 4. Synonyms: union of all
+                # equivalence-class lists across selected KBs. Additive —
+                # if KB-A defines brigade variants and KB-B defines unit
+                # variants, a multi-KB query should see both tables.
+                if key not in merged:
+                    merged[key] = list(value)
+                else:
+                    # Extend with classes not already present (identity by
+                    # first element to avoid duplicating identical classes).
+                    existing_heads = {cls[0] for cls in merged[key] if cls}
+                    for cls in value:
+                        if cls and cls[0] not in existing_heads:
+                            merged[key].append(cls)
+                            existing_heads.add(cls[0])
     return merged
 
 
@@ -450,6 +494,12 @@ def with_overrides(overrides: Mapping[str, str]):
 
 
 _VALID_CHUNKING_STRATEGIES = ("window", "structured")
+# 2026-05-03 — Phase 2 / Item 4. Valid values for ``entity_text_filter_mode``.
+# "filter" → Qdrant hard exclusion (original behaviour).
+# "boost"  → Python-side rerank-score boost (experimental, non-default).
+# Default code path is "filter off entirely" per validation results; this
+# constant exists for per-KB operator use and future rollback.
+_VALID_ENTITY_TEXT_FILTER_MODES = ("filter", "boost")
 
 
 def get_chunking_strategy(rag_config: dict | None) -> str:
@@ -466,6 +516,35 @@ def get_chunking_strategy(rag_config: dict | None) -> str:
     if raw not in _VALID_CHUNKING_STRATEGIES:
         return "window"
     return raw
+
+
+def expand_entity(entity: str, classes: list[list[str]] | None) -> set[str]:
+    """Return entity + every equivalence-class member that contains it.
+
+    Case-insensitive membership check. If ``entity`` is found in any class
+    in ``classes``, the full class is merged into the output set.  If it
+    appears in no class, only the original string is returned.
+
+    Args:
+        entity: The entity name as typed by the user (any casing).
+        classes: Per-KB synonym table — a list of equivalence classes, each
+                 class being a list of canonical + variant strings. Typically
+                 sourced from ``rag_config["synonyms"]`` after
+                 ``validate_config``.  ``None`` or ``[]`` is safe.
+
+    Returns:
+        A set containing ``entity`` plus every variant from matching classes.
+
+    Spec: docs/superpowers/specs/2026-05-03-retrieval-quality-fix-design.md §5.2.2
+    """
+    out: set[str] = {entity}
+    if not classes or not entity:
+        return out
+    e_low = entity.lower()
+    for cls in classes:
+        if any(v.lower() == e_low for v in cls):
+            out.update(cls)
+    return out
 
 
 def get_ocr_policy(kb_id: int, db_session) -> dict | None:
@@ -489,11 +568,13 @@ def get_ocr_policy(kb_id: int, db_session) -> dict | None:
 
 __all__ = [
     "VALID_KEYS",
+    "VALID_LIST_KEYS",
     "merge_configs",
     "config_to_env_overrides",
     "validate_config",
     "resolve_chunk_params",
     "with_overrides",
+    "expand_entity",
     "get_ocr_policy",
     "get_chunking_strategy",
 ]

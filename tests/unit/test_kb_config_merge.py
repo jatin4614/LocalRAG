@@ -121,6 +121,9 @@ def test_merge_all_valid_keys():
         "chunking_strategy": "structured",
         # Phase 6.X — per-KB image-caption gate.
         "image_captions": True,
+        # Phase 2 / Item 4 — entity filter mode + synonym table.
+        "entity_text_filter_mode": "boost",
+        "synonyms": [["5 PoK", "5 POK"]],
     }
     out = merge_configs([cfg])
     for key in VALID_KEYS:
@@ -252,6 +255,12 @@ def test_validate_accepts_all_whitelisted_keys():
     _string_sample = {
         # Phase 6.6 — string-typed enum keys.
         "chunking_strategy": "structured",
+        # Phase 2 / Item 4 — entity filter mode.
+        "entity_text_filter_mode": "boost",
+    }
+    _list_sample = {
+        # Phase 2 / Item 4 — synonym equivalence classes.
+        "synonyms": [["5 PoK", "5 POK"]],
     }
 
     def _sample_for(key: str):
@@ -261,6 +270,8 @@ def test_validate_accepts_all_whitelisted_keys():
             return _int_sample[key]
         if key in _string_sample:
             return _string_sample[key]
+        if key in _list_sample:
+            return _list_sample[key]
         return 0.5
 
     raw = {key: _sample_for(key) for key in VALID_KEYS}
