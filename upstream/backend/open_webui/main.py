@@ -523,6 +523,38 @@ from open_webui.utils.chat import (
     generate_chat_completion as chat_completion_handler,
     chat_completed as chat_completed_handler,
 )
+
+# LocalRAG bug-fix campaign §6.4 — wrap the user-facing chat completion
+# call in ``record_llm_call`` so the chat path emits the same
+# ``rag_tokens_prompt_total`` / ``rag_tokens_completion_total`` /
+# ``rag_llm_ttft_seconds`` observations as the contextualizer / hyde /
+# rewriter / SSE-stream paths via the canonical helper.
+#
+# The import is wrapped in try/except so this upstream file remains
+# usable in environments where ``ext`` is not on the path (e.g. an
+# unrelated open-webui install). When the helper isn't available we
+# substitute a no-op async context manager — the chat call still runs.
+#
+# Patch tracker: patches/0007_chat_completion_telemetry.patch — re-apply
+# if upstream/ is re-vendored.
+try:
+    from ext.services.llm_telemetry import record_llm_call as _record_llm_call
+except Exception:  # pragma: no cover — defensive for vendored upstream
+    from contextlib import asynccontextmanager as _asynccontextmanager
+
+    class _NullRecorder:
+        def set_tokens(self, *, prompt: int = 0, completion: int = 0) -> None:  # noqa: D401
+            return None
+
+        def set_first_token_at(self, t: float) -> None:  # noqa: D401
+            return None
+
+        def set_kb(self, kb: str) -> None:  # noqa: D401
+            return None
+
+    @_asynccontextmanager
+    async def _record_llm_call(*, stage: str, model: str, kb=None):  # type: ignore[no-redef]
+        yield _NullRecorder()
 from open_webui.utils.actions import chat_action as chat_action_handler
 from open_webui.utils.embeddings import generate_embeddings
 from open_webui.utils.middleware import (
@@ -1805,7 +1837,51 @@ async def chat_completion(
         try:
             form_data, metadata, events = await process_chat_payload(request, form_data, user, metadata, model)
 
-            response = await chat_completion_handler(request, form_data, user)
+            # LocalRAG bug-fix campaign §6.4 — wrap the user-facing chat
+            # completion call in ``record_llm_call`` so its TTFT / token
+            # counts feed the same Prometheus histograms as the
+            # contextualizer / hyde / rewriter / SSE-stream paths. The
+            # KB label is best-effort: pull from the chat metadata's
+            # ``kb_config`` (the canonical selection home post-migration
+            # 007) when present, else None. The model label is
+            # ``model_id`` from the outer scope.
+            _telemetry_kb = None
+            try:
+                _kb_cfg = (metadata or {}).get('kb_config') or {}
+                if isinstance(_kb_cfg, dict):
+                    _kb_ids = _kb_cfg.get('kb_ids') or _kb_cfg.get('selected_kb_ids') or []
+                    if isinstance(_kb_ids, (list, tuple)) and _kb_ids:
+                        _telemetry_kb = ','.join(str(x) for x in _kb_ids)
+            except Exception:
+                _telemetry_kb = None
+
+            async with _record_llm_call(
+                stage='user_chat',
+                model=str(model_id) if model_id else 'unknown',
+                kb=_telemetry_kb,
+            ) as _llm_rec:
+                response = await chat_completion_handler(request, form_data, user)
+                # Best-effort token capture for non-streaming responses.
+                # Streaming responses thread tokens through downstream
+                # handling in process_chat_response — we leave those at
+                # zero (recorder skips zero-counter increments) and the
+                # TTFT histogram still gets observed via the finally
+                # block's timing. Streaming token capture would require
+                # patching process_chat_response, which has a much
+                # larger surface; out of scope for this hook.
+                try:
+                    _body = getattr(response, 'body', None)
+                    if _body and isinstance(_body, (bytes, bytearray)):
+                        _parsed = json.loads(_body.decode('utf-8', errors='ignore'))
+                        _usage = _parsed.get('usage') if isinstance(_parsed, dict) else None
+                        if isinstance(_usage, dict):
+                            _llm_rec.set_tokens(
+                                prompt=int(_usage.get('prompt_tokens', 0) or 0),
+                                completion=int(_usage.get('completion_tokens', 0) or 0),
+                            )
+                except Exception:
+                    # Telemetry must never break the chat call.
+                    pass
             if metadata.get('chat_id') and metadata.get('message_id'):
                 try:
                     if not metadata['chat_id'].startswith('local:'):
