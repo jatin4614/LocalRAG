@@ -85,5 +85,13 @@ CANONICAL_COLLECTION_CONFIG = {
     "hnsw_config": {
         "m": 16,
         "ef_construct": 200,
+        # Wave 2 (review §4.7): mirror vector_store._hnsw_config_diff() so
+        # reconcile_qdrant_schema.py rebuilds collections with the same HNSW
+        # parameters as freshly-created ones. Prior gap: live collections had
+        # full_scan_threshold=10000 (set in vector_store.py:53), reconciled
+        # ones inherited Qdrant's default. RAG_QDRANT_FULL_SCAN_THRESHOLD env
+        # override is honored at create time; the canonical dict captures the
+        # default that production has been running with.
+        "full_scan_threshold": 10000,
     },
 }
