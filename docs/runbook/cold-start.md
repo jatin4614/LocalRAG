@@ -69,8 +69,17 @@ permission issue on `/var/ingest`):
 ```bash
 docker compose -p orgchat run --rm --user root open-webui \
     chown -R 1000:1000 /var/ingest /app/backend/data/uploads \
-                       /root/.cache/huggingface
+                       /home/orgchat/.cache/huggingface
 ```
+
+> **2026-05-03 path change.** The HF cache mount target moved from
+> `/root/.cache/huggingface` to `/home/orgchat/.cache/huggingface` when
+> the post-§10.1 image started shipping `USER 1000:1000` with
+> `HOME=/home/orgchat`. `/root/` is mode 700 in the new image so the
+> non-root user can't traverse it regardless of mount-point ownership.
+> If you're upgrading an older deploy, also update the bind-mount targets
+> in `compose/docker-compose.yml` (open-webui service) — search for
+> `hf-cache` and `models--QuantTrio--gemma-4-31B-it-AWQ`.
 
 Re-run the same command on celery-worker if the open-webui container
 isn't healthy yet:

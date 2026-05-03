@@ -116,7 +116,11 @@ docker compose -p orgchat up -d
 # the USER 1000:1000 baked into the images (review §10.1), the named volume
 # may still be root-owned from its first creation; chown once.
 docker compose -p orgchat run --rm --user root open-webui \
-    chown -R 1000:1000 /var/ingest /app/backend/data/uploads /root/.cache/huggingface
+    chown -R 1000:1000 /var/ingest /app/backend/data/uploads /home/orgchat/.cache/huggingface
+# 2026-05-03: HF cache mount target is /home/orgchat/.cache/huggingface
+# (was /root/.cache/huggingface pre-§10.1). /root/ in the new image is
+# mode 700 so the uid=1000 user can't traverse it. See runbook + compose
+# yml comments for context if upgrading from an older deploy.
 .venv/bin/python scripts/apply_migrations.py
 ADMIN_EMAIL=… ADMIN_PASSWORD=… .venv/bin/python scripts/seed_admin.py
 .venv/bin/python scripts/apply_analyst_config.py  # idempotent — seeds RAG_TEMPLATE + system prompt
