@@ -9,6 +9,9 @@ __pycache__
 # Large runtime dirs (NOT part of the image)
 volumes/
 compose/
+# Wave 2 (review §10.5): celery image needs requirements-celery.txt out
+# of compose/ — whitelist it back so the COPY in Dockerfile.celery works.
+!compose/requirements-celery.txt
 docs/
 tests/
 branding/
