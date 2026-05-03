@@ -37,6 +37,12 @@ dependencies = [
   # ext/services/circuit_breaker.py is local (no pybreaker dep), but pinning
   # for future expansion if we move to the library.
   "pybreaker>=1.2",
+  # Wave 3-f review §2.5 — multilingual sentence splitter. Used by
+  # ext/services/chunker.py when ``RAG_PYSBD_ENABLED=1`` (default OFF).
+  # Soft dependency: chunker imports inside try/except and falls back
+  # to the English-centric regex if pysbd is missing, so the wheel
+  # absence does not break ingest. Pinning keeps reproducible builds.
+  "pysbd>=0.3.4",
 ]
 
 [project.optional-dependencies]

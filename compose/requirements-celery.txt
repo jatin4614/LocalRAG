@@ -32,3 +32,9 @@ pillow>=10.0
 fastembed-gpu>=0.4
 numpy>=1.26
 python-pptx>=1.0
+# Wave 3-f review §2.5 — multilingual sentence splitter. Used by
+# ext/services/chunker.py when ``RAG_PYSBD_ENABLED=1`` (default OFF in
+# .env.example). Soft import with try/except fallback to regex, so this
+# is a forward-looking pin: shipping the wheel now means flipping the
+# flag later doesn't require a worker rebuild.
+pysbd>=0.3.4
