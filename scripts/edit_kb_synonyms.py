@@ -52,10 +52,15 @@ async def _list(kb_id: int) -> list:
 async def _set(kb_id: int, synonyms: list) -> None:
     conn = await _conn()
     try:
-        await conn.execute(
+        result = await conn.execute(
             "UPDATE knowledge_bases SET synonyms = $1::jsonb WHERE id = $2",
             json.dumps(synonyms), kb_id,
         )
+        # asyncpg execute returns "UPDATE N" string for UPDATE
+        rowcount = int(result.split()[-1]) if result.startswith("UPDATE ") else 0
+        if rowcount == 0:
+            print(f"error: no KB with id={kb_id}", file=sys.stderr)
+            sys.exit(2)
     finally:
         await conn.close()
 
@@ -64,12 +69,36 @@ async def _add(kb_id: int, new_class: list) -> None:
     if not isinstance(new_class, list) or not all(isinstance(s, str) for s in new_class):
         print("error: --add expects a JSON array of strings", file=sys.stderr)
         sys.exit(2)
-    current = await _list(kb_id)
-    if new_class in current:
-        print(f"info: class already present, no change", file=sys.stderr)
-        return
-    current.append(new_class)
-    await _set(kb_id, current)
+    conn = await _conn()
+    try:
+        # Atomic append-if-not-present. The @> check is a JSONB containment
+        # operator: returns true only when the array on the left contains
+        # the array on the right as an element. Combining the WHERE NOT @>
+        # with the || append makes the operation idempotent without a
+        # client-side read-modify-write race.
+        new_class_json = json.dumps([new_class])  # outer array so || appends as one element
+        target_json = json.dumps([new_class])
+        result = await conn.execute(
+            """
+            UPDATE knowledge_bases
+            SET synonyms = synonyms || $1::jsonb
+            WHERE id = $2 AND NOT (synonyms @> $3::jsonb)
+            """,
+            new_class_json, kb_id, target_json,
+        )
+        # asyncpg returns "UPDATE N" string; parse rowcount
+        rowcount = int(result.split()[-1]) if result.startswith("UPDATE ") else 0
+        if rowcount == 0:
+            # Either KB doesn't exist OR class already present — distinguish:
+            exists = await conn.fetchval(
+                "SELECT 1 FROM knowledge_bases WHERE id = $1", kb_id,
+            )
+            if not exists:
+                print(f"error: no KB with id={kb_id}", file=sys.stderr)
+                sys.exit(2)
+            print("info: class already present, no change", file=sys.stderr)
+    finally:
+        await conn.close()
 
 
 async def _remove(kb_id: int, target: list) -> None:
@@ -89,6 +118,14 @@ async def _load(kb_id: int, path: str) -> None:
             data = json.load(fh)
     if not isinstance(data, list):
         print("error: --load expects a JSON array of arrays of strings",
+              file=sys.stderr)
+        sys.exit(2)
+    if not all(
+        isinstance(cls, list) and all(isinstance(s, str) for s in cls)
+        for cls in data
+    ):
+        print("error: --load expects a JSON array of arrays of STRINGS — "
+              "each inner element must itself be a JSON array of strings",
               file=sys.stderr)
         sys.exit(2)
     await _set(kb_id, data)
