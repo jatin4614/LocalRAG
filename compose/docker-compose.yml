@@ -889,7 +889,16 @@ services:
       - worker
       - --loglevel=info
       - --queues=ingest
-      - --concurrency=2
+      # 2026-05-03: dropped from 2 → 1 because GPU 1 (24 GB) is shared
+      # by TEI + reranker + colbert + fastembed + vllm-qu. Two parallel
+      # ingest tasks each fanning out parallel TEI batches consistently
+      # OOM the GPU mid-embed (DriverError CUDA_ERROR_OUT_OF_MEMORY in
+      # TEI's embed_pooled, surfaces as 424 to the celery side). With
+      # concurrency=1 the worker serialises ingests against TEI; per-doc
+      # embed time is unchanged so total throughput on 4 monthly reports
+      # is essentially the same. Bump back to 2 if/when the stack moves
+      # to a GPU 2 dedicated to embedders.
+      - --concurrency=1
     depends_on:
       redis:
         condition: service_healthy
