@@ -637,6 +637,118 @@ def _total_budget_seconds() -> float:
         return 30.0
 
 
+# ---------------------------------------------------------------------------
+# Wave 2 round 6 (review §6.11) — Calibrated abstention.
+#
+# The "zero hedging" rule in the analyst system prompt encourages
+# confabulation when retrieval is weak. ``compute_abstention_prefix``
+# returns a one-line caveat to PREPEND to the system prompt for THIS
+# request only, when:
+#   * RAG_ENFORCE_ABSTENTION=1 (default 0 = OFF, returns ""), AND
+#   * average rerank-top-k score < RAG_ABSTENTION_THRESHOLD (default 0.1).
+#
+# Don't mutate the global system prompt — callers receive the prefix and
+# prepend it themselves so each request is independent. When the helper
+# returns a non-empty string, ``rag_abstention_caveat_added_total{intent}``
+# is incremented.
+#
+# Fail-open: any internal exception returns ""; the request still flies.
+# Lives at module top-level (NOT inside _run_pipeline) so Wave 6E does not
+# touch the protected pipeline body.
+# ---------------------------------------------------------------------------
+ABSTENTION_CAVEAT = (
+    "If the retrieved context is insufficient to answer accurately, "
+    "respond 'I don't have enough information to answer that based on "
+    "the documents I have access to.'"
+)
+
+
+def _abstention_threshold() -> float:
+    """Return RAG_ABSTENTION_THRESHOLD as a float (default 0.1).
+
+    Garbage values fail to parse → fall back to 0.1 (don't crash the
+    request because an operator typed ``0,1`` instead of ``0.1``).
+    """
+    raw = flags.get("RAG_ABSTENTION_THRESHOLD", "0.1")
+    try:
+        v = float(raw)
+        return v if v >= 0 else 0.1
+    except (TypeError, ValueError):
+        return 0.1
+
+
+def _hit_score(hit: Any) -> float:
+    """Pull a numeric ``score`` from a hit (object attr OR dict key).
+
+    Returns 0.0 if no score is found (so missing-score hits drag the avg
+    down — defensive, the abstention path is the safer side to err on).
+    """
+    # Object with .score attribute
+    s = getattr(hit, "score", None)
+    if s is None and isinstance(hit, dict):
+        # Dict shape — sources_out items / hit_summary entries.
+        s = hit.get("score")
+    if s is None:
+        return 0.0
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def compute_abstention_prefix(
+    hits: Any,
+    *,
+    intent: str = "specific",
+) -> str:
+    """Return a one-line caveat to prepend to the system prompt, or ``""``.
+
+    Args:
+      hits: An iterable of hits — anything with a ``score`` attribute or
+        ``"score"`` key. Empty iterable is treated as 0-score (driving the
+        avg below any positive threshold → caveat added).
+      intent: Pipeline intent label used for the
+        ``rag_abstention_caveat_added_total`` counter.
+
+    Returns:
+      The caveat string when the flag is on AND avg score < threshold;
+      empty string otherwise. Always a single line so callers can safely
+      prepend it as a one-line system-prompt prefix.
+    """
+    # Cheapest exit when the flag is off.
+    if flags.get("RAG_ENFORCE_ABSTENTION", "0") != "1":
+        return ""
+
+    try:
+        scores = [_hit_score(h) for h in (hits or [])]
+        # Empty hits → avg is 0 (definitely below any positive threshold,
+        # which is the most common 'retrieval failed' signal — caveat).
+        avg = (sum(scores) / len(scores)) if scores else 0.0
+        threshold = _abstention_threshold()
+        if avg >= threshold:
+            return ""
+        # Below threshold → add caveat + bump counter.
+        try:
+            from .metrics import rag_abstention_caveat_added_total
+
+            rag_abstention_caveat_added_total.labels(intent=str(intent)).inc()
+        except Exception:
+            # Metric back-end missing or label issue → never break the
+            # request. Caveat still returned.
+            pass
+        return ABSTENTION_CAVEAT
+    except Exception as exc:
+        # Fail-open: log + return empty so the request continues unchanged.
+        try:
+            logger.warning(
+                "rag: compute_abstention_prefix failed (%s): %r",
+                type(exc).__name__, exc,
+            )
+        except Exception:
+            pass
+        return ""
+
+
 def _build_datetime_preamble_source() -> Optional[dict]:
     """Return the canonical ``current-datetime`` source dict (or ``None``).
 
