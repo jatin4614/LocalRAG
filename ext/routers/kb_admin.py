@@ -1,7 +1,6 @@
 """HTTP admin routes for KB CRUD. Admin-only."""
 from __future__ import annotations
 
-import json
 import logging
 import os
 from collections import Counter
@@ -1114,24 +1113,12 @@ async def patch_kb_synonyms(
 
     Spec: docs/superpowers/specs/2026-05-03-retrieval-quality-fix-design.md §5.2.4
 
-    Validates that the body is a list of lists of strings (Pydantic
-    enforces the outer+inner list types; the explicit check below
-    guards against dicts/None slipping through before serialisation).
-    Returns 403 for non-admin, 400 for bad shape, 404 for missing KB,
-    200 + echo for success.
+    Pydantic enforces the outer+inner list[list[str]] types and returns 422
+    (Unprocessable Entity) before this handler body executes — 422 is the
+    RFC-9110-correct status for semantic body errors. No explicit isinstance
+    guard is needed here.
+    Returns 403 for non-admin, 404 for missing KB, 200 + echo for success.
     """
-    # Explicit inner validation: Pydantic's list[list[str]] rejects non-str
-    # scalars at parse time, but a fully opaque JSON value (dicts, None
-    # inside the inner list) would surface here rather than cleanly.
-    if not isinstance(body.synonyms, list) or not all(
-        isinstance(c, list) and all(isinstance(s, str) for s in c)
-        for c in body.synonyms
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="synonyms must be a list of lists of strings",
-        )
-
     from sqlalchemy import text as _sql, bindparam
     from sqlalchemy.dialects.postgresql import JSONB as _JSONB
     from sqlalchemy.types import JSON as _JSON

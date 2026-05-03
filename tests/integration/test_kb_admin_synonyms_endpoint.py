@@ -71,8 +71,8 @@ async def test_patch_synonyms_admin_only(client, kb_id):
 
 
 @pytest.mark.asyncio
-async def test_patch_synonyms_persists_then_returns_via_echo(client, kb_id):
-    """Happy path: the endpoint echoes the saved value."""
+async def test_patch_synonyms_persists_then_returns_via_get(client, kb_id, engine):
+    """PATCH writes to DB; verify by re-reading the row via direct query."""
     synonyms = [["__test_a__", "__test_b__"]]
     r = await client.patch(
         f"/api/kb/{kb_id}/synonyms",
@@ -82,6 +82,20 @@ async def test_patch_synonyms_persists_then_returns_via_echo(client, kb_id):
     assert r.status_code == 200, r.text
     assert r.json()["synonyms"] == synonyms
     assert r.json()["kb_id"] == kb_id
+
+    # Verify persistence by direct DB read (not just trusting the echo)
+    SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with SessionLocal() as s:
+        row = (await s.execute(
+            text("SELECT synonyms FROM knowledge_bases WHERE id = :i AND deleted_at IS NULL"),
+            {"i": kb_id},
+        )).first()
+    assert row is not None, "KB row not found after PATCH"
+    raw = row[0]
+    if isinstance(raw, str):
+        import json
+        raw = json.loads(raw)
+    assert raw == synonyms, f"DB synonyms mismatch: {raw!r}"
 
     # Cleanup
     await client.patch(
