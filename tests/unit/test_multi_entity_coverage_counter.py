@@ -126,3 +126,34 @@ def test_chunk_mentioning_two_entities_attributed_to_first_match():
     # outcome=full, which would be wrong.
     after_empty = _read("empty", "2")
     assert after_empty == before_empty + 1
+
+
+def test_counter_fires_on_mmr_success_path():
+    """Multi-entity + MMR-on must still bump the counter (regression for the
+    gap discovered 2026-05-04 where the counter was wired only into
+    _apply_entity_quota, which MMR-on KBs bypass).
+    """
+    from ext.services.chat_rag_bridge import _bump_coverage_counter
+
+    before_full = _read("full", "2")
+    hits = [
+        _hit(1, 0.9, "75 Inf Bde visited"),
+        _hit(2, 0.8, "75 Inf Bde inspection"),
+        _hit(3, 0.7, "75 Inf Bde 03 Apr"),
+        _hit(4, 0.6, "5 PoK Bde practice"),
+        _hit(5, 0.5, "5 PoK Bde rotation"),
+        _hit(6, 0.4, "5 PoK Bde meeting"),
+    ]
+    _bump_coverage_counter(
+        slice_=hits, entities=["75 Inf Bde", "5 PoK Bde"],
+        per_entity_floor=3,
+    )
+    after_full = _read("full", "2")
+    assert after_full == before_full + 1, "counter did not bump"
+
+
+def test_helper_safe_to_call_with_empty_entities():
+    """No-op when entities=[]; helper must not crash."""
+    from ext.services.chat_rag_bridge import _bump_coverage_counter
+    # Should be a no-op silently
+    _bump_coverage_counter(slice_=[], entities=[], per_entity_floor=3)

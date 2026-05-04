@@ -880,6 +880,53 @@ def _estimate_reserved_tokens(*, n_hits: int, intent: str) -> int:
     return _system_prompt_tokens() + 800 + 40 + (30 * max(0, int(n_hits)))
 
 
+def _bump_coverage_counter(
+    *,
+    slice_: list,
+    entities: list,
+    per_entity_floor: int,
+) -> None:
+    """Bump rag_multi_entity_coverage_total for the given returned slice.
+
+    Pure function — no side effects beyond the counter increment + the
+    silent-failure log on metric error. Caller passes the EXACT slice the
+    LLM will see (post-MMR / post-quota / post-trim). entities=[] is a
+    no-op so all callers can call it unconditionally.
+
+    Outcome semantics:
+      - full    : every entity got at least per_entity_floor chunks
+      - partial : at least one entity got <floor but >0 chunks
+      - empty   : at least one entity got 0 chunks
+
+    First-match attribution per chunk (matches the existing convention).
+
+    Three call sites (all mutually exclusive per request):
+      1. _apply_entity_quota (no-MMR trim / MMR-fail trim paths)
+      2. MMR-success branch in _run_pipeline (new — Task 16)
+    """
+    if not entities:
+        return
+    try:
+        from .metrics import rag_multi_entity_coverage_total
+        counts = {e: 0 for e in entities}
+        for hit in slice_:
+            text_low = ((hit.payload or {}).get("text") or "").lower()
+            # TODO: when per-KB synonyms wire into the bridge, use
+            # kb_config.expand_entity(e, kb_synonyms) here so synonym matches count.
+            for e in entities:
+                if e.lower() in text_low:
+                    counts[e] += 1
+                    break  # first-match-wins per chunk
+        n_zero = sum(1 for c in counts.values() if c == 0)
+        n_partial = sum(1 for c in counts.values() if 0 < c < per_entity_floor)
+        outcome = "empty" if n_zero else ("partial" if n_partial else "full")
+        rag_multi_entity_coverage_total.labels(
+            outcome=outcome, entity_count=str(len(entities)),
+        ).inc()
+    except Exception as err:
+        _record_silent_failure("multi_entity_coverage_counter", err)
+
+
 def _apply_entity_quota(
     *,
     reranked: list,
@@ -971,26 +1018,9 @@ def _apply_entity_quota(
     # Phase 3 / 2026-05-03 — observability bump.
     # Count attribution on the returned slice (selected[:final_k]), not the
     # full candidate pool, so the counter reflects what the LLM actually sees.
-    try:
-        from .metrics import rag_multi_entity_coverage_total
-        counts = {e: 0 for e in entities}
-        for hit in selected[:final_k]:
-            text_low = ((hit.payload or {}).get("text") or "").lower()
-            # TODO: when per-KB synonyms wire into the bridge's _multi_entity_retrieve
-            # (future task), use kb_config.expand_entity(e, kb_synonyms) here so a
-            # chunk matched via synonym still counts toward the entity's coverage.
-            for e in entities:
-                if e.lower() in text_low:
-                    counts[e] += 1
-                    break  # one entity attribution per chunk
-        n_zero = sum(1 for c in counts.values() if c == 0)
-        n_partial = sum(1 for c in counts.values() if 0 < c < per_entity_floor)
-        outcome = "empty" if n_zero else ("partial" if n_partial else "full")
-        rag_multi_entity_coverage_total.labels(
-            outcome=outcome, entity_count=str(len(entities)),
-        ).inc()
-    except Exception as err:
-        _record_silent_failure("multi_entity_coverage_counter", err)
+    _bump_coverage_counter(
+        slice_=selected[:final_k], entities=entities, per_entity_floor=per_entity_floor,
+    )
 
     return selected[:final_k]
 
@@ -2094,6 +2124,22 @@ async def _run_pipeline(
                         "ms": int((time.perf_counter() - _tM) * 1000),
                         "top_k": len(reranked),
                     })
+                    # Task 16 — third bump site (MMR-success path).
+                    # The no-MMR trim path and the MMR-fail-trim path both
+                    # bump via _apply_entity_quota; MMR-success bypasses both
+                    # and was therefore invisible to the counter. Fix: bump
+                    # here, on the slice downstream context_expand will see,
+                    # so all three branches are observable. This site is
+                    # mutually exclusive with the other two:
+                    #   • no-MMR  → `elif len(reranked) > _final_k` branch
+                    #   • MMR-fail → `except` branch (this try's complement)
+                    #   • MMR-success → this `try` body (current site)
+                    if _do_decompose and _entities and _entity_floor > 0:
+                        _bump_coverage_counter(
+                            slice_=reranked[:_final_k],
+                            entities=list(_entities),
+                            per_entity_floor=_entity_floor,
+                        )
                 except Exception as _err:
                     # Fail open: on any MMR error, stick with reranker output.
                     # B6: still surface via warning + counter so a broken
