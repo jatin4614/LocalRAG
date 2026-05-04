@@ -211,8 +211,10 @@ Find the line in `compose/docker-compose.yml` that has `RAG_MULTI_ENTITY_MIN_PER
       RAG_MULTI_ENTITY_MIN_PER_ENTITY: ${RAG_MULTI_ENTITY_MIN_PER_ENTITY:-10}
       # 2026-05-04 — per-entity rerank-stage floor (Phase 1 / Item 2).
       # Bumps post-cross-encoder pool floor for multi-entity queries.
-      # Default 8 = each named entity gets 8 chunks past the rerank cut.
-      RAG_MULTI_ENTITY_RERANK_FLOOR: ${RAG_MULTI_ENTITY_RERANK_FLOOR:-8}
+      # Default 12 = each named entity gets 12 chunks past the rerank cut.
+      # Original spec said 8; revised up to 12 after confirming Gemma-4
+      # supports 128K ctx (operator correction 2026-05-04, see spec §4.3).
+      RAG_MULTI_ENTITY_RERANK_FLOOR: ${RAG_MULTI_ENTITY_RERANK_FLOOR:-12}
 ```
 
 - [ ] **Step 2: Inject the same mapping into celery-worker block**
@@ -223,7 +225,8 @@ Find the celery-worker `environment:` block (starts around line 818). Add the sa
       RAG_RERANK: ${RAG_RERANK:-1}
       # 2026-05-04 — per-entity rerank-stage floor (Phase 1 / Item 2).
       # Worker reads this for any retrieval path it uses (eval scheduler).
-      RAG_MULTI_ENTITY_RERANK_FLOOR: ${RAG_MULTI_ENTITY_RERANK_FLOOR:-8}
+      # Default 12 — see open-webui block above for the 128K context note.
+      RAG_MULTI_ENTITY_RERANK_FLOOR: ${RAG_MULTI_ENTITY_RERANK_FLOOR:-12}
 ```
 
 - [ ] **Step 3: Validate compose YAML syntax**
@@ -232,7 +235,7 @@ Find the celery-worker `environment:` block (starts around line 818). Add the sa
 cd /home/vogic/LocalRAG/compose && docker compose -p orgchat config | grep -A1 RAG_MULTI_ENTITY_RERANK_FLOOR
 ```
 
-Expected: shows the env var listed under both `open-webui` and `celery-worker` services with value `8`.
+Expected: shows the env var listed under both `open-webui` and `celery-worker` services with value `12`.
 
 - [ ] **Step 4: Recreate the affected services**
 
@@ -242,17 +245,20 @@ docker compose -p orgchat exec -T open-webui printenv RAG_MULTI_ENTITY_RERANK_FL
 docker compose -p orgchat exec -T celery-worker printenv RAG_MULTI_ENTITY_RERANK_FLOOR
 ```
 
-Expected: both print `8`.
+Expected: both print `12`.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add compose/docker-compose.yml
 git commit -m "$(cat <<'EOF'
-chore(compose): map RAG_MULTI_ENTITY_RERANK_FLOOR=8 on open-webui + celery-worker
+chore(compose): map RAG_MULTI_ENTITY_RERANK_FLOOR=12 on open-webui + celery-worker
 
-Phase 1 / item 2. Env defaults to 8 (was implicit 3 inside the bridge);
+Phase 1 / item 2. Env defaults to 12 (was implicit 3 inside the bridge);
 per-KB rag_config.multi_entity_rerank_floor still wins via flags.get.
+Floor 12 (not 8 as in the original spec) reflects the 2026-05-04
+operator correction that Gemma-4 supports 128K context — see spec §4.3
+for the revised arithmetic.
 
 Spec: docs/superpowers/specs/2026-05-04-multi-entity-elaborate-answers-design.md §4.2
 
@@ -263,48 +269,103 @@ EOF
 
 ---
 
-## Task 3: Bump `RAG_BUDGET_TOKENS` default 22000 → 28000
+## Task 3: Lift vllm `--max-model-len` to 128K + bump `RAG_BUDGET_TOKENS` 22000 → 80000 + `RAG_GLOBAL_BUDGET_TOKENS` 22000 → 100000
 
 **Files:**
-- Modify: `compose/docker-compose.yml` (one line)
-- Modify: `compose/.env.example` (one line if the var has an example)
+- Modify: `compose/docker-compose.yml` (`vllm-chat.command` array + open-webui env block)
+- Modify: `compose/.env.example` (two lines)
 
-- [ ] **Step 1: Update the default in compose/docker-compose.yml**
+**Background:** Gemma-4-31B-it-AWQ supports 128K context natively (operator-confirmed 2026-05-04). The deployed `vllm-chat` container has a `--max-model-len` flag that may be capping at 32K from an older deploy. Bumping `RAG_BUDGET_TOKENS` past ~25K only takes effect after vllm is also lifted; otherwise vllm silently truncates the input regardless of the bridge's budget. This task does both lifts together so the change is coherent.
+
+- [ ] **Step 1: Inspect current `vllm-chat.command` `--max-model-len`**
+
+```bash
+grep -A30 "^  vllm-chat:" /home/vogic/LocalRAG/compose/docker-compose.yml | grep -E "max-model-len|command:" | head -5
+```
+
+If `--max-model-len` is set to anything below `131072`, proceed to Step 2. If it's already `131072` or unset (vllm defaults to model-card max), skip to Step 3.
+
+- [ ] **Step 2: Lift `--max-model-len` to 131072 in compose**
+
+In `compose/docker-compose.yml`, find the `vllm-chat` service's `command:` array (typically a multi-line YAML list of strings). Locate the `--max-model-len <N>` pair and replace `<N>` with `131072`. If the `--max-model-len` flag isn't present at all, add it directly after the model name argument:
+
+```yaml
+  vllm-chat:
+    # ... existing service definition ...
+    command:
+      - --model
+      - QuantTrio/gemma-4-31B-it-AWQ
+      # 2026-05-04 — explicit ctx lift. Model card supports 128K; older
+      # deploys may have shipped at 32K via a stale --max-model-len.
+      # Without this, RAG_BUDGET_TOKENS > 25K silently truncates inside
+      # vllm regardless of the bridge's budget setting. See spec §4.3.3.
+      - --max-model-len
+      - "131072"
+      # ... rest of existing flags ...
+```
+
+- [ ] **Step 3: Update `RAG_BUDGET_TOKENS` and `RAG_GLOBAL_BUDGET_TOKENS` defaults in compose**
 
 Find the line `RAG_BUDGET_TOKENS: ${RAG_BUDGET_TOKENS:-22000}` (around line 599 in the open-webui env block) and change to:
 
 ```yaml
-      # Bumped 22000 -> 28000 on 2026-05-04 (Phase 1 / Item 3 of
-      # multi-entity-elaborate-answers spec). Pairs with rerank_top_k
-      # raised to 120 per-KB so the wider post-rerank pool fits in
-      # context. 28K leaves ~4K headroom on the 32K Gemma-4-31B ctx
-      # for response generation after sys/user/history.
-      RAG_BUDGET_TOKENS: ${RAG_BUDGET_TOKENS:-28000}
+      # Bumped 22000 -> 80000 on 2026-05-04 (Phase 1 / Item 3 of
+      # multi-entity-elaborate-answers spec). Exploits the 128K Gemma-4
+      # ctx confirmed by operator 2026-05-04. With rerank_top_k=200
+      # per-KB and floor=12, post-rerank pool can grow to ~30-40K tokens;
+      # 80K budget gives headroom for context-expand siblings, datetime/
+      # spotlight preambles, and future entity-coverage doc summaries
+      # (Phase 2). Leaves ~38K for response generation on 128K ctx after
+      # sys/user/history. See spec §4.3 for the full arithmetic.
+      RAG_BUDGET_TOKENS: ${RAG_BUDGET_TOKENS:-80000}
 ```
 
-- [ ] **Step 2: Update compose/.env.example doc**
+Then find `RAG_GLOBAL_BUDGET_TOKENS: ${RAG_GLOBAL_BUDGET_TOKENS:-22000}` (typically a few lines below in the same block) and change to:
 
-Find the relevant `RAG_BUDGET_TOKENS` block in `compose/.env.example` and update the documented value:
+```yaml
+      # Bumped 22000 -> 100000 on 2026-05-04. Phase 2 entity-coverage
+      # doc summaries push more level=doc points into context for
+      # global-intent queries; 100K leaves room for that plus drilldown.
+      RAG_GLOBAL_BUDGET_TOKENS: ${RAG_GLOBAL_BUDGET_TOKENS:-100000}
+```
+
+- [ ] **Step 4: Update compose/.env.example doc**
+
+Find the relevant `RAG_BUDGET_TOKENS` block in `compose/.env.example` and update the documented value + comment:
 
 ```bash
 # Token budget for retrieval context fed to the LLM (specific/specific_date
-# intent). Bumped to 28000 on 2026-05-04 to give multi-entity comparative
-# queries room for 4 entities × 8 floor × ~120 tokens per chunk plus
-# context-expand siblings. Lower-bound the response size on 32K-ctx
-# models accordingly: response_max_tokens ≈ ctx_window - budget - sys_prompt.
-RAG_BUDGET_TOKENS=28000
+# intent). Bumped to 80000 on 2026-05-04 to exploit the 128K Gemma-4
+# context window. Gives multi-entity comparative queries room for
+# 4 entities × 12 floor × ~120 tokens per chunk plus context-expand
+# siblings, with ~38K free for response generation after sys/user/history.
+# Requires --max-model-len 131072 in vllm-chat.command (Task 3 Step 2).
+RAG_BUDGET_TOKENS=80000
+
+# Token budget for global-intent queries (catalog / aggregation).
+# Higher than RAG_BUDGET_TOKENS because Phase 2 entity-coverage doc
+# summaries surface more level=doc points per query.
+RAG_GLOBAL_BUDGET_TOKENS=100000
 ```
 
-- [ ] **Step 3: Recreate open-webui to pick up the new default**
+- [ ] **Step 5: Recreate vllm-chat AND open-webui to pick up the new values**
 
 ```bash
-cd /home/vogic/LocalRAG/compose && docker compose -p orgchat up -d open-webui
-docker compose -p orgchat exec -T open-webui printenv RAG_BUDGET_TOKENS
+cd /home/vogic/LocalRAG/compose && docker compose -p orgchat up -d vllm-chat open-webui
+docker compose -p orgchat exec -T open-webui printenv RAG_BUDGET_TOKENS RAG_GLOBAL_BUDGET_TOKENS
 ```
 
-Expected: `28000`.
+Expected: `80000` and `100000`.
 
-- [ ] **Step 4: Sanity-test that retrieval still works**
+vllm-chat takes ~30-90s to start on Gemma 4 31B AWQ. Wait for healthcheck:
+
+```bash
+until docker compose -p orgchat exec -T vllm-chat curl -sf http://localhost:8000/health 2>/dev/null; do sleep 5; done && echo "vllm ready"
+```
+
+Expected: `vllm ready` after 30-90s.
+
+- [ ] **Step 6: Sanity-test that retrieval still works at the new budget**
 
 ```bash
 JWT=$(docker compose -p orgchat exec -T open-webui curl -s -X POST \
@@ -323,18 +384,38 @@ docker compose -p orgchat exec -T open-webui curl -sf -X POST \
 
 Expected: `OK`.
 
-- [ ] **Step 5: Commit**
+Also verify a chat completion succeeds without truncation warnings in the vllm log:
+
+```bash
+docker compose -p orgchat logs --since 2m vllm-chat 2>&1 | grep -iE "truncat|max_tokens|max-model-len" | tail -5
+```
+
+Expected: no recent truncation warnings.
+
+- [ ] **Step 7: Commit**
 
 ```bash
 git add compose/docker-compose.yml compose/.env.example
 git commit -m "$(cat <<'EOF'
-chore(compose): RAG_BUDGET_TOKENS default 22000 -> 28000 (multi-entity headroom)
+chore(compose): exploit 128K Gemma ctx — vllm --max-model-len 131072 + budget 22000 -> 80000
 
-Phase 1 / item 3. Empirical brainstorm 2026-05-04 confirmed 22000 was
-truncating multi-entity answers mid-sentence on 32K-ctx Gemma 4 once
-sys+user+history+response were accounted for. 28000 leaves ~4K for
-response output, which is the elaborate-answer headroom the operator
-wants. Pairs with the per-KB rerank_top_k=120 stamp set in Task 5.
+Phase 1 / item 3. Operator confirmed 2026-05-04 that Gemma-4-31B-it-AWQ
+supports 128K context (CLAUDE.md §3 was stale at "32K"). The deployed
+vllm-chat may have been shipping at --max-model-len 32768 from an
+older deploy; without lifting that, raising RAG_BUDGET_TOKENS past 25K
+silently truncates inside vllm regardless of the bridge's budget.
+
+This commit:
+- Lifts vllm-chat.command --max-model-len to 131072
+- Raises RAG_BUDGET_TOKENS default 22000 -> 80000 (specific intent)
+- Raises RAG_GLOBAL_BUDGET_TOKENS default 22000 -> 100000 (global intent)
+
+Pairs with the per-KB rerank_top_k=200 stamp set in Task 6 and the
+multi_entity_rerank_floor=12 env default from Task 2. Empirical
+brainstorm 2026-05-04 showed budget was never the bottleneck at 22K;
+the bump is to give the 4-entity x 5-subtopic case + sibling expansion
+genuine headroom and to leave room for Phase 2's per-doc entity-coverage
+summaries and Phase 3's two-axis decompose pool.
 
 Spec: docs/superpowers/specs/2026-05-04-multi-entity-elaborate-answers-design.md §4.3
 
@@ -817,7 +898,7 @@ Expected: nonzero JWT length.
 ```bash
 docker compose -p orgchat exec -T open-webui curl -s -X PATCH \
     -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
-    -d '{"chunking_strategy":"window","chunk_tokens":200,"overlap_tokens":30,"rerank_top_k":120,"multi_entity_rerank_floor":8}' \
+    -d '{"chunking_strategy":"window","chunk_tokens":200,"overlap_tokens":30,"rerank_top_k":200,"multi_entity_rerank_floor":12}' \
     http://localhost:8080/api/kb/2/config | python3 -m json.tool
 ```
 
@@ -922,9 +1003,9 @@ PY
 ```
 
 Expected (Phase 1 acceptance criteria):
-- ≥4 facts per brigade across all 4 brigades.
-- Total facts ≥15.
-- Answer length ≥6000 chars.
+- ≥6 facts per brigade across all 4 brigades (revised up from ≥4 after the 128K context lift).
+- Total facts ≥20 (revised up from ≥15).
+- Answer length ≥10000 chars (revised up from ≥6000).
 
 - [ ] **Step 4: If acceptance fails, do not roll back — capture diagnostics**
 
