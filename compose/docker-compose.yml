@@ -615,6 +615,12 @@ services:
       # (Phase 2). Leaves ~38K for response generation on 128K ctx after
       # sys/user/history. See spec §4.3 for the full arithmetic.
       RAG_BUDGET_TOKENS: ${RAG_BUDGET_TOKENS:-80000}
+      # 2026-05-04 — total-pipeline timeout (asyncio.wait_for around the
+      # whole _run_pipeline). Default 30s in the bridge; bumped to 180s
+      # because multi-entity decompose with 4-7 sub-queries against a
+      # 200-chunk rerank pool + 80K budget routinely takes 50-90s.
+      # Operator's stated tolerance: latency OK to grow.
+      RAG_TOTAL_BUDGET_SEC: ${RAG_TOTAL_BUDGET_SEC:-180}
       # Cap MMR re-embed batch size. Pairs with multi-entity
       # decomposition: cross-encoder already ranked the pool, MMR
       # only diversifies the top band — sending all 200 candidates
