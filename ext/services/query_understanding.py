@@ -67,6 +67,7 @@ QU_OUTPUT_SCHEMA: dict[str, Any] = {
         "temporal_constraint",
         "entities",
         "confidence",
+        "subtopics",
     ],
     "properties": {
         "intent": {
@@ -138,6 +139,15 @@ QU_OUTPUT_SCHEMA: dict[str, Any] = {
             "minimum": 0.0,
             "maximum": 1.0,
         },
+        # 2026-05-04 — Phase 3 / item 5 of multi-entity-elaborate-answers spec.
+        # Subtopics are sub-headings the query references ("visits",
+        # "operations", "supply") extracted by the LLM so the bridge can
+        # build N×M sub-queries.  Empty list when none are present.
+        "subtopics": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1, "maxLength": 80},
+            "maxItems": 8,
+        },
     },
 }
 
@@ -163,6 +173,9 @@ class QueryUnderstanding:
     confidence: float = 0.0
     source: str = "llm"
     cached: bool = False
+    # 2026-05-04 — Phase 3 / item 5 of multi-entity-elaborate-answers spec.
+    # Populated by parse_qu_response from the LLM's "subtopics" key.
+    subtopics: list[str] = field(default_factory=list)
 
 
 _VALID_INTENTS = {"metadata", "global", "specific", "specific_date"}
@@ -202,7 +215,12 @@ Your task:
    Multi-temporal queries are common ("activities in May, Jul, Dec, Feb 2023",
    "compare Q1 and Q3 of 2023") — prefer the array form for those.
 4. List the named entities (products, places, people, units, brigades) referenced.
-5. Output your confidence in [0.0, 1.0].
+5. Extract subtopics: subheadings or sub-themes the query enumerates. Look for
+   patterns like "under heads: X, Y, Z", "under following: X / Y / Z", or any
+   comma/slash-separated list of noun phrases after "including", "covering",
+   "for each of". Output up to 8 subtopics as short strings (≤80 chars each).
+   Use empty list [] when no subtopics are mentioned.
+6. Output your confidence in [0.0, 1.0].
 
 Examples of temporal_constraint shape:
   - "What happened in February 2023?" ->
@@ -292,6 +310,14 @@ def parse_qu_response(raw: str) -> QueryUnderstanding:
     if not isinstance(entities, list):
         raise ValueError("entities must be a list")
 
+    # Phase 3 / item 5 — parse subtopics defensively; empty list on any
+    # type drift (guards against non-strict guided_json escapes).
+    raw_subtopics = data.get("subtopics")
+    if isinstance(raw_subtopics, list):
+        subtopics = [str(s) for s in raw_subtopics[:8] if isinstance(s, str) and s.strip()]
+    else:
+        subtopics = []
+
     try:
         confidence = float(data.get("confidence", 0.0))
     except (TypeError, ValueError) as e:
@@ -303,6 +329,7 @@ def parse_qu_response(raw: str) -> QueryUnderstanding:
         resolved_query=resolved.strip(),
         temporal_constraint=tc,
         entities=[str(e) for e in entities[:10]],
+        subtopics=subtopics,
         confidence=confidence,
         source="llm",
         cached=False,

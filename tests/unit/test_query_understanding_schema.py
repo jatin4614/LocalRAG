@@ -50,6 +50,8 @@ def test_required_list_includes_all_fields():
         "temporal_constraint",
         "entities",
         "confidence",
+        # Phase 3 / item 5 — subtopics added alongside entities.
+        "subtopics",
     }
 
 
