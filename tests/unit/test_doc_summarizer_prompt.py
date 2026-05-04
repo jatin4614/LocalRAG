@@ -88,3 +88,60 @@ class TestParseStructuredOutput:
         out = doc_summarizer.parse_structured_summary(raw)
         assert out["entities"] == []
         assert out["summary"] == "brief text"
+
+
+import pytest
+
+
+class TestSummarizeDocumentReturnShape:
+    """summarize_document() now returns the structured dict, not a bare string.
+    Callers that want the legacy string can read the 'summary' key."""
+
+    @pytest.mark.asyncio
+    async def test_returns_dict_with_entities_and_summary(
+        self, monkeypatch
+    ) -> None:
+        async def fake_impl(**kwargs):
+            return (
+                "ENTITIES: 75 Inf Bde, 5 PoK Bde\n\n"
+                "SUMMARY: Apr 26 monthly update covering 75 Inf Bde and 5 PoK Bde."
+            )
+        monkeypatch.setattr(doc_summarizer, "_summarize_impl", fake_impl)
+
+        out = await doc_summarizer.summarize_document(
+            chunks=["chunk 1", "chunk 2"],
+            filename="Apr 26.docx",
+            chat_url="http://fake/v1",
+            chat_model="fake",
+        )
+        assert isinstance(out, dict)
+        assert out["entities"] == ["75 Inf Bde", "5 PoK Bde"]
+        assert "Apr 26 monthly update" in out["summary"]
+
+    @pytest.mark.asyncio
+    async def test_empty_chunks_returns_empty_shape(
+        self, monkeypatch
+    ) -> None:
+        out = await doc_summarizer.summarize_document(
+            chunks=[],
+            filename="x",
+            chat_url="http://fake/v1",
+            chat_model="fake",
+        )
+        assert out == {"entities": [], "summary": ""}
+
+    @pytest.mark.asyncio
+    async def test_impl_failure_returns_empty_shape(
+        self, monkeypatch
+    ) -> None:
+        async def fake_impl(**kwargs):
+            return ""
+        monkeypatch.setattr(doc_summarizer, "_summarize_impl", fake_impl)
+
+        out = await doc_summarizer.summarize_document(
+            chunks=["x"],
+            filename="x",
+            chat_url="http://fake/v1",
+            chat_model="fake",
+        )
+        assert out == {"entities": [], "summary": ""}

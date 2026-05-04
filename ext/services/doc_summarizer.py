@@ -58,29 +58,34 @@ async def summarize_document(
     api_key: Optional[str] = None,
     timeout: float = 30.0,
     transport: Optional[httpx.AsyncBaseTransport] = None,
-) -> str:
-    """Summarize a document from its chunk texts.
+) -> dict[str, list[str] | str]:
+    """Summarize a document, returning ``{"entities": [...], "summary": "..."}``.
+
+    Phase 2 of the 2026-05-04 multi-entity-elaborate-answers spec.
+    Replaces the legacy bare-string return — callers that only want
+    the summary text should read ``out["summary"]``.
 
     Args:
         chunks: ordered list of chunk-body strings for the document.
-        filename: display name of the document (included in the prompt so
-            the summary mentions it by name — useful when the summary is
-            later retrieved as context).
-        chat_url: base URL of an OpenAI-compatible endpoint
-            (e.g. ``http://vllm-chat:8000/v1``).
-        chat_model: model name the endpoint expects (e.g. ``orgchat-chat``).
-        api_key: optional bearer token. If None, no Authorization header is sent.
+        filename: display name (included in the prompt for explicit naming).
+        chat_url: base URL of an OpenAI-compatible endpoint.
+        chat_model: model name the endpoint expects.
+        api_key: optional bearer token.
         timeout: request timeout (seconds).
-        transport: optional httpx transport, primarily for tests.
+        transport: optional httpx transport (for tests).
 
     Returns:
-        The summary text (stripped). On ANY failure returns ``""``.
+        A dict with two keys:
+          - ``entities``: list of canonical entity names (comma-list parsed)
+          - ``summary``: 5-7 sentence paragraph
+        On any LLM failure or empty input both keys hold their empty
+        defaults (``[]`` and ``""``).
     """
     if not chunks:
-        return ""
+        return {"entities": [], "summary": ""}
 
     with span("doc.summarize", model=chat_model, n_chunks=len(chunks)):
-        return await _summarize_impl(
+        raw = await _summarize_impl(
             chunks=chunks,
             filename=filename,
             chat_url=chat_url,
@@ -89,6 +94,7 @@ async def summarize_document(
             timeout=timeout,
             transport=transport,
         )
+    return parse_structured_summary(raw)
 
 
 async def _summarize_impl(

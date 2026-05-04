@@ -115,6 +115,6 @@ async def test_doc_summarizer_records_llm_call_even_on_failure(monkeypatch):
         chat_model=CHAT_MODEL,
         transport=httpx.MockTransport(handler),
     )
-    assert out == ""
+    assert out == {"entities": [], "summary": ""}
     # Recorder context entered + exited around the failing call
     assert entries == ["entered", "exited"]

@@ -48,7 +48,8 @@ async def test_summarizes_happy_path() -> None:
         api_key="sk-test",
         transport=httpx.MockTransport(handler),
     )
-    assert "Q1-report.pdf" in summary
+    assert isinstance(summary, dict)
+    assert "Q1-report.pdf" in summary["summary"]
     assert seen["url"].endswith("/chat/completions")
     # Filename is embedded in the prompt.
     assert "Q1-report.pdf" in seen["body"]
@@ -65,7 +66,8 @@ async def test_strips_summary_echo_prefix() -> None:
         chat_model=CHAT_MODEL,
         transport=httpx.MockTransport(handler),
     )
-    assert out == "a concise wrap-up sentence."
+    assert isinstance(out, dict)
+    assert out["summary"] == "a concise wrap-up sentence."
 
 
 async def test_forwards_bearer_token_when_api_key_set() -> None:
@@ -102,7 +104,7 @@ async def test_empty_chunks_returns_empty() -> None:
         chat_model=CHAT_MODEL,
         transport=httpx.MockTransport(should_not_be_called),
     )
-    assert out == ""
+    assert out == {"entities": [], "summary": ""}
 
 
 async def test_http_500_returns_empty() -> None:
@@ -116,7 +118,7 @@ async def test_http_500_returns_empty() -> None:
         chat_model=CHAT_MODEL,
         transport=httpx.MockTransport(handler),
     )
-    assert out == ""
+    assert out == {"entities": [], "summary": ""}
 
 
 async def test_timeout_returns_empty() -> None:
@@ -130,7 +132,7 @@ async def test_timeout_returns_empty() -> None:
         chat_model=CHAT_MODEL,
         transport=httpx.MockTransport(handler),
     )
-    assert out == ""
+    assert out == {"entities": [], "summary": ""}
 
 
 async def test_malformed_json_returns_empty() -> None:
@@ -144,7 +146,7 @@ async def test_malformed_json_returns_empty() -> None:
         chat_model=CHAT_MODEL,
         transport=httpx.MockTransport(handler),
     )
-    assert out == ""
+    assert out == {"entities": [], "summary": ""}
 
 
 async def test_empty_model_response_returns_empty() -> None:
@@ -158,4 +160,4 @@ async def test_empty_model_response_returns_empty() -> None:
         chat_model=CHAT_MODEL,
         transport=httpx.MockTransport(handler),
     )
-    assert out == ""
+    assert out == {"entities": [], "summary": ""}
