@@ -200,3 +200,74 @@ class TestIsMultiEntityQuery:
         assert entity_extractor.is_multi_entity_query(
             "plain question", qu_result=qu
         ) is True
+
+
+class TestExtractSubtopicsRegex:
+    """Phase 3 / item 5 of the 2026-05-04 multi-entity-elaborate-answers spec.
+    Regex-only subtopic extractor for queries with explicit subheadings."""
+
+    def test_under_fwg_heads_with_numbered_list(self) -> None:
+        q = (
+            "Give updates for following:\n1. 75 Inf Bde\nunder fwg heads:\n"
+            "1. visits of senior officers\n2. operational activities\n3. construction"
+        )
+        out = entity_extractor.extract_subtopics_regex(q)
+        # First-surface-form preserved, lowercased trimmed normalisation
+        assert out == [
+            "visits of senior officers",
+            "operational activities",
+            "construction",
+        ]
+
+    def test_under_following_heads(self) -> None:
+        q = (
+            "For each brigade list facts under following heads:\n"
+            "1. visits\n2. operations\n3. construction\n4. intel"
+        )
+        out = entity_extractor.extract_subtopics_regex(q)
+        assert out == ["visits", "operations", "construction", "intel"]
+
+    def test_bulleted_list_under_heading_marker(self) -> None:
+        q = "Updates under headings:\n- visits\n- operations"
+        out = entity_extractor.extract_subtopics_regex(q)
+        assert out == ["visits", "operations"]
+
+    def test_no_subtopics_returns_empty(self) -> None:
+        q = "Give updates from the report of April 2026"
+        assert entity_extractor.extract_subtopics_regex(q) == []
+
+    def test_single_subtopic_returns_empty(self) -> None:
+        # Below the >=2 threshold for two-axis decompose; we still emit []
+        q = "Updates under heads:\n1. visits"
+        assert entity_extractor.extract_subtopics_regex(q) == []
+
+    def test_caps_at_eight(self) -> None:
+        items = [f"topic {i}" for i in range(20)]
+        q = "Under headings:\n" + "\n".join(f"{i+1}. {t}" for i, t in enumerate(items))
+        out = entity_extractor.extract_subtopics_regex(q)
+        assert len(out) == 8
+        assert out[0] == "topic 0"
+        assert out[7] == "topic 7"
+
+    def test_dedupes_case_insensitively(self) -> None:
+        q = "Under heads:\n1. Visits\n2. visits\n3. Operations"
+        out = entity_extractor.extract_subtopics_regex(q)
+        assert out == ["Visits", "Operations"]
+
+
+class TestExtractSubtopicsCompose:
+    """Composition with QU LLM — same shape as extract_entities."""
+
+    def test_qu_subtopics_preferred_when_present(self) -> None:
+        class FakeQU:
+            subtopics = ["visits", "operations", "construction"]
+
+        out = entity_extractor.extract_subtopics(
+            "Give updates", qu_result=FakeQU(),
+        )
+        assert out == ["visits", "operations", "construction"]
+
+    def test_falls_back_to_regex_on_no_qu(self) -> None:
+        q = "Under heads:\n1. visits\n2. operations"
+        out = entity_extractor.extract_subtopics(q, qu_result=None)
+        assert out == ["visits", "operations"]
