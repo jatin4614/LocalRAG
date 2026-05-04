@@ -3690,22 +3690,14 @@ docker compose -p orgchat exec -T open-webui curl -s -X PATCH \
 
 Expected: response shows `"subtopic_decompose": true`.
 
-- [ ] **Step 3: Add the env-side flag flip**
+- [ ] **Step 3: Enable RAG_SUBTOPIC_DECOMPOSE at the env layer**
 
-Append `RAG_SUBTOPIC_DECOMPOSE=1` to `compose/.env`:
+The compose mapping for `RAG_SUBTOPIC_DECOMPOSE` ships with the multi-entity-elaborate-answers feature branch (see commit history) — no manual YAML edit required. Just append the env override to compose/.env:
 
 ```bash
 grep -q "^RAG_SUBTOPIC_DECOMPOSE=" /home/vogic/LocalRAG/compose/.env || \
   echo "RAG_SUBTOPIC_DECOMPOSE=1" >> /home/vogic/LocalRAG/compose/.env
 ```
-
-Add the explicit env mapping under `open-webui` and `celery-worker` in `compose/docker-compose.yml`. Open the YAML and find the line `RAG_MULTI_ENTITY_DECOMPOSE: ${RAG_MULTI_ENTITY_DECOMPOSE:-0}`. Insert immediately after it:
-
-```yaml
-      RAG_SUBTOPIC_DECOMPOSE: ${RAG_SUBTOPIC_DECOMPOSE:-0}
-```
-
-Repeat the same insertion in the celery-worker `environment:` block (find the same `RAG_MULTI_ENTITY_DECOMPOSE` anchor — celery-worker has its own copy of the env block).
 
 Recreate the services + verify:
 

@@ -383,3 +383,30 @@ class TestMergeWithTwoAxisQuota:
         # 5 PoK should have ≥3 of its 4 ops chunks (5,6,7,8)
         pok_ids = [i for i in ids if i in (5, 6, 7, 8)]
         assert len(pok_ids) >= 3
+
+    def test_leftover_cell_does_not_inflate_floors(self) -> None:
+        """The __leftover__ synthetic cell from _apply_two_axis_quota
+        should NOT consume entity/subtopic-floor quota slots — leftover
+        hits should only enter via the top-up pass."""
+        per_cell = {
+            ("A", "x"): [_FakeHit(id=1, score=0.9), _FakeHit(id=2, score=0.8)],
+            # Leftover hits — would have inflated floor recovery before fix
+            ("__leftover__", "__leftover__"): [
+                _FakeHit(id=10, score=0.5), _FakeHit(id=11, score=0.4),
+                _FakeHit(id=12, score=0.3),
+            ],
+        }
+        out = multi_query.merge_with_two_axis_quota(
+            per_cell_hits=per_cell,
+            k_min_per_cell=1,
+            k_min_per_entity=2,
+            k_min_per_subtopic=2,
+            k_total=4,
+        )
+        ids = [h.id for h in out]
+        # All 4 final slots: A's 2 hits (cell-quota + entity-floor satisfied
+        # without pulling __leftover__) + 2 leftover via top-up.
+        # The fix ensures __leftover__ is NOT treated as a real entity that
+        # demands its own k_min_per_entity quota.
+        assert 1 in ids and 2 in ids
+        assert len(ids) == 4

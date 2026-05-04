@@ -256,6 +256,12 @@ _KEY_TO_ENV: dict[str, str] = {
     "multi_entity_rerank_floor": "RAG_MULTI_ENTITY_RERANK_FLOOR",
     # 2026-05-03 — Phase 2 / Item 4. entity_text_filter mode toggle.
     "entity_text_filter_mode": "RAG_ENTITY_TEXT_FILTER_MODE",
+    # 2026-05-04 — Phase 3 / item 5 of multi-entity-elaborate-answers spec.
+    # Without this entry, a per-KB JSONB stamp would validate and persist
+    # but config_to_env_overrides would silently drop it, so flags.get
+    # at the bridge's _run_pipeline read site would never see the per-KB
+    # value. Same defect class as multi_entity_rerank_floor (review of 53d7094).
+    "subtopic_decompose": "RAG_SUBTOPIC_DECOMPOSE",
     # The QU LLM flags (RAG_QU_*) are cluster-wide and not exposed as
     # per-KB rag_config keys.
 }
@@ -385,9 +391,11 @@ def validate_config(raw: Mapping[str, Any]) -> dict[str, Any]:
             ok = True
             for k_inner, v_inner in value.items():
                 if not isinstance(k_inner, str):
-                    ok = False; break
+                    ok = False
+                    break
                 if not isinstance(v_inner, list):
-                    ok = False; break
+                    ok = False
+                    break
                 cleaned_list = [
                     item for item in v_inner if isinstance(item, str) and item.strip()
                 ]

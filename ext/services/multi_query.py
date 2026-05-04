@@ -258,7 +258,11 @@ def merge_with_two_axis_quota(
             _take(h)
 
     # Step 2 — entity-floor recovery
-    entities = sorted({e for (e, _) in bucket.keys()})
+    # Filter out the __leftover__ synthetic cell — it's not a real entity.
+    # Leftover hits flow through the top-up pass (step 4) instead.
+    entities = sorted({
+        e for (e, _) in bucket.keys() if e != "__leftover__"
+    })
     for entity in entities:
         # Count current selection for this entity
         ent_selected = [
@@ -282,7 +286,9 @@ def merge_with_two_axis_quota(
             _take(h)
 
     # Step 3 — subtopic-floor recovery (mirror of step 2)
-    subtopics = sorted({s for (_, s) in bucket.keys()})
+    subtopics = sorted({
+        s for (_, s) in bucket.keys() if s != "__leftover__"
+    })
     for subtopic in subtopics:
         sub_selected = [
             h for h in selected

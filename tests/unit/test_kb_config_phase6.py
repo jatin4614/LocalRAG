@@ -206,6 +206,14 @@ class TestSubtopicDecompose:
             {"subtopic_decompose": False}
         ) == {"subtopic_decompose": False}
 
+    def test_emits_subtopic_decompose_env(self) -> None:
+        """Per-KB stamp must round-trip through config_to_env_overrides
+        so flags.get sees it at the bridge read site. Without this the
+        per-KB override is silently dropped."""
+        from ext.services import kb_config
+        env = kb_config.config_to_env_overrides({"subtopic_decompose": True})
+        assert env == {"RAG_SUBTOPIC_DECOMPOSE": "1"}
+
 
 class TestSubtopicKeywords:
     """Phase 3 / item 5 — per-KB subtopic-keywords table."""

@@ -637,6 +637,12 @@ services:
       # All default OFF — opt in per KB via Advanced Settings, or
       # globally via these env vars. See .env.example for usage notes.
       RAG_MULTI_ENTITY_DECOMPOSE: ${RAG_MULTI_ENTITY_DECOMPOSE:-0}
+      # 2026-05-04 — Phase 3 / item 5 of multi-entity-elaborate-answers spec.
+      # Master gate for two-axis decompose. When 1, the bridge extracts
+      # subtopics alongside entities and (when ≥2 of each) fans out N×M
+      # sub-queries with two-axis quotas. Default 0 = byte-identical to
+      # single-axis behaviour.
+      RAG_SUBTOPIC_DECOMPOSE: ${RAG_SUBTOPIC_DECOMPOSE:-0}
       RAG_ENTITY_TEXT_FILTER: ${RAG_ENTITY_TEXT_FILTER:-0}
       RAG_QU_ENTITY_EXTRACT: ${RAG_QU_ENTITY_EXTRACT:-0}
       RAG_MULTI_ENTITY_MIN_PER_ENTITY: ${RAG_MULTI_ENTITY_MIN_PER_ENTITY:-10}
@@ -866,6 +872,12 @@ services:
       # Worker reads this for any retrieval path it uses (eval scheduler).
       # Default 12 — see open-webui block above for the 128K context note.
       RAG_MULTI_ENTITY_RERANK_FLOOR: ${RAG_MULTI_ENTITY_RERANK_FLOOR:-12}
+      # 2026-05-04 — Phase 3 / item 5 of multi-entity-elaborate-answers spec.
+      # Master gate for two-axis decompose. Mapped here for parity with
+      # the open-webui block — any retrieval path the worker invokes
+      # (eval scheduler, smoke harness) reads it via flags.get.
+      # Default 0 = byte-identical to single-axis behaviour.
+      RAG_SUBTOPIC_DECOMPOSE: ${RAG_SUBTOPIC_DECOMPOSE:-0}
       # The worker also runs ingest_bytes() and writes the doc-summary
       # tier; both sides need the same flag + chat-model URL/key/timeout.
       RAG_DOC_SUMMARIES: ${RAG_DOC_SUMMARIES:-1}
