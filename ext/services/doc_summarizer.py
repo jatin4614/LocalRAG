@@ -30,18 +30,23 @@ log = logging.getLogger("orgchat.doc_summarizer")
 
 
 # Approx token budget for the body we feed the summarizer. ~4 chars/token
-# → ~4000 tokens ≈ 16000 chars. We truncate by character count to avoid
+# → ~32000 chars ≈ 8000 tokens. We truncate by character count to avoid
 # pulling a tokenizer dep into the hot path; the model can handle slight
-# over/under.
-_MAX_BODY_CHARS = 16000
+# over/under. Bumped 16000 -> 32000 on 2026-05-04 (Phase 2 of the
+# multi-entity-elaborate-answers spec) so the entity-coverage prompt
+# sees enough body to enumerate every named formation.
+_MAX_BODY_CHARS = 32000
 
-_SUMMARY_PROMPT = """Summarize the following document in 3 sentences. Include the document name, top-line content, and dates/entities/identifiers a reader would need to know. Write as a single paragraph of plain prose — no bullets, no preamble.
+_SUMMARY_PROMPT = """Summarize this document for retrieval. Output two sections, no preamble:
+
+ENTITIES: A comma-separated list of every named formation, brigade, battalion, regiment, or unit that appears at least twice in the document. Use the canonical name as it first appears. If fewer than two distinct named formations are present, list whatever named formations exist (or write "none" if there are none).
+
+SUMMARY: A 5-7 sentence paragraph covering: document name, reporting period, every named entity from the ENTITIES list (one clause per entity naming what activities they were involved in), and any cross-cutting themes (training, construction, intel, etc.) that appear across multiple entities. Do NOT favour the most-mentioned entity over others — every ENTITIES-list member must be named in the SUMMARY.
 
 Document: {filename}
 
 {body}
-
-Summary:"""
+"""
 
 
 async def summarize_document(
@@ -178,4 +183,59 @@ async def _summarize_impl(
     return summary
 
 
-__all__ = ["summarize_document"]
+def parse_structured_summary(raw: str) -> dict[str, list[str] | str]:
+    """Parse the chat-LLM ENTITIES + SUMMARY response.
+
+    Returns ``{"entities": [...], "summary": "..."}``. Fail-soft: if a
+    section is missing, returns an empty list / empty string for that
+    section but keeps whatever was parseable. Empty input returns the
+    fully-empty shape.
+
+    Entity dedup is case-insensitive, preserving the first surface form
+    (matches ``entity_extractor._dedupe_preserve_first``).
+    """
+    if not raw:
+        return {"entities": [], "summary": ""}
+
+    raw = raw.strip()
+    entities_part = ""
+    summary_part = ""
+
+    # Find ENTITIES: marker (case-insensitive)
+    import re
+    ent_match = re.search(r"\bENTITIES\s*:\s*", raw, re.IGNORECASE)
+    sum_match = re.search(r"\bSUMMARY\s*:\s*", raw, re.IGNORECASE)
+
+    if ent_match and sum_match:
+        # Both present — split on the SUMMARY marker
+        entities_part = raw[ent_match.end():sum_match.start()].strip()
+        summary_part = raw[sum_match.end():].strip()
+    elif ent_match:
+        # Only ENTITIES — take everything after the marker
+        entities_part = raw[ent_match.end():].strip()
+    elif sum_match:
+        # Only SUMMARY
+        summary_part = raw[sum_match.end():].strip()
+    else:
+        # Neither marker — treat the whole thing as a summary (legacy shape)
+        summary_part = raw
+
+    # Parse entities list — comma-separated, dedupe case-insensitively
+    if entities_part and entities_part.lower() != "none":
+        seen_lower: set[str] = set()
+        entities: list[str] = []
+        for e in entities_part.split(","):
+            e_clean = e.strip()
+            if not e_clean:
+                continue
+            if e_clean.lower() in seen_lower:
+                continue
+            seen_lower.add(e_clean.lower())
+            entities.append(e_clean)
+    else:
+        entities = []
+
+    return {"entities": entities, "summary": summary_part}
+
+
+__all__ = ["summarize_document", "parse_structured_summary"]
