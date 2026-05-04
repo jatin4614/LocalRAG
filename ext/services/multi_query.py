@@ -100,6 +100,29 @@ def build_sub_queries(
     return [(e, f"{base} (focus on {e})") for e in entities]
 
 
+def build_sub_queries_two_axis(
+    query: str,
+    entities: Sequence[str],
+    subtopics: Sequence[str],
+) -> list[tuple[str, str, str]]:
+    """Return ``[(entity, subtopic, sub_query), ...]`` one per cell.
+
+    For each (entity, subtopic) pair, build a focus-suffixed sub-query.
+    Order is entity-major, subtopic-minor (so all of A's subtopics come
+    before B's). Empty entity OR empty subtopic list yields ``[]``.
+
+    Suffix format: ``"<original> (focus on <entity> — <subtopic>)"``.
+    """
+    if not entities or not subtopics:
+        return []
+    base = (query or "").strip() or "(no query)"
+    return [
+        (e, s, f"{base} (focus on {e} — {s})")
+        for e in entities
+        for s in subtopics
+    ]
+
+
 def merge_with_quota(
     *,
     per_entity_hits: dict[str, list[Any]],
@@ -175,5 +198,6 @@ def merge_with_quota(
 __all__ = [
     "should_decompose",
     "build_sub_queries",
+    "build_sub_queries_two_axis",
     "merge_with_quota",
 ]

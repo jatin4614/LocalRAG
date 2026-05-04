@@ -269,3 +269,35 @@ class TestShouldDecomposeTwoAxis:
             flag_on=False, intent="specific",
         )
         assert (mode, on) == ("none", False)
+
+
+class TestBuildSubQueriesTwoAxis:
+    def test_n_x_m_pairs(self) -> None:
+        out = multi_query.build_sub_queries_two_axis(
+            "Give all updates",
+            entities=["A", "B"],
+            subtopics=["visits", "ops"],
+        )
+        assert len(out) == 4
+        assert out[0] == ("A", "visits", "Give all updates (focus on A — visits)")
+        assert out[1] == ("A", "ops", "Give all updates (focus on A — ops)")
+        assert out[2] == ("B", "visits", "Give all updates (focus on B — visits)")
+        assert out[3] == ("B", "ops", "Give all updates (focus on B — ops)")
+
+    def test_empty_entities_returns_empty(self) -> None:
+        assert multi_query.build_sub_queries_two_axis(
+            "x", entities=[], subtopics=["a", "b"],
+        ) == []
+
+    def test_empty_subtopics_returns_empty(self) -> None:
+        # Two-axis function rejects subtopics=[]; caller should fall back
+        # to the single-axis build_sub_queries
+        assert multi_query.build_sub_queries_two_axis(
+            "x", entities=["A", "B"], subtopics=[],
+        ) == []
+
+    def test_blank_query_uses_placeholder(self) -> None:
+        out = multi_query.build_sub_queries_two_axis(
+            "", entities=["A"], subtopics=["x"],
+        )
+        assert out == [("A", "x", "(no query) (focus on A — x)")]
