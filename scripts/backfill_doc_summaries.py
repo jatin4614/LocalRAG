@@ -168,7 +168,7 @@ async def _summarize_one(
         if not chunks:
             return "empty", 0
 
-        summary = await summarize_document(
+        summary_dict = await summarize_document(
             chunks=chunks,
             filename=filename,
             chat_url=chat_url,
@@ -176,10 +176,25 @@ async def _summarize_one(
             api_key=api_key,
             timeout=float(os.environ.get("RAG_DOC_SUMMARY_TIMEOUT", "30.0")),
         )
-        if not summary:
+        # Phase 2 / item 4 — summarize_document returns
+        # ``{entities: [...], summary: "..."}``. Empty summary still
+        # implies no point.
+        if not summary_dict["summary"]:
             return "empty", 0
         if not apply:
-            return "ok", len(summary)
+            return "ok", len(summary_dict["summary"])
+
+        # Compose the text field as ENTITIES + SUMMARY so the dense
+        # retriever sees both signals. Mirrors ingest._emit_doc_summary_point
+        # so re-running the backfill produces an identical Qdrant point.
+        entities = summary_dict["entities"] or []
+        summary_text = summary_dict["summary"]
+        if entities:
+            text_field = (
+                f"ENTITIES: {', '.join(entities)}\n\nSUMMARY: {summary_text}"
+            )
+        else:
+            text_field = summary_text
 
         # Fetch the payload template (owner_user_id + subtag_id) from one
         # chunk so the summary point carries identical tenant tags.
@@ -190,7 +205,7 @@ async def _summarize_one(
             return "error", 0
 
         try:
-            [vec] = await embedder.embed([summary])
+            [vec] = await embedder.embed([text_field])
         except Exception as e:
             print(f"  [doc_id={doc_id}] embed failed: {e}", file=sys.stderr)
             return "error", 0
@@ -199,11 +214,12 @@ async def _summarize_one(
         # collection's named-vector form. Without a sparse companion,
         # VectorStore.upsert falls through to the legacy single-unnamed-vector
         # path which Qdrant rejects on hybrid-shaped collections
-        # ("Not existing vector name").
+        # ("Not existing vector name"). Embed the same combined text so
+        # BM25 indexes the entity-list tokens too.
         sparse_vec: Optional[tuple[list[int], list[float]]] = None
         try:
             from ext.services.sparse_embedder import embed_sparse
-            [sparse_vec] = list(embed_sparse([summary]))
+            [sparse_vec] = list(embed_sparse([text_field]))
         except Exception as e:
             print(f"  [doc_id={doc_id}] sparse-embed skipped: {e}", file=sys.stderr)
 
@@ -211,7 +227,8 @@ async def _summarize_one(
         summary_payload = dict(payload_base)
         summary_payload.update({
             "chunk_index": -1,
-            "text": summary,
+            "text": text_field,
+            "entities": entities,  # NEW — Phase 2 payload field
             "filename": filename,
             "uploaded_at": _time.time_ns(),
             "deleted": False,
@@ -245,13 +262,16 @@ async def _summarize_one(
             print(f"  [doc_id={doc_id}] upsert failed: {e}", file=sys.stderr)
             return "error", 0
 
+        # Postgres mirror — persist the summary prose only (entities are
+        # reconstructable from the Qdrant payload; the doc_summary
+        # column stays human-readable for UI previews).
         try:
             async with sessionmaker() as s:
                 await s.execute(
                     _sql_text(
                         "UPDATE kb_documents SET doc_summary = :s WHERE id = :d"
                     ),
-                    {"s": summary, "d": doc_id},
+                    {"s": summary_text, "d": doc_id},
                 )
                 await s.commit()
         except Exception as e:
@@ -259,7 +279,7 @@ async def _summarize_one(
                   file=sys.stderr)
             return "error", 0
 
-        return "ok", len(summary)
+        return "ok", len(summary_text)
 
 
 async def _payload_base_from_chunk(vs, collection: str, doc_id: int, kb_id: int) -> dict:

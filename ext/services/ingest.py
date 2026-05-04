@@ -17,6 +17,7 @@ from typing import Mapping
 
 from . import flags
 from .chunker import chunk_text
+from .doc_summarizer import summarize_document
 from .embedder import Embedder
 from .extractor import extract
 from .kb_config import get_chunking_strategy
@@ -1012,30 +1013,70 @@ async def ingest_bytes(
     # Tier 1: per-document summary point.
     # Gated by RAG_DOC_SUMMARIES (default OFF). When ON and we have a
     # doc_id (KB uploads — not ephemeral chat uploads), call the chat
-    # model to produce a 3-sentence summary, embed it, and upsert one
-    # more point into the same collection with level="doc". Also mirror
-    # the summary into kb_documents.doc_summary so it's queryable from
-    # Postgres (UI "what does this doc cover?" previews).
+    # model to produce a structured ENTITIES + SUMMARY response, embed
+    # the combined text, and upsert one more point into the same
+    # collection with level="doc". Also mirror the summary prose into
+    # kb_documents.doc_summary so it's queryable from Postgres
+    # (UI "what does this doc cover?" previews).
     #
     # Fail-open at every step: a failed summary never blocks the
-    # chunk-level ingest (which already succeeded above). Default path
-    # (flag off) does not import doc_summarizer — zero cost.
+    # chunk-level ingest (which already succeeded above).
     if flags.get("RAG_DOC_SUMMARIES", "0") == "1" and doc_id is not None and texts:
         try:
-            await _emit_doc_summary_point(
-                chunks_texts=texts,
-                filename=filename,
-                doc_id=int(doc_id),
-                payload_base=payload_base,
-                collection=collection,
-                vector_store=vector_store,
-                embedder=embedder,
-                pipeline_version=pv,
-                now_ns=now,
-            )
+            chat_url = os.environ.get("OPENAI_API_BASE_URL")
+            if chat_url:
+                chat_model = os.environ.get(
+                    "SUMMARY_MODEL",
+                    os.environ.get("CHAT_MODEL", "orgchat-chat"),
+                )
+                api_key = os.environ.get("OPENAI_API_KEY")
+                pb_kb_id = payload_base.get("kb_id")  # type: ignore[union-attr]
+                pb_subtag_id = payload_base.get("subtag_id")  # type: ignore[union-attr]
+                summary_dict = await _emit_doc_summary_point(
+                    kb_id=int(pb_kb_id) if pb_kb_id is not None else None,
+                    doc_id=int(doc_id),
+                    subtag_id=int(pb_subtag_id) if pb_subtag_id is not None else None,
+                    filename=filename,
+                    chunk_texts=texts,
+                    chat_url=chat_url,
+                    chat_model=chat_model,
+                    api_key=api_key,
+                    vector_store=vector_store,
+                    embedder=embedder,
+                    payload_base=payload_base,
+                    collection=collection,
+                    pipeline_version=pv,
+                    now_ns=now,
+                )
+                # Postgres mirror — best-effort. Persists the summary
+                # prose only (entities are reconstructable from the
+                # Qdrant payload; the doc_summary column stays
+                # human-readable for UI previews).
+                if summary_dict and summary_dict.get("summary"):
+                    try:
+                        from .chat_rag_bridge import _sessionmaker as _sm
+                        if _sm is not None:
+                            from sqlalchemy import text as _sql_text
+                            async with _sm() as s:
+                                await s.execute(
+                                    _sql_text(
+                                        "UPDATE kb_documents SET doc_summary = :s "
+                                        "WHERE id = :d"
+                                    ),
+                                    {"s": summary_dict["summary"], "d": int(doc_id)},
+                                )
+                                await s.commit()
+                    except Exception as _mirror_e:  # noqa: BLE001
+                        log.warning(
+                            "kb_documents.doc_summary mirror failed doc_id=%s: %s",
+                            doc_id, _mirror_e,
+                        )
+            else:
+                log.debug(
+                    "RAG_DOC_SUMMARIES=1 but OPENAI_API_BASE_URL unset — skipping"
+                )
         except Exception as e:  # noqa: BLE001 — best-effort
-            import logging as _log
-            _log.getLogger("orgchat.ingest").warning(
+            log.warning(
                 "doc summary emit failed for doc_id=%s: %s", doc_id, e
             )
 
@@ -1044,67 +1085,131 @@ async def ingest_bytes(
 
 async def _emit_doc_summary_point(
     *,
-    chunks_texts: list[str],
-    filename: str,
+    kb_id: int | None,
     doc_id: int,
-    payload_base: Mapping[str, int | str],
-    collection: str,
+    subtag_id: int | None = None,
+    filename: str,
+    chunk_texts: list[str],
+    chat_url: str,
+    chat_model: str,
+    api_key: str | None = None,
     vector_store: VectorStore,
     embedder: Embedder,
-    pipeline_version: str,
-    now_ns: int,
-) -> None:
-    """Summarize a doc, embed the summary, and upsert one Qdrant point.
+    payload_base: Mapping[str, int | str] | None = None,
+    collection: str | None = None,
+    pipeline_version: str | None = None,
+    now_ns: int | None = None,
+) -> dict[str, list[str] | str]:
+    """Summarize a doc, embed the combined ENTITIES + SUMMARY text, and
+    upsert one ``level="doc"`` Qdrant point.
 
-    Also UPDATEs ``kb_documents.doc_summary`` so the text is queryable
-    from Postgres (no Qdrant round-trip needed for UI previews).
+    Phase 2 / item 4 of the 2026-05-04 multi-entity-elaborate-answers
+    spec. Consumes the structured ``{entities, summary}`` return from
+    ``summarize_document`` and stamps both:
 
-    Fail-open at every boundary: caller wraps in try/except and logs.
-    The chunk-level ingest has already succeeded so any failure here
-    leaves the system in a consistent state (document indexed at the
-    chunk tier; summary tier simply absent until the backfill script
-    fills it in later).
+      * ``payload["text"]`` — combined ``"ENTITIES: e1, e2, ...\\n\\n
+        SUMMARY: ..."`` (or just the summary when entities is empty)
+        so the dense retriever sees both signals.
+      * ``payload["entities"]`` — the canonical list, queryable as a
+        Qdrant payload field.
+
+    Returns the structured summary dict so the caller can mirror
+    ``summary_dict["summary"]`` into ``kb_documents.doc_summary``. On
+    empty/error result, no Qdrant point is upserted and the empty-shape
+    dict (``{"entities": [], "summary": ""}``) is returned.
+
+    Fail-open at every boundary: ``ingest_bytes`` wraps the call in
+    try/except. The chunk-level ingest has already succeeded so any
+    failure here leaves the system in a consistent state (document
+    indexed at the chunk tier; summary tier simply absent until the
+    backfill script fills it in later).
+
+    Args:
+        kb_id: Knowledge-base id. ``None`` only for ephemeral chat
+            uploads (caller already gates that path off via
+            ``doc_id is not None`` so this is effectively required for
+            shared-KB ingest).
+        doc_id: ``kb_documents.id`` (postgres). Used to derive the
+            deterministic Qdrant point id.
+        subtag_id: optional ``kb_subtags.id`` carried into the point
+            payload for tenant-scoped queries.
+        filename: source filename, stamped onto the payload + included
+            in the LLM prompt.
+        chunk_texts: ordered list of chunk-body strings the summariser
+            joins as the LLM input.
+        chat_url, chat_model, api_key: OpenAI-compatible endpoint args
+            forwarded to ``summarize_document``.
+        vector_store, embedder: DI handles. The caller (``ingest_bytes``)
+            forwards the same instances it used for chunk-level upserts.
+        payload_base: optional template payload (kb_id / subtag_id /
+            owner_user_id / chat_id) — when provided, its tenancy keys
+            are inherited so the summary point matches chunk-tier
+            tenancy. When ``None`` we derive from ``kb_id`` / ``doc_id``
+            / ``subtag_id`` directly.
+        collection: optional override; defaults to ``f"kb_{kb_id}"``.
+        pipeline_version: stamped into ``payload["model_version"]``.
+            ``None`` falls through to the live ``current_version()``.
+        now_ns: stamped into ``payload["uploaded_at"]``. ``None``
+            uses ``time.time_ns()``.
     """
-    import logging as _log
-    import uuid as _uuid
-    log = _log.getLogger("orgchat.ingest")
-
-    from .doc_summarizer import summarize_document
-
-    chat_url = os.environ.get("OPENAI_API_BASE_URL")
-    if not chat_url:
-        log.debug("RAG_DOC_SUMMARIES=1 but OPENAI_API_BASE_URL unset — skipping")
-        return
-    chat_model = os.environ.get("SUMMARY_MODEL",
-                                os.environ.get("CHAT_MODEL", "orgchat-chat"))
-    api_key = os.environ.get("OPENAI_API_KEY")
-
-    summary = await summarize_document(
-        chunks=chunks_texts,
+    summary_dict = await summarize_document(
+        chunks=chunk_texts,
         filename=filename,
         chat_url=chat_url,
         chat_model=chat_model,
         api_key=api_key,
         timeout=float(os.environ.get("RAG_DOC_SUMMARY_TIMEOUT", "30.0")),
     )
-    if not summary:
+    if not summary_dict["summary"]:
+        # Fail-soft: no summary, no point. Caller decides whether to
+        # log; the existing pipeline already logs via the wrapping
+        # try/except in ingest_bytes.
         log.debug("empty summary for doc_id=%s — skipping summary point", doc_id)
-        return
+        return summary_dict
 
-    # Embed the summary as a single-element batch.
-    [summary_vec] = await embedder.embed([summary])
+    entities = summary_dict["entities"] or []
+    summary_text = summary_dict["summary"]
+    # Compose the text field as ENTITIES + SUMMARY so the dense
+    # retriever sees both signals. When entities is empty (single-
+    # entity docs, parser fallback), drop the marker prefix so the
+    # text field stays clean prose.
+    if entities:
+        text_field = (
+            f"ENTITIES: {', '.join(entities)}\n\nSUMMARY: {summary_text}"
+        )
+    else:
+        text_field = summary_text
 
-    summary_payload: dict = dict(payload_base)
-    # Wave 2 (review §2.8): doc-summary points have no logical "chunk_index"
-    # in the source — the legacy -1 magic value conflicted with `WHERE
-    # chunk_index >= 0` filters. The level="doc" + kind="doc_summary" fields
-    # below are the canonical discriminator. Setting None instead of -1.
-    # D-1's RRF dedup fix (commit 5b7ce80) handles None correctly.
+    # Embed the combined text as a single-element batch.
+    [summary_vec] = await embedder.embed([text_field])
+
+    # Inherit tenancy from the caller's payload_base when available.
+    summary_payload: dict = dict(payload_base) if payload_base else {}
+    # Identity fields — explicit args override payload_base inheritance
+    # so a caller can stamp a different doc_id / kb_id without rebuilding
+    # the template (parity with the legacy backfill caller).
+    if kb_id is not None:
+        summary_payload["kb_id"] = kb_id
+    summary_payload["doc_id"] = doc_id
+    if subtag_id is not None:
+        summary_payload["subtag_id"] = subtag_id
+
+    # Wave 2 (review §2.8): doc-summary points have no logical
+    # "chunk_index" in the source — the legacy -1 magic value conflicted
+    # with ``WHERE chunk_index >= 0`` filters. The level="doc" + kind=
+    # "doc_summary" fields below are the canonical discriminator. Setting
+    # None instead of -1. D-1's RRF dedup fix (commit 5b7ce80) handles
+    # None correctly.
     summary_payload["chunk_index"] = None
-    summary_payload["text"] = summary
-    summary_payload["uploaded_at"] = now_ns
+    summary_payload["text"] = text_field
+    summary_payload["entities"] = entities  # NEW — Phase 2 payload field
+    summary_payload["uploaded_at"] = (
+        now_ns if now_ns is not None else time.time_ns()
+    )
     summary_payload["deleted"] = False
-    summary_payload["model_version"] = pipeline_version
+    summary_payload["model_version"] = (
+        pipeline_version if pipeline_version is not None else current_version()
+    )
     summary_payload["level"] = "doc"
     summary_payload["kind"] = "doc_summary"
     summary_payload["filename"] = filename
@@ -1120,36 +1225,20 @@ async def _emit_doc_summary_point(
     # must include a 'shard_key'". Body sample reuses the first chunk
     # which mirrors what the chunk-side derivation does.
     if _sharding_enabled():
-        from .temporal_shard import extract_shard_key as _extract_sk
-        body_sample = chunks_texts[0] if chunks_texts else ""
-        _sk, _sk_origin = _extract_sk(filename=filename, body=body_sample)
+        body_sample = chunk_texts[0] if chunk_texts else ""
+        _sk, _sk_origin = extract_shard_key(filename=filename, body=body_sample)
         summary_payload["shard_key"] = _sk
         summary_payload["shard_key_origin"] = _sk_origin.value
 
-    point_id = str(_uuid.uuid5(_POINT_NS, f"doc:{doc_id}:doc_summary"))
+    point_id = str(uuid.uuid5(_POINT_NS, f"doc:{doc_id}:doc_summary"))
     point = {"id": point_id, "vector": summary_vec, "payload": summary_payload}
 
-    await vector_store.upsert(collection, [point])
+    target_collection = (
+        collection if collection is not None else f"kb_{kb_id}"
+    )
+    await vector_store.upsert(target_collection, [point])
 
-    # Mirror into Postgres. Import lazily — ingest.py doesn't currently
-    # depend on the chat_rag_bridge module registry, so we reach into its
-    # configured sessionmaker (set by ext.app.build_ext_routers at
-    # startup). If unset (unlikely in prod, possible in tests), skip the
-    # mirror silently — Qdrant is the retrieval source of truth.
-    try:
-        from .chat_rag_bridge import _sessionmaker as _sm
-        if _sm is not None:
-            from sqlalchemy import text as _sql_text
-            async with _sm() as s:
-                await s.execute(
-                    _sql_text(
-                        "UPDATE kb_documents SET doc_summary = :s WHERE id = :d"
-                    ),
-                    {"s": summary, "d": doc_id},
-                )
-                await s.commit()
-    except Exception as e:  # noqa: BLE001 — best-effort mirror
-        log.warning("kb_documents.doc_summary mirror failed doc_id=%s: %s", doc_id, e)
+    return summary_dict
 
 
 # ---------------------------------------------------------------------------
