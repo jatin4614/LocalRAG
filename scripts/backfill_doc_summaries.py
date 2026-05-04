@@ -10,7 +10,7 @@ For every document in the given KB that doesn't already have a
      chat model (bounded concurrency, default 4 in-flight).
   3. Embeds the summary through the TEI client.
   4. Upserts a single summary point into the same collection with
-     ``level="doc"``, ``kind="doc_summary"``, ``chunk_index=-1``.
+     ``level="doc"``, ``kind="doc_summary"``, ``chunk_index=None``.
   5. UPDATEs ``kb_documents.doc_summary`` so the text is queryable from
      Postgres.
 
@@ -226,7 +226,7 @@ async def _summarize_one(
         import time as _time
         summary_payload = dict(payload_base)
         summary_payload.update({
-            "chunk_index": -1,
+            "chunk_index": None,
             "text": text_field,
             "entities": entities,  # NEW — Phase 2 payload field
             "filename": filename,
