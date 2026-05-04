@@ -195,9 +195,133 @@ def merge_with_quota(
     return quota[:k_total]
 
 
+def merge_with_two_axis_quota(
+    *,
+    per_cell_hits: dict[tuple[str, str], list[Any]],
+    k_min_per_cell: int,
+    k_min_per_entity: int,
+    k_min_per_subtopic: int,
+    k_total: int,
+) -> list[Any]:
+    """Merge per-(entity, subtopic) hit lists with quotas at three levels.
+
+    Algorithm:
+      1. **Cell-quota pass.** For each (entity, subtopic) cell, take its
+         top ``k_min_per_cell`` hits in score-desc order.
+      2. **Entity-floor recovery.** For each entity, ensure its total
+         pool size is ≥ ``k_min_per_entity`` — if a cell was empty,
+         pull more from cells that did have hits for that entity.
+      3. **Subtopic-floor recovery.** Same for subtopics — if a subtopic
+         is under-represented, pull from any cell that had hits for it.
+      4. **Top-up pass.** Fill remaining slots up to ``k_total`` by
+         score-desc across deduped non-quota leftovers.
+      5. **Final sort + cap.** Sort by score desc, cap at ``k_total``.
+
+    Dedup is by ``hit.id``. When the same hit appears in multiple cells
+    (the same chunk semantically matched two sub-queries), the highest
+    score copy wins, then the algorithm above runs.
+
+    Hit shape contract: any object with ``.id`` and ``.score``
+    (matches ``merge_with_quota``).
+
+    Returns a flat list of hits, length ≤ ``k_total``.
+    """
+    # Step 0 — flatten + dedupe by id, keep highest score copy + remember
+    # which (entity, subtopic) cell first picked it.
+    best_for_id: dict[Any, tuple[Any, str, str]] = {}
+    for (entity, subtopic), hits in per_cell_hits.items():
+        for h in hits:
+            prev = best_for_id.get(h.id)
+            if prev is None or h.score > prev[0].score:
+                best_for_id[h.id] = (h, entity, subtopic)
+
+    # Rebuild bucket dict from deduped hits (cell-keyed)
+    bucket: dict[tuple[str, str], list[Any]] = {
+        k: [] for k in per_cell_hits.keys()
+    }
+    for hit, e, s in best_for_id.values():
+        bucket[(e, s)].append(hit)
+    for k in bucket:
+        bucket[k].sort(key=lambda h: h.score, reverse=True)
+
+    selected_ids: set = set()
+    selected: list[Any] = []
+
+    def _take(hit: Any) -> None:
+        if hit.id not in selected_ids:
+            selected_ids.add(hit.id)
+            selected.append(hit)
+
+    # Step 1 — cell-quota
+    for (e, s), hits in bucket.items():
+        for h in hits[:k_min_per_cell]:
+            _take(h)
+
+    # Step 2 — entity-floor recovery
+    entities = sorted({e for (e, _) in bucket.keys()})
+    for entity in entities:
+        # Count current selection for this entity
+        ent_selected = [
+            h for h in selected
+            if any(
+                h.id in {hh.id for hh in bucket.get((entity, s), [])}
+                for s in {ss for (ee, ss) in bucket.keys() if ee == entity}
+            )
+        ]
+        if len(ent_selected) >= k_min_per_entity:
+            continue
+        deficit = k_min_per_entity - len(ent_selected)
+        # Pull more from any cell of this entity, score-desc
+        candidates = []
+        for s in {ss for (ee, ss) in bucket.keys() if ee == entity}:
+            for h in bucket.get((entity, s), []):
+                if h.id not in selected_ids:
+                    candidates.append(h)
+        candidates.sort(key=lambda h: h.score, reverse=True)
+        for h in candidates[:deficit]:
+            _take(h)
+
+    # Step 3 — subtopic-floor recovery (mirror of step 2)
+    subtopics = sorted({s for (_, s) in bucket.keys()})
+    for subtopic in subtopics:
+        sub_selected = [
+            h for h in selected
+            if any(
+                h.id in {hh.id for hh in bucket.get((e, subtopic), [])}
+                for e in {ee for (ee, ss) in bucket.keys() if ss == subtopic}
+            )
+        ]
+        if len(sub_selected) >= k_min_per_subtopic:
+            continue
+        deficit = k_min_per_subtopic - len(sub_selected)
+        candidates = []
+        for e in {ee for (ee, ss) in bucket.keys() if ss == subtopic}:
+            for h in bucket.get((e, subtopic), []):
+                if h.id not in selected_ids:
+                    candidates.append(h)
+        candidates.sort(key=lambda h: h.score, reverse=True)
+        for h in candidates[:deficit]:
+            _take(h)
+
+    # Step 4 — top-up by score across remaining leftovers
+    if len(selected) < k_total:
+        leftover = [
+            h for hits in bucket.values() for h in hits
+            if h.id not in selected_ids
+        ]
+        leftover.sort(key=lambda h: h.score, reverse=True)
+        for h in leftover[: k_total - len(selected)]:
+            _take(h)
+
+    # Step 5 — final sort + cap
+    selected.sort(key=lambda h: h.score, reverse=True)
+    return selected[:k_total]
+
+
 __all__ = [
     "should_decompose",
     "build_sub_queries",
     "build_sub_queries_two_axis",
     "merge_with_quota",
+    "merge_with_two_axis_quota",
 ]

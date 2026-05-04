@@ -301,3 +301,85 @@ class TestBuildSubQueriesTwoAxis:
             "", entities=["A"], subtopics=["x"],
         )
         assert out == [("A", "x", "(no query) (focus on A — x)")]
+
+
+class TestMergeWithTwoAxisQuota:
+    def _hits(self, scores: list[tuple[str, str, int, float]]):
+        # (entity, subtopic, hit_id, score) -> {(e,s): [hit, ...]}
+        out: dict = {}
+        for e, s, hid, sc in scores:
+            out.setdefault((e, s), []).append(_FakeHit(id=hid, score=sc))
+        for k in out:
+            out[k].sort(key=lambda h: h.score, reverse=True)
+        return out
+
+    def test_cell_floor_satisfied(self) -> None:
+        per_cell = self._hits([
+            ("A", "x", 1, 1.0), ("A", "x", 2, 0.9),
+            ("A", "y", 3, 0.8), ("A", "y", 4, 0.7),
+            ("B", "x", 5, 0.6), ("B", "x", 6, 0.5),
+            ("B", "y", 7, 0.4), ("B", "y", 8, 0.3),
+        ])
+        out = multi_query.merge_with_two_axis_quota(
+            per_cell_hits=per_cell,
+            k_min_per_cell=1,
+            k_min_per_entity=2,
+            k_min_per_subtopic=2,
+            k_total=8,
+        )
+        ids = [h.id for h in out]
+        # Each cell got at least 1 hit; final sorted by score desc
+        assert ids == [1, 2, 3, 4, 5, 6, 7, 8]
+
+    def test_dedupe_by_id(self) -> None:
+        # Same hit appearing in two cells should appear once in output
+        h = _FakeHit(id=99, score=1.0)
+        per_cell = {
+            ("A", "x"): [h],
+            ("A", "y"): [h],
+            ("B", "x"): [_FakeHit(id=2, score=0.5)],
+            ("B", "y"): [_FakeHit(id=3, score=0.4)],
+        }
+        out = multi_query.merge_with_two_axis_quota(
+            per_cell_hits=per_cell,
+            k_min_per_cell=1, k_min_per_entity=1,
+            k_min_per_subtopic=1, k_total=4,
+        )
+        ids = [h.id for h in out]
+        assert ids.count(99) == 1
+
+    def test_total_cap_respected(self) -> None:
+        per_cell = self._hits([
+            ("A", "x", i, 1.0 - i * 0.01) for i in range(20)
+        ])
+        out = multi_query.merge_with_two_axis_quota(
+            per_cell_hits=per_cell,
+            k_min_per_cell=2,
+            k_min_per_entity=2,
+            k_min_per_subtopic=2,
+            k_total=5,
+        )
+        assert len(out) == 5
+
+    def test_entity_floor_recovery_when_cell_empty(self) -> None:
+        # 5 PoK x visits has 0 hits but 5 PoK x ops has plenty.
+        # Entity-floor recovery pulls extra ops chunks so the per-entity
+        # floor is met.
+        per_cell = self._hits([
+            ("75 Inf", "visits", 1, 0.9), ("75 Inf", "visits", 2, 0.8),
+            ("75 Inf", "ops",    3, 0.7), ("75 Inf", "ops",    4, 0.6),
+            # 5 PoK has 0 visits but 4 ops:
+            ("5 PoK", "ops",     5, 0.5), ("5 PoK", "ops",     6, 0.4),
+            ("5 PoK", "ops",     7, 0.3), ("5 PoK", "ops",     8, 0.2),
+        ])
+        out = multi_query.merge_with_two_axis_quota(
+            per_cell_hits=per_cell,
+            k_min_per_cell=1,
+            k_min_per_entity=3,    # 5 PoK must end up with ≥3 chunks
+            k_min_per_subtopic=2,
+            k_total=10,
+        )
+        ids = [h.id for h in out]
+        # 5 PoK should have ≥3 of its 4 ops chunks (5,6,7,8)
+        pok_ids = [i for i in ids if i in (5, 6, 7, 8)]
+        assert len(pok_ids) >= 3
