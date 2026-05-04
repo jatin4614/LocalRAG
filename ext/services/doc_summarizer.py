@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Optional
 
 import httpx
@@ -202,7 +203,6 @@ def parse_structured_summary(raw: str) -> dict[str, list[str] | str]:
     summary_part = ""
 
     # Find ENTITIES: marker (case-insensitive)
-    import re
     ent_match = re.search(r"\bENTITIES\s*:\s*", raw, re.IGNORECASE)
     sum_match = re.search(r"\bSUMMARY\s*:\s*", raw, re.IGNORECASE)
 

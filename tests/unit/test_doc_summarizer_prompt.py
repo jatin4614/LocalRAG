@@ -71,3 +71,20 @@ class TestParseStructuredOutput:
         out = doc_summarizer.parse_structured_summary(raw)
         # First-surface-form wins — same convention as entity_extractor
         assert out["entities"] == ["A", "B"]
+
+    def test_legacy_unmarked_treated_as_summary(self) -> None:
+        """When neither ENTITIES: nor SUMMARY: marker is present, treat
+        the whole input as the summary text. This is the legacy fallthrough
+        path for pre-Phase-2 chat-LLM responses."""
+        raw = "Just three sentences. With no headers. Pre-Phase-2 shape."
+        out = doc_summarizer.parse_structured_summary(raw)
+        assert out["entities"] == []
+        assert out["summary"] == raw
+
+    def test_entities_none_literal_returns_empty_list(self) -> None:
+        """The prompt allows "ENTITIES: none" when no qualifying formations
+        appear. Parser must return an empty list, not the literal string."""
+        raw = "ENTITIES: none\n\nSUMMARY: brief text"
+        out = doc_summarizer.parse_structured_summary(raw)
+        assert out["entities"] == []
+        assert out["summary"] == "brief text"
