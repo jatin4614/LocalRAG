@@ -147,6 +147,27 @@ def test_wipe_deletes_qdrant_collections_and_postgres_rows(
 
     asyncio.run(setup_fake_kb())
 
+    async def setup_qdrant_collection(qdrant_url: str, qdrant_key: str) -> None:
+        import httpx
+        headers = {"api-key": qdrant_key} if qdrant_key else {}
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # Idempotent — delete any leftover from prior failed runs
+            await client.delete(
+                f"{qdrant_url}/collections/kb_99_v1", headers=headers
+            )
+            # Create with minimal vector config (2-dim cosine — enough to satisfy
+            # Qdrant; we never insert points)
+            r = await client.put(
+                f"{qdrant_url}/collections/kb_99_v1",
+                headers={**headers, "Content-Type": "application/json"},
+                json={"vectors": {"size": 2, "distance": "Cosine"}},
+            )
+            r.raise_for_status()
+
+    qdrant_url = env.get("QDRANT_URL", "http://localhost:6333")
+    qdrant_key = env.get("QDRANT_API_KEY", "")
+    asyncio.run(setup_qdrant_collection(qdrant_url, qdrant_key))
+
     backup_dir = tmp_path / "kb99_backup"
     result = subprocess.run(
         [
@@ -177,6 +198,19 @@ def test_wipe_deletes_qdrant_collections_and_postgres_rows(
         return n
     assert asyncio.run(check_pg()) == 0
 
+    # Qdrant collection gone
+    async def check_qdrant(qdrant_url: str, qdrant_key: str) -> bool:
+        import httpx
+        headers = {"api-key": qdrant_key} if qdrant_key else {}
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.get(f"{qdrant_url}/collections", headers=headers)
+            r.raise_for_status()
+            names = [c["name"] for c in r.json()["result"]["collections"]]
+            return "kb_99_v1" in names
+
+    assert asyncio.run(check_qdrant(qdrant_url, qdrant_key)) is False, \
+        "kb_99_v1 should have been deleted by the wipe"
+
     # rag_config preserved (the script re-stamps it from the backup)
     async def check_kb() -> dict:
         url = env.get("DATABASE_URL", os.environ.get("DATABASE_URL", ""))
@@ -205,3 +239,13 @@ def test_wipe_deletes_qdrant_collections_and_postgres_rows(
         finally:
             await conn.close()
     asyncio.run(teardown())
+
+    async def teardown_qdrant(qdrant_url: str, qdrant_key: str) -> None:
+        import httpx
+        headers = {"api-key": qdrant_key} if qdrant_key else {}
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # Idempotent — 404 is fine; the wipe should have deleted it already
+            await client.delete(
+                f"{qdrant_url}/collections/kb_99_v1", headers=headers
+            )
+    asyncio.run(teardown_qdrant(qdrant_url, qdrant_key))

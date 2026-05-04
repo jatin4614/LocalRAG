@@ -120,6 +120,14 @@ async def _qdrant_delete_kb_collections(kb_id: int) -> list[str]:
             )
             if resp.status_code in (200, 404):
                 deleted.append(name)
+            else:
+                # Loud failure — half-deleted Qdrant state is worse than no-op.
+                # The operator can re-run the script after fixing the auth /
+                # network issue; both phases are idempotent.
+                raise RuntimeError(
+                    f"Qdrant DELETE /collections/{name} failed: "
+                    f"{resp.status_code} {resp.text[:200]}"
+                )
         return deleted
 
 
@@ -127,16 +135,17 @@ async def _postgres_wipe(kb_id: int, restore_rag_config: dict) -> None:
     """DELETE kb_documents rows; preserve knowledge_bases.rag_config."""
     conn = await _conn()
     try:
-        # Hard-delete docs (FK cascades chunk-level rows in any audit table
-        # if those exist; they don't today but the wipe is meant to be
-        # destructive).
-        await conn.execute("DELETE FROM kb_documents WHERE kb_id = $1", kb_id)
-        # Re-stamp rag_config from the backup so chunker/floor settings
-        # survive the wipe.
-        await conn.execute(
-            "UPDATE knowledge_bases SET rag_config = $1::jsonb WHERE id = $2",
-            json.dumps(restore_rag_config), kb_id,
-        )
+        async with conn.transaction():
+            # Hard-delete docs (FK cascades chunk-level rows in any audit table
+            # if those exist; they don't today but the wipe is meant to be
+            # destructive).
+            await conn.execute("DELETE FROM kb_documents WHERE kb_id = $1", kb_id)
+            # Re-stamp rag_config from the backup so chunker/floor settings
+            # survive the wipe.
+            await conn.execute(
+                "UPDATE knowledge_bases SET rag_config = $1::jsonb WHERE id = $2",
+                json.dumps(restore_rag_config), kb_id,
+            )
     finally:
         await conn.close()
 
