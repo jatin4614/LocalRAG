@@ -144,6 +144,11 @@ VALID_INT_KEYS = frozenset({
     # its hits, whichever is fewer). Default 10. Bounds [1, 50] —
     # higher than 50 starts crowding out single-entity recall.
     "multi_entity_min_per_entity",
+    # 2026-05-04 — rerank-stage per-entity floor (Phase 1 / Item 2 of
+    # multi-entity-elaborate-answers spec). Overrides the
+    # RAG_MULTI_ENTITY_RERANK_FLOOR env var per-KB. Bounds [1, 50] —
+    # higher values starve single-entity recall on the same KB.
+    "multi_entity_rerank_floor",
 })
 VALID_FLOAT_KEYS = frozenset({
     "mmr_lambda",
@@ -302,6 +307,10 @@ def validate_config(raw: Mapping[str, Any]) -> dict[str, Any]:
             # meaning (no quota); above 50 starts crowding out other
             # signal at the rerank cut. Out-of-range silently drops.
             if key == "multi_entity_min_per_entity" and not (1 <= coerced <= 50):
+                continue
+            # 2026-05-04 — rerank-stage per-entity floor. Same bounds
+            # rationale as multi_entity_min_per_entity above.
+            if key == "multi_entity_rerank_floor" and not (1 <= coerced <= 50):
                 continue
             out[key] = coerced
         elif key in VALID_FLOAT_KEYS:
