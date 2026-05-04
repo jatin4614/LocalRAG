@@ -234,13 +234,18 @@ services:
       # vllm regardless of the bridge's budget setting. See spec §4.3.3.
       - "--max-model-len"
       - "131072"
-      # GPU 0 (RTX 6000 Ada 48 GB). TEI (Phase 1) and open-webui reranker
-      # (Phase 3) are on GPU 1 (Blackwell). Remaining GPU 0 tenant: ~7.3 GB
-      # of frams-recognition-worker-* (separate project).
-      # 0.70 × 48 = 33.6 GB for vllm: weights (~20 GB) + FP8 KV cache at
-      # 128K sequences (fp8 KV, ~8 GB for typical concurrent load) leaves
-      # headroom. Leaves ~5 GB headroom on GPU 0 beyond frams +
-      # vllm + overhead — safer margin against transient spikes.
+      # GPU 0 budget arithmetic (RTX 6000 Ada 48 GB):
+      #   weights:   ~20 GB (Gemma-4-31B-it-AWQ, 4-bit quantized)
+      #   KV pool:   gpu-memory-utilization × VRAM − weights
+      #              = 0.70 × 48 − 20 = ~14 GB at fp8 KV
+      #   Headroom:  ~5 GB for activations + framework + cuda graphs
+      #              + ~7.3 GB frams-recognition-worker-* (separate project
+      #              on GPU 0 — TEI and open-webui reranker are on GPU 1).
+      # KV pool of 14 GB at fp8 covers ~160K token-equivalents of
+      # concurrent KV — the 128K max-model-len fits 1 full-length session,
+      # or ~10-20+ typical multi-entity calls (each ~5-15K context).
+      # Lifting max-model-len does NOT shrink the KV pool — that's set
+      # by gpu-memory-utilization.
       - "--gpu-memory-utilization"
       - "0.70"
       # Cap concurrent sequences at 32 (8 users × burst of 4 outstanding).
@@ -594,7 +599,7 @@ services:
       # After the level=doc summary pass returns one paraphrase per document,
       # fan out to per-doc chunk retrieval (K chunks per doc) and merge so the
       # LLM sees both per-doc summaries AND granular event chunks. Wider
-      # budget for global intent only; specific/metadata stay at 10K.
+      # budget for global intent only; specific/metadata stay at 80K.
       RAG_GLOBAL_DRILLDOWN: ${RAG_GLOBAL_DRILLDOWN:-1}
       RAG_GLOBAL_DRILLDOWN_K: ${RAG_GLOBAL_DRILLDOWN_K:-2}
       # Bumped 22000 -> 100000 on 2026-05-04. Phase 2 entity-coverage
