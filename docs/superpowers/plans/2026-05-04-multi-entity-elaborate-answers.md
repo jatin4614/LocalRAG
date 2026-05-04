@@ -150,6 +150,23 @@ Then add bounds inside `validate_config` next to the existing `multi_entity_min_
                 continue
 ```
 
+**Also add a `_KEY_TO_ENV` mapping** in the same file. Find the `_KEY_TO_ENV` dict and add the new mapping immediately after `multi_entity_min_per_entity`:
+
+\```python
+    "multi_entity_rerank_floor": "RAG_MULTI_ENTITY_RERANK_FLOOR",
+\```
+
+Without this entry, the per-KB JSONB stamp validates and persists but is silently dropped by `config_to_env_overrides`, and the rerank-stage floor read site (`chat_rag_bridge.py:~2024`) never sees the per-KB value — only the env default reaches `flags.get`. Add the test below to lock the round-trip:
+
+\```python
+    def test_emits_rerank_floor_env(self) -> None:
+        from ext.services import kb_config
+        env = kb_config.config_to_env_overrides(
+            {"multi_entity_rerank_floor": 8}
+        )
+        assert env == {"RAG_MULTI_ENTITY_RERANK_FLOOR": "8"}
+\```
+
 - [ ] **Step 4: Run test to verify it passes**
 
 ```bash

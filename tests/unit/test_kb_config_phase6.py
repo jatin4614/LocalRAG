@@ -179,3 +179,13 @@ class TestMultiEntityRerankFloor:
         assert kb_config.validate_config(
             {"multi_entity_rerank_floor": "10"}
         ) == {"multi_entity_rerank_floor": 10}
+
+    def test_emits_rerank_floor_env(self) -> None:
+        """Per-KB stamp must round-trip through config_to_env_overrides
+        so flags.get sees it at the rerank-stage read site. Without this
+        the per-KB override is silently dropped."""
+        from ext.services import kb_config
+        env = kb_config.config_to_env_overrides(
+            {"multi_entity_rerank_floor": 8}
+        )
+        assert env == {"RAG_MULTI_ENTITY_RERANK_FLOOR": "8"}

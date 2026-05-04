@@ -228,6 +228,12 @@ _KEY_TO_ENV: dict[str, str] = {
     "entity_text_filter": "RAG_ENTITY_TEXT_FILTER",
     "qu_entity_extract": "RAG_QU_ENTITY_EXTRACT",
     "multi_entity_min_per_entity": "RAG_MULTI_ENTITY_MIN_PER_ENTITY",
+    # 2026-05-04 — Phase 1 / Item 2 of multi-entity-elaborate-answers spec.
+    # Companion to multi_entity_min_per_entity above. Without this entry
+    # the per-KB JSONB stamp would validate and persist but never reach
+    # ``flags.get`` at ``chat_rag_bridge._run_pipeline:~2024``, so the
+    # rerank-stage floor would always read the env default.
+    "multi_entity_rerank_floor": "RAG_MULTI_ENTITY_RERANK_FLOOR",
     # 2026-05-03 — Phase 2 / Item 4. entity_text_filter mode toggle.
     "entity_text_filter_mode": "RAG_ENTITY_TEXT_FILTER_MODE",
     # The QU LLM flags (RAG_QU_*) are cluster-wide and not exposed as
