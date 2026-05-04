@@ -1141,6 +1141,8 @@ async def _multi_entity_retrieve(
     doc_ids=None,
     temporal_constraint=None,
     with_vectors: bool = False,
+    subtopics: list | tuple = (),
+    decompose_mode: str = "entity",
 ):
     """Multi-entity decomposed retrieval (Phase 6.X — Methods 3 + 4).
 
@@ -1166,12 +1168,157 @@ async def _multi_entity_retrieve(
     temporal filters, level filter, owner filter, and doc-id filter
     apply unchanged. Only ``query`` and (optionally) ``text_filter``
     differ across the N parallel calls.
+
+    2026-05-04 — Phase 3 / item 5 — two-axis dispatch.
+    When ``decompose_mode == "both"``, the function fans out an N×M
+    cartesian (one parallel ``retrieve`` per (entity, subtopic) cell)
+    using ``build_sub_queries_two_axis`` for the focus suffix. Per-cell
+    budget = ``max(per_kb_limit // (N*M), 5)`` so the total candidate
+    pool stays roughly proportional to ``per_kb_limit`` — the
+    post-rerank ``_apply_two_axis_quota`` step dedupes by id and
+    enforces the per-cell / per-axis floors.
+
+    When ``decompose_mode == "subtopic"`` (rare — entities < 2 but
+    subtopics ≥ 2), it fans out one ``retrieve`` per subtopic with a
+    focus-on-subtopic suffix. The post-rerank stage uses the standard
+    entity-only quota helper since there's only one axis to balance.
+
+    When ``decompose_mode in ("entity", "none")`` the legacy entity-only
+    code path runs unchanged.
     """
     import asyncio as _asyncio
 
     from .multi_query import build_sub_queries, merge_with_quota
     from .retriever import retrieve as _retrieve
 
+    # 2026-05-04 — Phase 3 / item 5. Two-axis fan-out — N×M cells.
+    # Each cell gets its own focus-shifted sub-query "<base> (focus on
+    # <entity> — <subtopic>)" via build_sub_queries_two_axis. We split
+    # the per_kb_limit budget across cells so total candidates stay
+    # roughly proportional to the single-axis path. Rerank-stage quota
+    # (_apply_two_axis_quota) does the cross-axis balancing — this
+    # function only fans out + flattens. Dedup happens at the merge
+    # step below (best-score copy wins per hit.id).
+    if decompose_mode == "both" and entities and subtopics:
+        from .multi_query import build_sub_queries_two_axis
+        triples = build_sub_queries_two_axis(base_query, entities, subtopics)
+        n_cells = max(1, len(triples))
+        per_cell_limit = max(per_kb_limit // n_cells, 5)
+        n_kbs = max(1, len(selected_kbs or []))
+        sub_total = per_cell_limit * n_kbs
+
+        async def _retrieve_cell(_e, _s, sub_q):
+            try:
+                return await _retrieve(
+                    query=sub_q,
+                    selected_kbs=selected_kbs,
+                    chat_id=chat_id,
+                    vector_store=vector_store,
+                    embedder=embedder,
+                    per_kb_limit=per_cell_limit,
+                    total_limit=sub_total,
+                    owner_user_id=owner_user_id,
+                    level_filter=level_filter,
+                    doc_ids=doc_ids,
+                    temporal_constraint=temporal_constraint,
+                    with_vectors=with_vectors,
+                )
+            except Exception as exc:
+                _record_silent_failure(
+                    f"multi_entity.retrieve_cell[{str(_e)[:20]}/"
+                    f"{str(_s)[:20]}]", exc,
+                )
+                return []
+
+        cell_results = await _asyncio.gather(
+            *(_retrieve_cell(e, s, sub_q) for e, s, sub_q in triples),
+        )
+        # Flatten with id-level dedup (best score wins). The post-rerank
+        # _apply_two_axis_quota also dedupes by id, but we dedup here so
+        # the cross-encoder doesn't waste GPU re-scoring the same chunk
+        # multiple times for different (e, s) cells.
+        best_for_id: dict = {}
+        for hits in cell_results:
+            for h in hits:
+                prev = best_for_id.get(h.id)
+                if prev is None or h.score > prev.score:
+                    best_for_id[h.id] = h
+        flat = sorted(best_for_id.values(), key=lambda h: h.score, reverse=True)
+        try:
+            from .metrics import rag_multi_query_decompose_total
+            rag_multi_query_decompose_total.labels(outcome="decomposed").inc()
+        except Exception:
+            pass
+        logger.info(
+            "rag: two-axis decompose entities=%d subtopics=%d cells=%d "
+            "per_cell_limit=%d -> %d hits",
+            len(entities), len(subtopics), n_cells, per_cell_limit, len(flat),
+        )
+        return flat
+
+    # 2026-05-04 — Phase 3 / item 5. Subtopic-only fan-out — rare path
+    # (entities < 2 but subtopics ≥ 2). Treat subtopics as the focus
+    # axis; ``build_sub_queries`` produces "<base> (focus on
+    # <subtopic>)" pairs, then the same merge_with_quota collapses
+    # buckets with subtopic as the bucket key. Post-rerank uses the
+    # standard entity-only quota helper (only one axis to balance).
+    if decompose_mode == "subtopic" and subtopics:
+        sub_pairs = build_sub_queries(base_query, list(subtopics))
+        n_subs = max(1, len(sub_pairs))
+        per_sub_limit = max(per_kb_limit // n_subs, 5)
+        n_kbs = max(1, len(selected_kbs or []))
+        sub_total = per_sub_limit * n_kbs
+
+        async def _retrieve_sub(_s, sub_q):
+            try:
+                return await _retrieve(
+                    query=sub_q,
+                    selected_kbs=selected_kbs,
+                    chat_id=chat_id,
+                    vector_store=vector_store,
+                    embedder=embedder,
+                    per_kb_limit=per_sub_limit,
+                    total_limit=sub_total,
+                    owner_user_id=owner_user_id,
+                    level_filter=level_filter,
+                    doc_ids=doc_ids,
+                    temporal_constraint=temporal_constraint,
+                    with_vectors=with_vectors,
+                )
+            except Exception as exc:
+                _record_silent_failure(
+                    f"multi_entity.retrieve_subtopic[{str(_s)[:20]}]", exc,
+                )
+                return []
+
+        sub_results = await _asyncio.gather(
+            *(_retrieve_sub(s, sq) for (s, sq) in sub_pairs),
+        )
+        per_subtopic_hits = {s: hits for ((s, _), hits) in zip(sub_pairs, sub_results)}
+        # Floor is the same env knob as the entity path — operators tune
+        # one number; the spec only diverges at the rerank stage.
+        try:
+            floor = int(flags.get("RAG_MULTI_ENTITY_MIN_PER_ENTITY") or "10")
+        except (TypeError, ValueError):
+            floor = 10
+        floor = max(1, min(floor, 50))
+        merged = merge_with_quota(
+            per_entity_hits=per_subtopic_hits,
+            k_min_per_entity=floor,
+            k_total=total_limit,
+        )
+        try:
+            from .metrics import rag_multi_query_decompose_total
+            rag_multi_query_decompose_total.labels(outcome="decomposed").inc()
+        except Exception:
+            pass
+        logger.info(
+            "rag: subtopic-only decompose subtopics=%d floor=%d total=%d -> %d hits",
+            len(subtopics), floor, total_limit, len(merged),
+        )
+        return merged
+
+    # ---- entity-only path (legacy — unchanged) ----
     pairs = build_sub_queries(base_query, entities)
     text_filter_on = flags.get("RAG_ENTITY_TEXT_FILTER", "0") == "1"
     try:
@@ -1438,7 +1585,18 @@ async def _retrieve_kb_sources_inner(
     )
     # ``resolve_intent_flags`` already applied the per-KB overrides on top
     # of the intent defaults, so its return value IS the effective overlay.
-    merged_overrides = _intent_flag_overrides
+    merged_overrides: dict[str, Any] = dict(_intent_flag_overrides)
+    # 2026-05-04 — Phase 3 / item 5. Thread dict/list-typed per-KB config
+    # (``subtopic_keywords`` table and ``synonyms`` equivalence classes)
+    # into the same overlay. ``config_to_env_overrides`` skips them
+    # (they have no RAG_* env analogue), so we splice from ``merged_cfg``
+    # directly. ``flags.with_overrides`` preserves dict/list values
+    # without ``str(...)`` coercion; ``flags.get_dict`` / ``get_list``
+    # at the read side return them only when the type matches.
+    for _k in ("subtopic_keywords", "synonyms"):
+        _v = merged_cfg.get(_k)
+        if isinstance(_v, (dict, list)):
+            merged_overrides[_k] = _v
 
     # Wave 2 round 4 (review §5.15) — total-pipeline timeout. Wrap the inner
     # pipeline in asyncio.wait_for so a hung downstream service (TEI, vllm-qu,
@@ -1687,9 +1845,14 @@ async def _run_pipeline(
                 # metadata-intent path (which short-circuits before the decompose block)
                 # doesn't crash when the post-rerank quota check references them.
                 # See docs/superpowers/specs/2026-05-03-retrieval-quality-fix-design.md §1.4.
+                # 2026-05-04 — Phase 3 / item 5: ``_subtopics`` joins the
+                # init block so the two-axis post-rerank quota check
+                # (``_decompose_mode == "both" and _subtopics``) doesn't
+                # NameError on the metadata-intent path either.
                 _do_decompose: bool = False
                 _decompose_mode: str = "none"
                 _entities: list[str] = []
+                _subtopics: list[str] = []
                 _entity_floor: int = 0
                 # Tier 2 routing — metadata queries are answered entirely
                 # by the catalog preamble appended later; skipping
@@ -1846,17 +2009,38 @@ async def _run_pipeline(
                     # pre-Phase-6: same single retrieve call, same
                     # arguments, same return.
                     _decompose_on = flags.get("RAG_MULTI_ENTITY_DECOMPOSE", "0") == "1"
-                    _entities: list = []
-                    _do_decompose = False
+                    # 2026-05-04 — Phase 3 / item 5 of multi-entity-elaborate-answers.
+                    # When ``RAG_SUBTOPIC_DECOMPOSE=1`` AND the query yields ≥2
+                    # subtopics in addition to ≥2 entities, ``should_decompose``
+                    # promotes the dispatch to ``mode == "both"`` and the
+                    # bridge fans out the (entity, subtopic) cartesian via
+                    # ``build_sub_queries_two_axis``. Default-off path is
+                    # byte-identical: ``_subtopics`` stays empty, so
+                    # ``should_decompose`` returns "entity" mode and the
+                    # legacy entity-only fan-out runs.
+                    _subtopic_decompose_on = (
+                        flags.get("RAG_SUBTOPIC_DECOMPOSE", "0") == "1"
+                    )
+                    # _decompose_mode + _entities + _subtopics + _do_decompose
+                    # initialized in the outer block above (defaults: "none",
+                    # [], [], False) so the metadata-intent path doesn't
+                    # crash on the post-rerank quota check.
                     if _decompose_on:
                         try:
-                            from .entity_extractor import extract_entities
+                            from .entity_extractor import (
+                                extract_entities,
+                                extract_subtopics,
+                            )
                             from .multi_query import should_decompose
 
                             _entities = extract_entities(query, qu_result=_hybrid)
+                            if _subtopic_decompose_on:
+                                _subtopics = extract_subtopics(
+                                    query, qu_result=_hybrid,
+                                )
                             _decompose_mode, _do_decompose = should_decompose(
                                 entities=_entities,
-                                subtopics=[],          # Phase 3 plumbs real subtopics; for now empty
+                                subtopics=_subtopics,
                                 flag_on=True,
                                 intent=_intent,
                             )
@@ -1864,6 +2048,7 @@ async def _run_pipeline(
                             _record_silent_failure(
                                 "multi_entity.gate", _exc,
                             )
+                            _decompose_mode = "none"
                             _do_decompose = False
                     if not _do_decompose:
                         # Telemetry for the "flag on, but query was
@@ -1897,6 +2082,8 @@ async def _run_pipeline(
                         if _do_decompose:
                             raw_hits = await _multi_entity_retrieve(
                                 entities=_entities,
+                                subtopics=_subtopics,
+                                decompose_mode=_decompose_mode,
                                 base_query=_retrieval_query,
                                 selected_kbs=selected_kbs,
                                 chat_id=chat_id,
@@ -2247,17 +2434,48 @@ async def _run_pipeline(
                         and len(reranked) > _final_k
                     ):
                         if _do_decompose and _entities and _entity_floor > 0:
-                            reranked = _apply_entity_quota(
-                                reranked=reranked,
-                                entities=list(_entities),
-                                per_entity_floor=_entity_floor,
-                                final_k=_final_k,
-                            )
-                            logger.info(
-                                "rag: multi-entity rerank quota active "
-                                "(mmr fail-trim) — entities=%d floor=%d final_k=%d",
-                                len(_entities), _entity_floor, _final_k,
-                            )
+                            # 2026-05-04 — Phase 3 / item 5. When the
+                            # bridge dispatched two-axis decompose, route
+                            # the post-rerank pool through the two-axis
+                            # quota helper so subtopics survive the
+                            # cross-encoder trim alongside entities.
+                            # Otherwise fall back to the single-axis
+                            # entity-only quota (legacy behaviour).
+                            if _decompose_mode == "both" and _subtopics:
+                                _subtopic_keywords = (
+                                    flags.get_dict("subtopic_keywords") or {}
+                                )
+                                _kb_synonyms = flags.get_list("synonyms") or []
+                                reranked = _apply_two_axis_quota(
+                                    reranked=reranked,
+                                    entities=list(_entities),
+                                    subtopics=list(_subtopics),
+                                    subtopic_keywords=_subtopic_keywords,
+                                    synonyms=_kb_synonyms,
+                                    per_cell_floor=1,
+                                    per_entity_floor=_entity_floor,
+                                    per_subtopic_floor=max(2, _entity_floor // 2),
+                                    final_k=_final_k,
+                                )
+                                logger.info(
+                                    "rag: two-axis rerank quota active "
+                                    "(mmr fail-trim) — entities=%d subtopics=%d "
+                                    "entity_floor=%d final_k=%d",
+                                    len(_entities), len(_subtopics),
+                                    _entity_floor, _final_k,
+                                )
+                            else:
+                                reranked = _apply_entity_quota(
+                                    reranked=reranked,
+                                    entities=list(_entities),
+                                    per_entity_floor=_entity_floor,
+                                    final_k=_final_k,
+                                )
+                                logger.info(
+                                    "rag: multi-entity rerank quota active "
+                                    "(mmr fail-trim) — entities=%d floor=%d final_k=%d",
+                                    len(_entities), _entity_floor, _final_k,
+                                )
                             try:
                                 from .metrics import (
                                     rag_multi_entity_rerank_quota_total,
@@ -2289,17 +2507,42 @@ async def _run_pipeline(
                 # 3) chunks in the post-rerank pool. Entity-blind trim is
                 # preserved for the non-decompose path.
                 if _do_decompose and _entities and _entity_floor > 0:
-                    reranked = _apply_entity_quota(
-                        reranked=reranked,
-                        entities=list(_entities),
-                        per_entity_floor=_entity_floor,
-                        final_k=_final_k,
-                    )
-                    logger.info(
-                        "rag: multi-entity rerank quota active — "
-                        "entities=%d floor=%d final_k=%d",
-                        len(_entities), _entity_floor, _final_k,
-                    )
+                    # 2026-05-04 — Phase 3 / item 5. Mirror the MMR-fail
+                    # branch above: route through the two-axis quota when
+                    # the bridge dispatched decompose_mode=="both", else
+                    # use the single-axis entity-only path.
+                    if _decompose_mode == "both" and _subtopics:
+                        _subtopic_keywords = flags.get_dict("subtopic_keywords") or {}
+                        _kb_synonyms = flags.get_list("synonyms") or []
+                        reranked = _apply_two_axis_quota(
+                            reranked=reranked,
+                            entities=list(_entities),
+                            subtopics=list(_subtopics),
+                            subtopic_keywords=_subtopic_keywords,
+                            synonyms=_kb_synonyms,
+                            per_cell_floor=1,
+                            per_entity_floor=_entity_floor,
+                            per_subtopic_floor=max(2, _entity_floor // 2),
+                            final_k=_final_k,
+                        )
+                        logger.info(
+                            "rag: two-axis rerank quota active — "
+                            "entities=%d subtopics=%d entity_floor=%d final_k=%d",
+                            len(_entities), len(_subtopics),
+                            _entity_floor, _final_k,
+                        )
+                    else:
+                        reranked = _apply_entity_quota(
+                            reranked=reranked,
+                            entities=list(_entities),
+                            per_entity_floor=_entity_floor,
+                            final_k=_final_k,
+                        )
+                        logger.info(
+                            "rag: multi-entity rerank quota active — "
+                            "entities=%d floor=%d final_k=%d",
+                            len(_entities), _entity_floor, _final_k,
+                        )
                     try:
                         from .metrics import rag_multi_entity_rerank_quota_total
                         rag_multi_entity_rerank_quota_total.labels(

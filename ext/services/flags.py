@@ -52,12 +52,19 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import os
-from typing import Iterator, Mapping, Optional
+from typing import Any, Iterator, Mapping, Optional
 
 # The contextvar holds the current overlay dict (or None when no overlay
 # is active). A fresh dict object is stored per ``with_overrides`` entry
 # so nested calls can compose without aliasing.
-_OVERLAY: contextvars.ContextVar[Optional[dict[str, str]]] = contextvars.ContextVar(
+#
+# 2026-05-04 — Phase 3 / item 5: relaxed value type from ``str`` to ``Any``
+# so per-KB ``subtopic_keywords`` (dict) and ``synonyms`` (list) can ride
+# the same overlay as the string-valued RAG_* env-var overrides. Existing
+# call sites pass strings and continue to work; the new helpers
+# ``get_dict`` / ``get_list`` validate the type before returning so a
+# stringified value never masquerades as the structured type.
+_OVERLAY: contextvars.ContextVar[Optional[dict[str, Any]]] = contextvars.ContextVar(
     "rag_flag_overlay", default=None,
 )
 
@@ -68,15 +75,60 @@ def get(key: str, default: Optional[str] = None) -> Optional[str]:
     Drop-in replacement for ``os.environ.get(key, default)`` — all callers
     in the RAG hot path should use this instead so that per-request KB
     config overrides (from ``chat_rag_bridge``) take effect.
+
+    2026-05-04 — only string-typed overlay values are returned by this
+    helper. Dict/list overlay values (used by Phase 3 ``subtopic_keywords``
+    / ``synonyms``) fall through to ``os.environ.get`` so a code path that
+    expects a string flag never receives a structured value.
     """
     overlay = _OVERLAY.get()
     if overlay is not None and key in overlay:
-        return overlay[key]
+        val = overlay[key]
+        if isinstance(val, str):
+            return val
     return os.environ.get(key, default)
 
 
+def get_dict(key: str, default: dict | None = None) -> dict | None:
+    """Return overlay value for ``key`` if it's a dict; else ``default``.
+
+    2026-05-04 — Phase 3 / item 5 of multi-entity-elaborate-answers spec.
+    Used by chat_rag_bridge to read the per-KB ``subtopic_keywords`` table
+    out of the rag_config overlay set up in ``_retrieve_overrides``.
+
+    Unlike ``get`` this never falls back to ``os.environ`` (env vars are
+    always strings) — the overlay is the only source of dict-typed values.
+    """
+    overlay = _OVERLAY.get()
+    if overlay is None:
+        return default
+    val = overlay.get(key)
+    if isinstance(val, dict):
+        return val
+    return default
+
+
+def get_list(key: str, default: list | None = None) -> list | None:
+    """Return overlay value for ``key`` if it's a list; else ``default``.
+
+    2026-05-04 — Phase 3 / item 5 of multi-entity-elaborate-answers spec.
+    Used by chat_rag_bridge to read the per-KB ``synonyms`` table out of
+    the rag_config overlay.
+
+    Unlike ``get`` this never falls back to ``os.environ`` (env vars are
+    always strings) — the overlay is the only source of list-typed values.
+    """
+    overlay = _OVERLAY.get()
+    if overlay is None:
+        return default
+    val = overlay.get(key)
+    if isinstance(val, list):
+        return val
+    return default
+
+
 @contextlib.contextmanager
-def with_overrides(overrides: Mapping[str, str]) -> Iterator[None]:
+def with_overrides(overrides: Mapping[str, Any]) -> Iterator[None]:
     """Temporarily overlay ``overrides`` on top of ``os.environ`` reads.
 
     Scoped to the current ``contextvars.Context`` — concurrent asyncio
@@ -85,6 +137,13 @@ def with_overrides(overrides: Mapping[str, str]) -> Iterator[None]:
 
     Passing an empty mapping is a no-op (the current overlay, if any, is
     preserved unchanged).
+
+    2026-05-04 — Phase 3 / item 5. Dict and list values are preserved
+    as-is (no ``str(...)`` coercion) so ``get_dict`` / ``get_list`` can
+    read structured per-KB config (``subtopic_keywords``, ``synonyms``)
+    from the same overlay that carries the string RAG_* values. Every
+    other value type continues to be stringified — preserving the
+    Mapping[str, str] read-side contract that ``flags.get`` enforces.
     """
     if not overrides:
         yield
@@ -93,9 +152,12 @@ def with_overrides(overrides: Mapping[str, str]) -> Iterator[None]:
     current = _OVERLAY.get()
     # Build the merged overlay as a fresh dict so the outer scope's dict
     # is not mutated. Inner keys win over outer.
-    merged: dict[str, str] = dict(current) if current is not None else {}
+    merged: dict[str, Any] = dict(current) if current is not None else {}
     for k, v in overrides.items():
-        merged[str(k)] = str(v)
+        if isinstance(v, (dict, list)):
+            merged[str(k)] = v
+        else:
+            merged[str(k)] = str(v)
 
     token = _OVERLAY.set(merged)
     try:
@@ -104,10 +166,10 @@ def with_overrides(overrides: Mapping[str, str]) -> Iterator[None]:
         _OVERLAY.reset(token)
 
 
-def _peek_overlay_for_tests() -> Optional[dict[str, str]]:
+def _peek_overlay_for_tests() -> Optional[dict[str, Any]]:
     """Return a copy of the current overlay (for assertions in unit tests)."""
     o = _OVERLAY.get()
     return dict(o) if o is not None else None
 
 
-__all__ = ["get", "with_overrides"]
+__all__ = ["get", "get_dict", "get_list", "with_overrides"]
