@@ -117,6 +117,15 @@ VALID_BOOL_KEYS = frozenset({
     # routinely OOM the worker. Per-KB explicit value (True or False)
     # wins over the env flag.
     "image_captions",
+    # 2026-05-04 — Phase 3 / item 5. Master gate for two-axis subtopic
+    # decomposition. When True, the bridge decomposes the query along
+    # both the entity axis AND the subtopic axis, fanning out N×M
+    # parallel sub-queries (entity × subtopic) and merging with per-cell
+    # quota. Default off; opt in for corpora that carry clearly separated
+    # sub-topics per entity (e.g. military reports: per-brigade visits,
+    # operations, exercises, personnel readiness each warranting dedicated
+    # retrieval budget).
+    "subtopic_decompose",
 })
 VALID_INT_KEYS = frozenset({
     # Pre-rerank pull cap. Overrides the intent-driven _per_kb default
@@ -144,6 +153,11 @@ VALID_INT_KEYS = frozenset({
     # its hits, whichever is fewer). Default 10. Bounds [1, 50] —
     # higher than 50 starts crowding out single-entity recall.
     "multi_entity_min_per_entity",
+    # 2026-05-04 — rerank-stage per-entity floor (Phase 1 / Item 2 of
+    # multi-entity-elaborate-answers spec). Overrides the
+    # RAG_MULTI_ENTITY_RERANK_FLOOR env var per-KB. Bounds [1, 50] —
+    # higher values starve single-entity recall on the same KB.
+    "multi_entity_rerank_floor",
 })
 VALID_FLOAT_KEYS = frozenset({
     "mmr_lambda",
@@ -166,9 +180,20 @@ VALID_STRING_KEYS = frozenset({
 VALID_LIST_KEYS = frozenset({
     "synonyms",
 })
+# 2026-05-04 — Phase 3 / item 5. Dict-typed keys with shape
+# ``{str: list[str]}``. Each entry maps a subtopic label to a list of
+# corpus-vocabulary keywords for that subtopic. No env-level analogue —
+# consumed directly by the subtopic-decompose path; not propagated via
+# the RAG_* env overlay. Strict shape validation: non-dict, non-string
+# outer keys, and non-list values all drop silently. Non-string list
+# items are stripped (not a hard-reject) so partial markup doesn't
+# block a fully valid table.
+VALID_DICT_KEYS = frozenset({
+    "subtopic_keywords",
+})
 VALID_KEYS = (
     VALID_BOOL_KEYS | VALID_INT_KEYS | VALID_FLOAT_KEYS
-    | VALID_STRING_KEYS | VALID_LIST_KEYS
+    | VALID_STRING_KEYS | VALID_LIST_KEYS | VALID_DICT_KEYS
 )
 
 # Keys that are NOT propagated into the request-scope overlay because the
@@ -223,8 +248,20 @@ _KEY_TO_ENV: dict[str, str] = {
     "entity_text_filter": "RAG_ENTITY_TEXT_FILTER",
     "qu_entity_extract": "RAG_QU_ENTITY_EXTRACT",
     "multi_entity_min_per_entity": "RAG_MULTI_ENTITY_MIN_PER_ENTITY",
+    # 2026-05-04 — Phase 1 / Item 2 of multi-entity-elaborate-answers spec.
+    # Companion to multi_entity_min_per_entity above. Without this entry
+    # the per-KB JSONB stamp would validate and persist but never reach
+    # ``flags.get`` at ``chat_rag_bridge._run_pipeline:~2024``, so the
+    # rerank-stage floor would always read the env default.
+    "multi_entity_rerank_floor": "RAG_MULTI_ENTITY_RERANK_FLOOR",
     # 2026-05-03 — Phase 2 / Item 4. entity_text_filter mode toggle.
     "entity_text_filter_mode": "RAG_ENTITY_TEXT_FILTER_MODE",
+    # 2026-05-04 — Phase 3 / item 5 of multi-entity-elaborate-answers spec.
+    # Without this entry, a per-KB JSONB stamp would validate and persist
+    # but config_to_env_overrides would silently drop it, so flags.get
+    # at the bridge's _run_pipeline read site would never see the per-KB
+    # value. Same defect class as multi_entity_rerank_floor (review of 53d7094).
+    "subtopic_decompose": "RAG_SUBTOPIC_DECOMPOSE",
     # The QU LLM flags (RAG_QU_*) are cluster-wide and not exposed as
     # per-KB rag_config keys.
 }
@@ -303,6 +340,10 @@ def validate_config(raw: Mapping[str, Any]) -> dict[str, Any]:
             # signal at the rerank cut. Out-of-range silently drops.
             if key == "multi_entity_min_per_entity" and not (1 <= coerced <= 50):
                 continue
+            # 2026-05-04 — rerank-stage per-entity floor. Same bounds
+            # rationale as multi_entity_min_per_entity above.
+            if key == "multi_entity_rerank_floor" and not (1 <= coerced <= 50):
+                continue
             out[key] = coerced
         elif key in VALID_FLOAT_KEYS:
             try:
@@ -342,6 +383,26 @@ def validate_config(raw: Mapping[str, Any]) -> dict[str, Any]:
             ):
                 continue
             out[key] = value
+        elif key in VALID_DICT_KEYS:
+            # 2026-05-04 — Phase 3 / item 5. Dict-typed key validation.
+            if not isinstance(value, dict):
+                continue
+            cleaned_dict: dict[str, list[str]] = {}
+            ok = True
+            for k_inner, v_inner in value.items():
+                if not isinstance(k_inner, str):
+                    ok = False
+                    break
+                if not isinstance(v_inner, list):
+                    ok = False
+                    break
+                cleaned_list = [
+                    item for item in v_inner if isinstance(item, str) and item.strip()
+                ]
+                cleaned_dict[k_inner] = cleaned_list
+            if not ok:
+                continue
+            out[key] = cleaned_dict
     return out
 
 
@@ -397,6 +458,17 @@ def merge_configs(configs: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
                 # call time. Simpler than any class-merging algorithm and
                 # avoids the head-based dedup bug (see review of 5c3c6ae).
                 merged[key] = merged.get(key, []) + list(value)
+            elif key in VALID_DICT_KEYS:
+                # 2026-05-04 — Phase 3 / item 5. Dict-typed keys: merge by
+                # combining the dicts from all selected KBs. Last-write wins
+                # per subtopic label (later KB's keyword list replaces an
+                # earlier one with the same key). This is intentional:
+                # subtopic_keywords is curated per-KB; if two KBs define
+                # the same subtopic label with different vocabularies the
+                # richer/most-recently-stamped table wins rather than
+                # silently truncating either. Additive for distinct labels.
+                existing = merged.get(key, {})
+                merged[key] = {**existing, **value}
     return merged
 
 
@@ -574,6 +646,7 @@ def get_ocr_policy(kb_id: int, db_session) -> dict | None:
 __all__ = [
     "VALID_KEYS",
     "VALID_LIST_KEYS",
+    "VALID_DICT_KEYS",
     "merge_configs",
     "config_to_env_overrides",
     "validate_config",

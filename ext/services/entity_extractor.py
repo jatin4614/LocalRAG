@@ -264,8 +264,89 @@ def is_multi_entity_query(
     return len(extract_entities(query, qu_result)) >= _MIN_ENTITIES
 
 
+# 2026-05-04 — Phase 3 / item 5 of multi-entity-elaborate-answers spec.
+# Subtopic extraction. Same priority pattern as entity extraction:
+# QU LLM > regex > empty.
+
+_MIN_SUBTOPICS = 2
+_MAX_SUBTOPICS = 8
+
+# Regexes mirror the entity-extractor patterns but trigger on subtopic
+# markers rather than entity-list markers.
+_SUBTOPIC_HEADER_RE = re.compile(
+    r"\b(under|with)?\s*(fwg|following)?\s*(head(?:ing)?s?|sections?)\s*:",
+    re.IGNORECASE,
+)
+
+
+def _extract_subtopic_numbered(text: str) -> list[str]:
+    # Find a header marker, then read numbered items beneath it
+    m = _SUBTOPIC_HEADER_RE.search(text)
+    if not m:
+        return []
+    after = text[m.end():]
+    items = re.findall(r"^\s*\d+[.)]\s+(.+?)\s*$", after, re.MULTILINE)
+    return [i.strip() for i in items if i.strip()]
+
+
+def _extract_subtopic_bulleted(text: str) -> list[str]:
+    m = _SUBTOPIC_HEADER_RE.search(text)
+    if not m:
+        return []
+    after = text[m.end():]
+    items = re.findall(r"^\s*[-*•]\s+(.+?)\s*$", after, re.MULTILINE)
+    return [i.strip() for i in items if i.strip()]
+
+
+def extract_subtopics_regex(query: str | None) -> list[str]:
+    """Pure-regex subtopic extractor — no LLM, no I/O.
+
+    Returns empty list when:
+      * input is empty / None
+      * no subtopic header marker found
+      * fewer than :data:`_MIN_SUBTOPICS` items detected
+
+    Output is deduped case-insensitively, capped at :data:`_MAX_SUBTOPICS`.
+    """
+    if not query or not isinstance(query, str):
+        return []
+    for extractor in (_extract_subtopic_numbered, _extract_subtopic_bulleted):
+        cands = extractor(query)
+        if len(cands) >= _MIN_SUBTOPICS:
+            return _dedupe_preserve_first(cands)[:_MAX_SUBTOPICS]
+    return []
+
+
+def _subtopics_from_qu(qu_result: Any) -> list[str]:
+    """Pull `.subtopics` off a QU result object, defensively. Mirror of
+    `_entities_from_qu`."""
+    raw = getattr(qu_result, "subtopics", None)
+    if not isinstance(raw, list):
+        return []
+    cleaned: list[str] = []
+    for item in raw:
+        s = _clean_surface(item) if isinstance(item, str) else ""
+        if s:
+            cleaned.append(s)
+    return cleaned
+
+
+def extract_subtopics(
+    query: str | None,
+    qu_result: Optional[Any] = None,
+) -> list[str]:
+    """Compose QU + regex subtopic extraction. Mirror of `extract_entities`."""
+    qu_subtopics = _subtopics_from_qu(qu_result)
+    if qu_subtopics:
+        return _dedupe_preserve_first(qu_subtopics)[:_MAX_SUBTOPICS]
+    return extract_subtopics_regex(query)
+
+
 __all__ = [
     "extract_entities",
     "extract_entities_regex",
     "is_multi_entity_query",
+    # Phase 3 — multi-entity-elaborate-answers
+    "extract_subtopics",
+    "extract_subtopics_regex",
 ]

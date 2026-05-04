@@ -38,4 +38,24 @@ def test_coerce_missing_optional_fields_gets_default():
 def test_canonical_indexes_list_types():
     for idx in CANONICAL_INDEXES:
         assert "field" in idx and "type" in idx
-        assert idx["type"] in {"keyword", "integer", "bool", "float"}
+        assert idx["type"] in {"keyword", "integer", "bool", "float", "text"}
+
+
+def test_canonical_indexes_includes_entities() -> None:
+    """Phase 2 of multi-entity-elaborate-answers spec adds 'entities' index.
+
+    Entity list on level=doc points; text index with lowercase tokenization
+    handles "5 PoK" / "5 POK" / "5 PoK Bde" variants the same way the
+    per-KB synonym table feeds entity_text_filter on chunk-level points.
+    """
+    field_names = [idx["field"] for idx in CANONICAL_INDEXES]
+    assert "entities" in field_names
+
+
+def test_entities_index_is_text_lowercased() -> None:
+    """Entities index must be text type with lowercase tokenization."""
+    entities_idx = next(
+        idx for idx in CANONICAL_INDEXES if idx["field"] == "entities"
+    )
+    assert entities_idx["type"] == "text"
+    assert entities_idx.get("lowercase") is True

@@ -124,6 +124,10 @@ def test_merge_all_valid_keys():
         # Phase 2 / Item 4 — entity filter mode + synonym table.
         "entity_text_filter_mode": "boost",
         "synonyms": [["5 PoK", "5 POK"]],
+        # 2026-05-04 — Phase 3 / item 5. Per-KB rerank floor + two-axis decompose.
+        "multi_entity_rerank_floor": 8,
+        "subtopic_decompose": True,
+        "subtopic_keywords": {"visits": ["visit", "vis"]},
     }
     out = merge_configs([cfg])
     for key in VALID_KEYS:
@@ -241,6 +245,8 @@ def test_validate_accepts_all_whitelisted_keys():
         # Phase 6.X
         "multi_entity_decompose", "entity_text_filter", "qu_entity_extract",
         "image_captions",
+        # 2026-05-04 — Phase 3 / item 5. Two-axis decompose gate.
+        "subtopic_decompose",
     }
     _int_sample = {
         "top_k": 24,
@@ -251,6 +257,8 @@ def test_validate_accepts_all_whitelisted_keys():
         "overlap_tokens": 100,
         # Phase 6.X
         "multi_entity_min_per_entity": 12,
+        # 2026-05-04 — Phase 3 / item 5. Per-KB rerank floor.
+        "multi_entity_rerank_floor": 8,
     }
     _string_sample = {
         # Phase 6.6 — string-typed enum keys.
@@ -262,6 +270,10 @@ def test_validate_accepts_all_whitelisted_keys():
         # Phase 2 / Item 4 — synonym equivalence classes.
         "synonyms": [["5 PoK", "5 POK"]],
     }
+    _dict_sample = {
+        # 2026-05-04 — Phase 3 / item 5. Subtopic-keywords table.
+        "subtopic_keywords": {"visits": ["visit", "vis"]},
+    }
 
     def _sample_for(key: str):
         if key in _bool_keys:
@@ -272,6 +284,8 @@ def test_validate_accepts_all_whitelisted_keys():
             return _string_sample[key]
         if key in _list_sample:
             return _list_sample[key]
+        if key in _dict_sample:
+            return _dict_sample[key]
         return 0.5
 
     raw = {key: _sample_for(key) for key in VALID_KEYS}

@@ -70,10 +70,24 @@ async def create_target(client: AsyncQdrantClient, source: str, target: str) -> 
             "bool": qmodels.PayloadSchemaType.BOOL,
             "float": qmodels.PayloadSchemaType.FLOAT,
         }
+        # 2026-05-04 — Phase 2 / item 4 of multi-entity-elaborate-answers
+        # spec. "text" type uses TextIndexParams with a lowercase WORD
+        # tokenizer so MatchText against case-variant entity names
+        # ("5 PoK" / "5 POK") matches consistently.
+        if idx["type"] == "text":
+            schema = qmodels.TextIndexParams(
+                type=qmodels.TextIndexType.TEXT,
+                tokenizer=qmodels.TokenizerType.WORD,
+                lowercase=bool(idx.get("lowercase", True)),
+                min_token_len=2,
+                max_token_len=20,
+            )
+        else:
+            schema = field_type_map[idx["type"]]
         await client.create_payload_index(
             collection_name=target,
             field_name=idx["field"],
-            field_schema=field_type_map[idx["type"]],
+            field_schema=schema,
         )
         log.info("created index: %s (%s)", idx["field"], idx["type"])
 

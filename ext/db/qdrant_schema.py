@@ -23,6 +23,12 @@ CANONICAL_INDEXES = [
     {"field": "chunk_index", "type": "integer", "is_tenant": False},
     {"field": "level", "type": "keyword", "is_tenant": False},  # 'chunk' | 'doc'
     {"field": "filename", "type": "keyword", "is_tenant": False},
+    # 2026-05-04 — Phase 2 / item 4 of multi-entity-elaborate-answers
+    # spec. Entity list on level=doc points; text index with lowercase
+    # tokenization handles "5 PoK" / "5 POK" / "5 PoK Bde" variants the
+    # same way the per-KB synonym table feeds entity_text_filter on
+    # chunk-level points.
+    {"field": "entities", "type": "text", "lowercase": True, "is_tenant": False},
 ]
 
 

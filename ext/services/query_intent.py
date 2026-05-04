@@ -536,6 +536,10 @@ class HybridClassification:
     escalation_reason: EscalationReason = EscalationReason.NONE
     regex_reason: str = ""
     cached: bool = False
+    # 2026-05-04 — Phase 3 / item 5 of multi-entity-elaborate-answers spec.
+    # Subtopics extracted alongside entities so the bridge can build
+    # N×M sub-queries.
+    subtopics: list[str] = field(default_factory=list)
 
 
 async def _invoke_qu(
@@ -656,6 +660,7 @@ async def classify_with_qu(
                 resolved_query=qu.resolved_query,
                 temporal_constraint=qu.temporal_constraint,
                 entities=qu.entities,
+                subtopics=qu.subtopics,
                 confidence=qu.confidence,
                 source="llm",
                 escalation_reason=reason,
@@ -686,6 +691,7 @@ async def classify_with_qu(
         resolved_query=qu.resolved_query,
         temporal_constraint=qu.temporal_constraint,
         entities=qu.entities,
+        subtopics=qu.subtopics,
         confidence=qu.confidence,
         source="llm",
         escalation_reason=reason,

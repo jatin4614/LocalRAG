@@ -130,3 +130,131 @@ class TestPhase6Overlay:
             {"multi_entity_decompose": False}
         )
         assert env == {"RAG_MULTI_ENTITY_DECOMPOSE": "0"}
+
+
+class TestMultiEntityRerankFloor:
+    """Per-KB override of RAG_MULTI_ENTITY_RERANK_FLOOR env. Phase 1 of the
+    2026-05-04 multi-entity-elaborate-answers spec."""
+
+    def test_accepts_valid_int(self) -> None:
+        from ext.services import kb_config
+        assert kb_config.validate_config(
+            {"multi_entity_rerank_floor": 8}
+        ) == {"multi_entity_rerank_floor": 8}
+
+    def test_accepts_lower_bound(self) -> None:
+        from ext.services import kb_config
+        assert kb_config.validate_config(
+            {"multi_entity_rerank_floor": 1}
+        ) == {"multi_entity_rerank_floor": 1}
+
+    def test_accepts_upper_bound(self) -> None:
+        from ext.services import kb_config
+        assert kb_config.validate_config(
+            {"multi_entity_rerank_floor": 50}
+        ) == {"multi_entity_rerank_floor": 50}
+
+    def test_rejects_below_lower_bound(self) -> None:
+        from ext.services import kb_config
+        # 0 silently dropped — out-of-range = inherit env default
+        assert kb_config.validate_config(
+            {"multi_entity_rerank_floor": 0}
+        ) == {}
+
+    def test_rejects_above_upper_bound(self) -> None:
+        from ext.services import kb_config
+        assert kb_config.validate_config(
+            {"multi_entity_rerank_floor": 51}
+        ) == {}
+
+    def test_rejects_string(self) -> None:
+        from ext.services import kb_config
+        # Strings without int() coercion drop silently
+        assert kb_config.validate_config(
+            {"multi_entity_rerank_floor": "high"}
+        ) == {}
+
+    def test_coerces_string_int(self) -> None:
+        from ext.services import kb_config
+        assert kb_config.validate_config(
+            {"multi_entity_rerank_floor": "10"}
+        ) == {"multi_entity_rerank_floor": 10}
+
+    def test_emits_rerank_floor_env(self) -> None:
+        """Per-KB stamp must round-trip through config_to_env_overrides
+        so flags.get sees it at the rerank-stage read site. Without this
+        the per-KB override is silently dropped."""
+        from ext.services import kb_config
+        env = kb_config.config_to_env_overrides(
+            {"multi_entity_rerank_floor": 8}
+        )
+        assert env == {"RAG_MULTI_ENTITY_RERANK_FLOOR": "8"}
+
+
+class TestSubtopicDecompose:
+    """Phase 3 / item 5 — per-KB master gate for two-axis decompose."""
+
+    def test_accepts_true(self) -> None:
+        from ext.services import kb_config
+        assert kb_config.validate_config(
+            {"subtopic_decompose": True}
+        ) == {"subtopic_decompose": True}
+
+    def test_accepts_false(self) -> None:
+        from ext.services import kb_config
+        assert kb_config.validate_config(
+            {"subtopic_decompose": False}
+        ) == {"subtopic_decompose": False}
+
+    def test_emits_subtopic_decompose_env(self) -> None:
+        """Per-KB stamp must round-trip through config_to_env_overrides
+        so flags.get sees it at the bridge read site. Without this the
+        per-KB override is silently dropped."""
+        from ext.services import kb_config
+        env = kb_config.config_to_env_overrides({"subtopic_decompose": True})
+        assert env == {"RAG_SUBTOPIC_DECOMPOSE": "1"}
+
+
+class TestSubtopicKeywords:
+    """Phase 3 / item 5 — per-KB subtopic-keywords table."""
+
+    def test_accepts_dict_of_str_to_list(self) -> None:
+        from ext.services import kb_config
+        kw = {
+            "visits": ["visit", "vis", "inspection"],
+            "operations": ["operation", "exercise"],
+        }
+        assert kb_config.validate_config(
+            {"subtopic_keywords": kw}
+        ) == {"subtopic_keywords": kw}
+
+    def test_rejects_non_dict(self) -> None:
+        from ext.services import kb_config
+        assert kb_config.validate_config(
+            {"subtopic_keywords": ["a", "b"]}
+        ) == {}
+
+    def test_rejects_dict_with_non_string_key(self) -> None:
+        from ext.services import kb_config
+        assert kb_config.validate_config(
+            {"subtopic_keywords": {1: ["x"]}}
+        ) == {}
+
+    def test_rejects_dict_with_non_list_value(self) -> None:
+        from ext.services import kb_config
+        assert kb_config.validate_config(
+            {"subtopic_keywords": {"visits": "not a list"}}
+        ) == {}
+
+    def test_strips_non_string_list_items(self) -> None:
+        from ext.services import kb_config
+        out = kb_config.validate_config(
+            {"subtopic_keywords": {"visits": ["visit", 42, None, "vis"]}}
+        )
+        assert out == {"subtopic_keywords": {"visits": ["visit", "vis"]}}
+
+    def test_empty_dict_accepted(self) -> None:
+        from ext.services import kb_config
+        assert kb_config.validate_config(
+            {"subtopic_keywords": {}}
+        ) == {"subtopic_keywords": {}}

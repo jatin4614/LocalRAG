@@ -2,7 +2,7 @@
 
 Three pure functions:
 
-* ``should_decompose(entities, flag_on, intent) -> bool`` — gate.
+* ``should_decompose(entities, subtopics, flag_on, intent) -> (mode, bool)`` — gate.
 * ``build_sub_queries(query, entities) -> list[(entity, sub_query)]`` —
   builds focus-shifted sub-queries.
 * ``merge_with_quota(per_entity_hits, k_min_per_entity, k_total) ->
@@ -26,42 +26,49 @@ class _FakeHit:
 
 class TestShouldDecompose:
     def test_flag_off_returns_false(self) -> None:
-        assert multi_query.should_decompose(
+        mode, on = multi_query.should_decompose(
             entities=["A", "B", "C"], flag_on=False, intent="specific",
-        ) is False
+        )
+        assert on is False
 
     def test_zero_entities_returns_false(self) -> None:
-        assert multi_query.should_decompose(
+        mode, on = multi_query.should_decompose(
             entities=[], flag_on=True, intent="specific",
-        ) is False
+        )
+        assert on is False
 
     def test_one_entity_returns_false(self) -> None:
         # Single-entity queries go through the existing path.
-        assert multi_query.should_decompose(
+        mode, on = multi_query.should_decompose(
             entities=["A"], flag_on=True, intent="specific",
-        ) is False
+        )
+        assert on is False
 
     def test_metadata_intent_returns_false(self) -> None:
         # Catalog questions never decompose.
-        assert multi_query.should_decompose(
+        mode, on = multi_query.should_decompose(
             entities=["A", "B"], flag_on=True, intent="metadata",
-        ) is False
+        )
+        assert on is False
 
     def test_two_entities_flag_on_returns_true(self) -> None:
-        assert multi_query.should_decompose(
+        mode, on = multi_query.should_decompose(
             entities=["A", "B"], flag_on=True, intent="specific",
-        ) is True
+        )
+        assert (mode, on) == ("entity", True)
 
     def test_intent_none_treated_as_specific(self) -> None:
         # Defensive: if intent classifier didn't run, decompose anyway.
-        assert multi_query.should_decompose(
+        mode, on = multi_query.should_decompose(
             entities=["A", "B"], flag_on=True, intent=None,
-        ) is True
+        )
+        assert on is True
 
     def test_global_intent_decomposes(self) -> None:
-        assert multi_query.should_decompose(
+        mode, on = multi_query.should_decompose(
             entities=["A", "B"], flag_on=True, intent="global",
-        ) is True
+        )
+        assert on is True
 
 
 class TestBuildSubQueries:
@@ -220,3 +227,186 @@ class TestMergeWithQuota:
         )
         # Quota satisfied (1 each); final list sorted by score desc.
         assert [h.id for h in out] == ["B1", "C1", "A1"]
+
+
+class TestShouldDecomposeTwoAxis:
+    """Phase 3 — two-axis return: ('none' | 'entity' | 'subtopic' | 'both', bool)."""
+
+    def test_no_entities_no_subtopics_returns_none(self) -> None:
+        mode, on = multi_query.should_decompose(
+            entities=[], subtopics=[], flag_on=True, intent="specific",
+        )
+        assert (mode, on) == ("none", False)
+
+    def test_two_entities_no_subtopics_returns_entity(self) -> None:
+        mode, on = multi_query.should_decompose(
+            entities=["A", "B"], subtopics=[], flag_on=True, intent="specific",
+        )
+        assert (mode, on) == ("entity", True)
+
+    def test_no_entities_two_subtopics_returns_subtopic(self) -> None:
+        mode, on = multi_query.should_decompose(
+            entities=[], subtopics=["visits", "ops"], flag_on=True, intent="specific",
+        )
+        assert (mode, on) == ("subtopic", True)
+
+    def test_two_entities_two_subtopics_returns_both(self) -> None:
+        mode, on = multi_query.should_decompose(
+            entities=["A", "B"], subtopics=["x", "y"], flag_on=True, intent="specific",
+        )
+        assert (mode, on) == ("both", True)
+
+    def test_metadata_intent_returns_none(self) -> None:
+        mode, on = multi_query.should_decompose(
+            entities=["A", "B"], subtopics=["x", "y"],
+            flag_on=True, intent="metadata",
+        )
+        assert (mode, on) == ("none", False)
+
+    def test_flag_off_returns_none(self) -> None:
+        mode, on = multi_query.should_decompose(
+            entities=["A", "B"], subtopics=["x", "y"],
+            flag_on=False, intent="specific",
+        )
+        assert (mode, on) == ("none", False)
+
+
+class TestBuildSubQueriesTwoAxis:
+    def test_n_x_m_pairs(self) -> None:
+        out = multi_query.build_sub_queries_two_axis(
+            "Give all updates",
+            entities=["A", "B"],
+            subtopics=["visits", "ops"],
+        )
+        assert len(out) == 4
+        assert out[0] == ("A", "visits", "Give all updates (focus on A — visits)")
+        assert out[1] == ("A", "ops", "Give all updates (focus on A — ops)")
+        assert out[2] == ("B", "visits", "Give all updates (focus on B — visits)")
+        assert out[3] == ("B", "ops", "Give all updates (focus on B — ops)")
+
+    def test_empty_entities_returns_empty(self) -> None:
+        assert multi_query.build_sub_queries_two_axis(
+            "x", entities=[], subtopics=["a", "b"],
+        ) == []
+
+    def test_empty_subtopics_returns_empty(self) -> None:
+        # Two-axis function rejects subtopics=[]; caller should fall back
+        # to the single-axis build_sub_queries
+        assert multi_query.build_sub_queries_two_axis(
+            "x", entities=["A", "B"], subtopics=[],
+        ) == []
+
+    def test_blank_query_uses_placeholder(self) -> None:
+        out = multi_query.build_sub_queries_two_axis(
+            "", entities=["A"], subtopics=["x"],
+        )
+        assert out == [("A", "x", "(no query) (focus on A — x)")]
+
+
+class TestMergeWithTwoAxisQuota:
+    def _hits(self, scores: list[tuple[str, str, int, float]]):
+        # (entity, subtopic, hit_id, score) -> {(e,s): [hit, ...]}
+        out: dict = {}
+        for e, s, hid, sc in scores:
+            out.setdefault((e, s), []).append(_FakeHit(id=hid, score=sc))
+        for k in out:
+            out[k].sort(key=lambda h: h.score, reverse=True)
+        return out
+
+    def test_cell_floor_satisfied(self) -> None:
+        per_cell = self._hits([
+            ("A", "x", 1, 1.0), ("A", "x", 2, 0.9),
+            ("A", "y", 3, 0.8), ("A", "y", 4, 0.7),
+            ("B", "x", 5, 0.6), ("B", "x", 6, 0.5),
+            ("B", "y", 7, 0.4), ("B", "y", 8, 0.3),
+        ])
+        out = multi_query.merge_with_two_axis_quota(
+            per_cell_hits=per_cell,
+            k_min_per_cell=1,
+            k_min_per_entity=2,
+            k_min_per_subtopic=2,
+            k_total=8,
+        )
+        ids = [h.id for h in out]
+        # Each cell got at least 1 hit; final sorted by score desc
+        assert ids == [1, 2, 3, 4, 5, 6, 7, 8]
+
+    def test_dedupe_by_id(self) -> None:
+        # Same hit appearing in two cells should appear once in output
+        h = _FakeHit(id=99, score=1.0)
+        per_cell = {
+            ("A", "x"): [h],
+            ("A", "y"): [h],
+            ("B", "x"): [_FakeHit(id=2, score=0.5)],
+            ("B", "y"): [_FakeHit(id=3, score=0.4)],
+        }
+        out = multi_query.merge_with_two_axis_quota(
+            per_cell_hits=per_cell,
+            k_min_per_cell=1, k_min_per_entity=1,
+            k_min_per_subtopic=1, k_total=4,
+        )
+        ids = [h.id for h in out]
+        assert ids.count(99) == 1
+
+    def test_total_cap_respected(self) -> None:
+        per_cell = self._hits([
+            ("A", "x", i, 1.0 - i * 0.01) for i in range(20)
+        ])
+        out = multi_query.merge_with_two_axis_quota(
+            per_cell_hits=per_cell,
+            k_min_per_cell=2,
+            k_min_per_entity=2,
+            k_min_per_subtopic=2,
+            k_total=5,
+        )
+        assert len(out) == 5
+
+    def test_entity_floor_recovery_when_cell_empty(self) -> None:
+        # 5 PoK x visits has 0 hits but 5 PoK x ops has plenty.
+        # Entity-floor recovery pulls extra ops chunks so the per-entity
+        # floor is met.
+        per_cell = self._hits([
+            ("75 Inf", "visits", 1, 0.9), ("75 Inf", "visits", 2, 0.8),
+            ("75 Inf", "ops",    3, 0.7), ("75 Inf", "ops",    4, 0.6),
+            # 5 PoK has 0 visits but 4 ops:
+            ("5 PoK", "ops",     5, 0.5), ("5 PoK", "ops",     6, 0.4),
+            ("5 PoK", "ops",     7, 0.3), ("5 PoK", "ops",     8, 0.2),
+        ])
+        out = multi_query.merge_with_two_axis_quota(
+            per_cell_hits=per_cell,
+            k_min_per_cell=1,
+            k_min_per_entity=3,    # 5 PoK must end up with ≥3 chunks
+            k_min_per_subtopic=2,
+            k_total=10,
+        )
+        ids = [h.id for h in out]
+        # 5 PoK should have ≥3 of its 4 ops chunks (5,6,7,8)
+        pok_ids = [i for i in ids if i in (5, 6, 7, 8)]
+        assert len(pok_ids) >= 3
+
+    def test_leftover_cell_does_not_inflate_floors(self) -> None:
+        """The __leftover__ synthetic cell from _apply_two_axis_quota
+        should NOT consume entity/subtopic-floor quota slots — leftover
+        hits should only enter via the top-up pass."""
+        per_cell = {
+            ("A", "x"): [_FakeHit(id=1, score=0.9), _FakeHit(id=2, score=0.8)],
+            # Leftover hits — would have inflated floor recovery before fix
+            ("__leftover__", "__leftover__"): [
+                _FakeHit(id=10, score=0.5), _FakeHit(id=11, score=0.4),
+                _FakeHit(id=12, score=0.3),
+            ],
+        }
+        out = multi_query.merge_with_two_axis_quota(
+            per_cell_hits=per_cell,
+            k_min_per_cell=1,
+            k_min_per_entity=2,
+            k_min_per_subtopic=2,
+            k_total=4,
+        )
+        ids = [h.id for h in out]
+        # All 4 final slots: A's 2 hits (cell-quota + entity-floor satisfied
+        # without pulling __leftover__) + 2 leftover via top-up.
+        # The fix ensures __leftover__ is NOT treated as a real entity that
+        # demands its own k_min_per_entity quota.
+        assert 1 in ids and 2 in ids
+        assert len(ids) == 4

@@ -186,61 +186,76 @@ Per-entity floor multiplied by entity count = floor for the post-rerank pool. Wi
 
 Empirically validated at 8 in the brainstorm runs. Bounds upper of 50 is the same as `multi_entity_min_per_entity`'s — anything above that crowds out single-entity recall on the same KB.
 
-### 4.3 Item 3 — Widen the rerank pool + budget headroom
+### 4.3 Item 3 — Widen the rerank pool + exploit the 128K context window
 
-#### 4.3.1 What changes (corrected after empirical re-check)
+#### 4.3.1 What changes (revised 2026-05-04 after operator clarified Gemma-4 ctx)
 
-The 2026-05-04 brainstorm initially framed this as a budget bump, but the actual empirical trace shows budget was **never** the bottleneck. With 40 post-rerank chunks at ~120 tokens each + sibling expansion = ~5-6K tokens of retrieval context — well under either 22K or 35K budget. The lever that actually grew the answer was item 2 (floor 3 → 8 → final pool 12 → 40 chunks).
+CLAUDE.md said "32K ctx" for vllm-chat. **Operator correction 2026-05-04: Gemma-4-31B-it-AWQ supports 128K natively** — the 32K cap was either a vllm `--max-model-len` setting or a stale CLAUDE.md note. With 128K available we have ~4× the headroom of the original Phase 1 design. This section is rewritten to exploit it.
 
-So item 3 has two parts:
+The 2026-05-04 brainstorm showed budget was never the bottleneck at 22K — 40 post-rerank chunks × 120 tokens = ~5-6K of actual retrieval context. The lever that grew the answer was item 2 (rerank-stage floor 3→8). Item 3 widens the pool further so the LLM has room for genuinely elaborate, well-cited answers.
 
-- **3a. Per-KB `rerank_top_k` lift** — raise from 50 to 120 in KB 2's `rag_config`. This is the actual cap on post-rerank pool depth. With `_final_k = max(rerank_top_k, len(entities) * floor)`, `rerank_top_k=120` lets a 4-entity query keep up to 120 chunks past the cross-encoder cut (was 50). Budget then chooses how many fit; this gives MMR room to diversify and context-expand room to add siblings.
-- **3b. Budget headroom bump 22000 → 28000** — for the 4-entity * 5-subtopic * sibling-expanded case, 120 chunks × 120 tokens + 60 sibling chunks × 120 tokens = ~22K tokens. 28K leaves 6K headroom for prompt-prefix + spotlight tags + intent preamble + datetime preamble. Conservative — leaves 4K of LLM-ctx room for response generation.
+Three parts:
 
-#### 4.3.2 LLM context-window arithmetic
+- **3a. Per-KB `rerank_top_k` lift** — raise from 50 to 200 in KB 2's `rag_config`. With `_final_k = max(rerank_top_k, len(entities) * floor)`, `rerank_top_k=200` lets a 4-entity 5-subtopic query keep up to 200 chunks past the cross-encoder cut (was 50). MMR has room to diversify; context-expand has room to add siblings.
+- **3b. Budget bump 22000 → 80000** — exploit the 128K window. For the 4-entity × 5-subtopic case at floor=12 (see 3c) plus sibling expansion: 200 reranked × 120 tokens + 60 siblings × 120 tokens = ~31K tokens of retrieval context. 80K headroom future-proofs the doc-summary tier (Phase 2) and lets the LLM see deep per-doc context for global-intent queries. `RAG_GLOBAL_BUDGET_TOKENS` lifts in lockstep, 22000 → 100000.
+- **3c. Per-entity rerank-stage floor 8 → 12** — with the wider pool from 3a, each entity can comfortably hold 12 chunks past the rerank cut (was 8 in the original spec). 4 entities × 12 = 48-chunk floor, leaving room for top-up and subtopic axis.
 
-Gemma-4-31B-it-AWQ has 32K ctx (CLAUDE.md §3). Budget for retrieval context + system prompt (~3-5K) + user message (~1K) + chat history (~2K typical) + response output must fit:
+#### 4.3.2 LLM context-window arithmetic (128K)
 
-```
-22000 (current budget) + 5000 (sys) + 1000 (user) + 2000 (hist) + max_response = 32000
-                                                                ⇒ max_response ≤ 2000
-```
-
-That's tight. Long answers were getting truncated mid-sentence on the brigade query class.
-
-After 3a + 3b:
+Gemma-4-31B-it-AWQ supports 128K ctx (verified 2026-05-04). Budget for retrieval context + system prompt + user message + chat history + response output must fit:
 
 ```
-28000 (new budget) + 5000 + 1000 + 2000 + max_response = 32000
-                                         ⇒ max_response ≤ 4000  ← comfortable for elaborate answers
+80000 (new budget) + 5000 (sys) + 1500 (user, multi-entity queries are longer)
+                   + 4000 (hist) + max_response = 128000
+                                  ⇒ max_response ≤ 37500
 ```
 
-If the operator later swaps in a longer-context model (e.g. a 128K-ctx variant), revisit and lift budget to 50-60K.
+That's room for very elaborate enumerated answers (the operator's stated goal). In practice we'd cap response at ~12000-15000 tokens to keep latency reasonable; the remaining ~25K is headroom for intent-preamble, spotlight tags, and any future feature that wants context room.
 
-#### 4.3.3 What about `RAG_GLOBAL_BUDGET_TOKENS`?
+The original spec had 4K available for response on a (claimed) 32K window. The new arithmetic gives ~10× the response headroom and ~3× the retrieval budget.
 
-Global intent's budget is `RAG_GLOBAL_BUDGET_TOKENS=22000` (compose default). After Phase 2 (entity-coverage doc summaries), more doc summaries reach the LLM per query, so global budget could plausibly want a similar bump. But we won't know until item 4 ships and we measure. Leave at 22000 in Phase 1; revisit at the end of Phase 2 once the new summaries are flowing.
+#### 4.3.3 vllm `--max-model-len` check
 
-#### 4.3.4 Compose env mapping
+Action item before Phase 1 ships: verify the deployed `vllm-chat` container's `--max-model-len` flag. If it's at 32768 (the cause of the CLAUDE.md note), bump it to 131072 in `compose/docker-compose.yml`'s `vllm-chat.command` array. Without this lift, raising `RAG_BUDGET_TOKENS` past 22-25K silently truncates inside vllm regardless of model capability. This is recorded as Task 3a in Phase 1 deliverables below.
 
-`compose/.env.example` adds `RAG_RERANK_TOP_K_DEFAULT=120` (env-side default — per-KB stamp wins). Or stamp directly on KB 2 via `PATCH /api/kb/2/config`. Recommend the per-KB stamp — `rerank_top_k` per-KB already in `VALID_INT_KEYS` with bounds `[1, 1000]`, so this is config-only, no code change.
+The model itself (Gemma-4-31B-it-AWQ at QuantTrio) was trained / quantized with full 128K context support per the model card. We're not stretching the model — we're un-throttling vllm.
 
-`RAG_BUDGET_TOKENS` already in compose env block (line ~599). Bump default 22000 → 28000.
+#### 4.3.4 Why not push budget even higher (100K+)?
+
+Three reasons to stop at 80K for retrieval context:
+
+1. **Lost-in-the-middle.** Even capable LLMs ignore content in the middle of very long contexts (Liu et al, 2023). Past ~80K of retrieval, the marginal answer-quality gain per added token approaches zero.
+2. **Latency.** TTFT (time-to-first-token) on Gemma-4-31B scales roughly linearly with input tokens above 30K. 80K input adds 2-4s vs 22K input on this hardware (RTX 6000 Ada 48GB). Acceptable per operator's "latency OK to grow" — but 100K+ starts feeling sluggish.
+3. **Diminishing return on rerank quality.** With rerank_top_k=200 the cross-encoder is already operating at the edge of its useful precision band (bge-reranker-v2-m3 is trained on top-100 settings). Going to 500+ candidates gets us mostly noise.
+
+#### 4.3.5 Compose env mapping
+
+`compose/.env.example` adds:
+- `RAG_BUDGET_TOKENS=80000` (raised from 22000)
+- `RAG_GLOBAL_BUDGET_TOKENS=100000` (raised from 22000)
+- `RAG_MULTI_ENTITY_RERANK_FLOOR=12` (raised from 8 in the original spec — Item 2 amends to 12 in light of the 128K window)
+- Per-KB `rerank_top_k=200` set via `PATCH /api/kb/2/config` (env-side default unchanged at 12; per-KB stamp wins).
+
+`RAG_BUDGET_TOKENS` and `RAG_GLOBAL_BUDGET_TOKENS` already mapped in `compose/docker-compose.yml`. `RAG_MULTI_ENTITY_RERANK_FLOOR` mapping lands in Task 2.
+
+vllm-chat `--max-model-len` lift (Task 3a) is the only NEW compose change beyond env defaults.
 
 ### 4.4 Phase 1 deliverables
 
-- `kb_config.py` adds `multi_entity_rerank_floor` to `VALID_INT_KEYS` with bounds `[1, 50]`.
+- `kb_config.py` adds `multi_entity_rerank_floor` to `VALID_INT_KEYS` with bounds `[1, 50]` and to `_KEY_TO_ENV` (so per-KB stamps reach `flags.get`).
 - `chat_rag_bridge.py` no code change at the floor read site (already uses `flags.get`); add a one-line debug log when floor is non-default so the operator can see it firing.
 - `compose/.env.example` and `compose/docker-compose.yml`:
-  - new env mapping `RAG_MULTI_ENTITY_RERANK_FLOOR` (default 8) on `open-webui` + `celery-worker`.
-  - `RAG_BUDGET_TOKENS` default raised 22000 → 28000.
+  - new env mapping `RAG_MULTI_ENTITY_RERANK_FLOOR` (default 12) on `open-webui` + `celery-worker`.
+  - `RAG_BUDGET_TOKENS` default raised 22000 → 80000 (exploits 128K Gemma ctx).
+  - `RAG_GLOBAL_BUDGET_TOKENS` default raised 22000 → 100000.
+  - `vllm-chat.command` `--max-model-len` lift to 131072 (Task 3a — required before budget bump takes effect).
   - `RAG_INGEST_BLOCK_MIN_TOKENS` mapping (already added during 2026-05-04 brainstorm) — keep at default 200.
 - KB 2 `rag_config` PATCH:
   - `chunking_strategy: "window"`, `chunk_tokens: 200`, `overlap_tokens: 30`
-  - `rerank_top_k: 120` (raised from 50)
-  - `multi_entity_rerank_floor: 8` (or rely on env)
+  - `rerank_top_k: 200` (raised from 50; was originally 120 pre-128K-correction)
+  - `multi_entity_rerank_floor: 12` (or rely on env)
 - Operator script `scripts/wipe_and_reingest.py` (see §7).
-- Per-KB chat-completions smoke test: brigade query against KB 2 returns ≥4 facts/brigade across all 4 brigades, ≥6K total chars.
+- Per-KB chat-completions smoke test: brigade query against KB 2 returns ≥6 facts/brigade across all 4 brigades, ≥10K total chars (revised up from ≥4 facts / ≥6K chars to match the wider 128K budget).
 - Eval-gate: `make eval-gate` no >5pp nDCG@10 regression vs the committed baseline. Updated baseline if shape of the gold-set queries changes.
 
 ---
