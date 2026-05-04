@@ -189,3 +189,64 @@ class TestMultiEntityRerankFloor:
             {"multi_entity_rerank_floor": 8}
         )
         assert env == {"RAG_MULTI_ENTITY_RERANK_FLOOR": "8"}
+
+
+class TestSubtopicDecompose:
+    """Phase 3 / item 5 — per-KB master gate for two-axis decompose."""
+
+    def test_accepts_true(self) -> None:
+        from ext.services import kb_config
+        assert kb_config.validate_config(
+            {"subtopic_decompose": True}
+        ) == {"subtopic_decompose": True}
+
+    def test_accepts_false(self) -> None:
+        from ext.services import kb_config
+        assert kb_config.validate_config(
+            {"subtopic_decompose": False}
+        ) == {"subtopic_decompose": False}
+
+
+class TestSubtopicKeywords:
+    """Phase 3 / item 5 — per-KB subtopic-keywords table."""
+
+    def test_accepts_dict_of_str_to_list(self) -> None:
+        from ext.services import kb_config
+        kw = {
+            "visits": ["visit", "vis", "inspection"],
+            "operations": ["operation", "exercise"],
+        }
+        assert kb_config.validate_config(
+            {"subtopic_keywords": kw}
+        ) == {"subtopic_keywords": kw}
+
+    def test_rejects_non_dict(self) -> None:
+        from ext.services import kb_config
+        assert kb_config.validate_config(
+            {"subtopic_keywords": ["a", "b"]}
+        ) == {}
+
+    def test_rejects_dict_with_non_string_key(self) -> None:
+        from ext.services import kb_config
+        assert kb_config.validate_config(
+            {"subtopic_keywords": {1: ["x"]}}
+        ) == {}
+
+    def test_rejects_dict_with_non_list_value(self) -> None:
+        from ext.services import kb_config
+        assert kb_config.validate_config(
+            {"subtopic_keywords": {"visits": "not a list"}}
+        ) == {}
+
+    def test_strips_non_string_list_items(self) -> None:
+        from ext.services import kb_config
+        out = kb_config.validate_config(
+            {"subtopic_keywords": {"visits": ["visit", 42, None, "vis"]}}
+        )
+        assert out == {"subtopic_keywords": {"visits": ["visit", "vis"]}}
+
+    def test_empty_dict_accepted(self) -> None:
+        from ext.services import kb_config
+        assert kb_config.validate_config(
+            {"subtopic_keywords": {}}
+        ) == {"subtopic_keywords": {}}
