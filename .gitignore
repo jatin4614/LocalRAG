@@ -46,3 +46,6 @@ qdrant-backups/
 
 # Loose snapshots that may accumulate
 *.snapshot
+
+# Git worktrees (subagent-driven plan execution)
+.worktrees/
