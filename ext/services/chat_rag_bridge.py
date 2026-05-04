@@ -1025,6 +1025,93 @@ def _apply_entity_quota(
     return selected[:final_k]
 
 
+def _apply_two_axis_quota(
+    *,
+    reranked: list,
+    entities: list,
+    subtopics: list,
+    subtopic_keywords: dict[str, list[str]],
+    per_cell_floor: int,
+    per_entity_floor: int,
+    per_subtopic_floor: int,
+    final_k: int,
+    synonyms: list[list[str]] | None = None,
+) -> list:
+    """Phase 3 / item 5 — two-axis post-rerank quota.
+
+    Attributes each hit to (entity, subtopic) cells using:
+      - entity attribution: case-insensitive substring of any entity name
+        (or any synonym variant if ``synonyms`` is provided)
+      - subtopic attribution: case-insensitive substring of any keyword
+        in ``subtopic_keywords[subtopic]``
+
+    Then dispatches to ``merge_with_two_axis_quota`` shape — but
+    operating on already-reranked hits with their cross-encoder scores
+    preserved (no re-scoring).
+
+    If ``entities`` or ``subtopics`` is empty, short-circuits to
+    ``reranked[:final_k]`` (single-axis or no-quota behaviour).
+    """
+    if not reranked or not entities or not subtopics:
+        return list(reranked[:final_k])
+
+    # Pre-compute entity needle sets (synonym-expanded if available)
+    def _entity_needles(e: str) -> set[str]:
+        out = {e.lower()}
+        if not synonyms:
+            return out
+        for cls in synonyms:
+            if any(v.lower() == e.lower() for v in cls):
+                out.update(v.lower() for v in cls)
+        return out
+
+    entity_needle_map = {e: _entity_needles(e) for e in entities}
+
+    # Pre-lowercase subtopic keyword variants
+    subtopic_kw_map = {
+        s: [v.lower() for v in subtopic_keywords.get(s, [s])]
+        for s in subtopics
+    }
+
+    # Attribute each hit to one or more (entity, subtopic) cells
+    per_cell: dict[tuple[str, str], list] = {}
+    for hit in reranked:
+        text = ((hit.payload or {}).get("text") or "").lower()
+        if not text:
+            continue
+        matched_entities = [
+            e for e, needles in entity_needle_map.items()
+            if any(n in text for n in needles)
+        ]
+        matched_subtopics = [
+            s for s, kws in subtopic_kw_map.items()
+            if any(kw in text for kw in kws)
+        ]
+        # A hit that matches no entity OR no subtopic is "leftover" — kept
+        # for the top-up pass via merge.
+        if not matched_entities or not matched_subtopics:
+            per_cell.setdefault(("__leftover__", "__leftover__"), []).append(hit)
+            continue
+        # Attribute to every matching cell (the merge dedupes by id)
+        for e in matched_entities:
+            for s in matched_subtopics:
+                per_cell.setdefault((e, s), []).append(hit)
+
+    # Sort each cell by score
+    for k in per_cell:
+        per_cell[k].sort(key=lambda h: h.score, reverse=True)
+
+    # Hand off to multi_query.merge_with_two_axis_quota
+    from .multi_query import merge_with_two_axis_quota
+    return merge_with_two_axis_quota(
+        per_cell_hits=per_cell,
+        k_min_per_cell=per_cell_floor,
+        k_min_per_entity=per_entity_floor,
+        k_min_per_subtopic=per_subtopic_floor,
+        k_total=final_k,
+    )
+
+
 async def _emit(cb: Optional[Callable[[dict], Awaitable[None]]], event: dict) -> None:
     """Call the progress callback, swallowing any errors so a broken SSE
     client never breaks retrieval. No-op when cb is None."""
