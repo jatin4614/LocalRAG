@@ -228,13 +228,18 @@ services:
       - "${CHAT_MODEL}"
       - "--served-model-name"
       - "orgchat-chat"
+      # 2026-05-04 — explicit ctx lift. Model card supports 128K; older
+      # deploys may have shipped at 32K via a stale --max-model-len.
+      # Without this, RAG_BUDGET_TOKENS > 25K silently truncates inside
+      # vllm regardless of the bridge's budget setting. See spec §4.3.3.
       - "--max-model-len"
-      - "32768"
+      - "131072"
       # GPU 0 (RTX 6000 Ada 48 GB). TEI (Phase 1) and open-webui reranker
       # (Phase 3) are on GPU 1 (Blackwell). Remaining GPU 0 tenant: ~7.3 GB
       # of frams-recognition-worker-* (separate project).
-      # 0.70 × 48 = 33.6 GB for vllm: weights (~20 GB) + FP8 KV cache (~13 GB)
-      # → ~28k token budget. Leaves ~5 GB headroom on GPU 0 beyond frams +
+      # 0.70 × 48 = 33.6 GB for vllm: weights (~20 GB) + FP8 KV cache at
+      # 128K sequences (fp8 KV, ~8 GB for typical concurrent load) leaves
+      # headroom. Leaves ~5 GB headroom on GPU 0 beyond frams +
       # vllm + overhead — safer margin against transient spikes.
       - "--gpu-memory-utilization"
       - "0.70"
@@ -592,11 +597,19 @@ services:
       # budget for global intent only; specific/metadata stay at 10K.
       RAG_GLOBAL_DRILLDOWN: ${RAG_GLOBAL_DRILLDOWN:-1}
       RAG_GLOBAL_DRILLDOWN_K: ${RAG_GLOBAL_DRILLDOWN_K:-2}
-      RAG_GLOBAL_BUDGET_TOKENS: ${RAG_GLOBAL_BUDGET_TOKENS:-22000}
-      # Bumped 10000 -> 22000 on 2026-05-01 (Phase 6.X). Multi-entity
-      # decomposition + context_expand inflate per-hit tokens; prior
-      # default evicted down to 3 hits on a 4-brigade query.
-      RAG_BUDGET_TOKENS: ${RAG_BUDGET_TOKENS:-22000}
+      # Bumped 22000 -> 100000 on 2026-05-04. Phase 2 entity-coverage
+      # doc summaries push more level=doc points into context for
+      # global-intent queries; 100K leaves room for that plus drilldown.
+      RAG_GLOBAL_BUDGET_TOKENS: ${RAG_GLOBAL_BUDGET_TOKENS:-100000}
+      # Bumped 22000 -> 80000 on 2026-05-04 (Phase 1 / Item 3 of
+      # multi-entity-elaborate-answers spec). Exploits the 128K Gemma-4
+      # ctx confirmed by operator 2026-05-04. With rerank_top_k=200
+      # per-KB and floor=12, post-rerank pool can grow to ~30-40K tokens;
+      # 80K budget gives headroom for context-expand siblings, datetime/
+      # spotlight preambles, and future entity-coverage doc summaries
+      # (Phase 2). Leaves ~38K for response generation on 128K ctx after
+      # sys/user/history. See spec §4.3 for the full arithmetic.
+      RAG_BUDGET_TOKENS: ${RAG_BUDGET_TOKENS:-80000}
       # Cap MMR re-embed batch size. Pairs with multi-entity
       # decomposition: cross-encoder already ranked the pool, MMR
       # only diversifies the top band — sending all 200 candidates
