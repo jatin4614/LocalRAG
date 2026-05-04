@@ -622,6 +622,12 @@ services:
       RAG_ENTITY_TEXT_FILTER: ${RAG_ENTITY_TEXT_FILTER:-0}
       RAG_QU_ENTITY_EXTRACT: ${RAG_QU_ENTITY_EXTRACT:-0}
       RAG_MULTI_ENTITY_MIN_PER_ENTITY: ${RAG_MULTI_ENTITY_MIN_PER_ENTITY:-10}
+      # 2026-05-04 — per-entity rerank-stage floor (Phase 1 / Item 2).
+      # Bumps post-cross-encoder pool floor for multi-entity queries.
+      # Default 12 = each named entity gets 12 chunks past the rerank cut.
+      # Original spec said 8; revised up to 12 after confirming Gemma-4
+      # supports 128K ctx (operator correction 2026-05-04, see spec §4.3).
+      RAG_MULTI_ENTITY_RERANK_FLOOR: ${RAG_MULTI_ENTITY_RERANK_FLOOR:-12}
       # Plan B Phase 5.4 — per-document summary tier. When on, each KB
       # ingest emits one ``level=doc`` summary point (chat-model 3-line
       # synopsis, mirrored to kb_documents.doc_summary). Required for
@@ -838,6 +844,10 @@ services:
       RAG_HYBRID: ${RAG_HYBRID:-1}
       RAG_COLBERT: ${RAG_COLBERT:-1}
       RAG_RERANK: ${RAG_RERANK:-1}
+      # 2026-05-04 — per-entity rerank-stage floor (Phase 1 / Item 2).
+      # Worker reads this for any retrieval path it uses (eval scheduler).
+      # Default 12 — see open-webui block above for the 128K context note.
+      RAG_MULTI_ENTITY_RERANK_FLOOR: ${RAG_MULTI_ENTITY_RERANK_FLOOR:-12}
       # The worker also runs ingest_bytes() and writes the doc-summary
       # tier; both sides need the same flag + chat-model URL/key/timeout.
       RAG_DOC_SUMMARIES: ${RAG_DOC_SUMMARIES:-1}
