@@ -42,31 +42,41 @@ _NON_DECOMPOSING_INTENTS = frozenset({"metadata"})
 def should_decompose(
     *,
     entities: Sequence[str],
+    subtopics: Sequence[str] = (),
     flag_on: bool,
     intent: str | None,
-) -> bool:
-    """Gate predicate for multi-query decomposition.
+) -> tuple[str, bool]:
+    """Two-axis gate predicate for multi-query decomposition.
 
-    Returns ``True`` iff all of:
-      * ``flag_on`` — the per-KB or global ``RAG_MULTI_ENTITY_DECOMPOSE``
-        flag is enabled.
-      * ``len(entities) >= 2`` — the extractor produced ≥2 entities.
-        Single-entity queries go through the existing single-query path.
-      * ``intent`` is not ``"metadata"``. Catalog/enumeration queries
-        (``"list documents"``, ``"what files do I have"``) don't fan out.
+    Returns ``(mode, enabled)`` where ``mode`` is one of:
 
-    ``intent=None`` is treated as decomposable — defensive for the case
-    where the intent classifier failed and the bridge is operating
-    blind. Better to fan out and accept the small extra cost than to
-    silently fall through to the broken single-query path.
+    * ``"none"``     — single-axis behaviour, no decompose
+    * ``"entity"``   — N entities, M < 2 subtopics — current single-axis path
+    * ``"subtopic"`` — M subtopics, N < 2 entities — fan out by subtopic only
+    * ``"both"``     — N×M sub-queries with two-axis quotas
+
+    Bound conditions (independent of mode):
+    * ``flag_on`` — env or per-KB master gate
+    * ``intent`` is not ``"metadata"`` — catalog questions never decompose
+
+    ``intent=None`` is treated as decomposable (defensive — mirror of the
+    original gate behaviour).
     """
     if not flag_on:
-        return False
-    if not entities or len(entities) < 2:
-        return False
+        return ("none", False)
     if intent in _NON_DECOMPOSING_INTENTS:
-        return False
-    return True
+        return ("none", False)
+
+    n_e = len(entities or [])
+    n_s = len(subtopics or [])
+
+    if n_e >= 2 and n_s >= 2:
+        return ("both", True)
+    if n_e >= 2:
+        return ("entity", True)
+    if n_s >= 2:
+        return ("subtopic", True)
+    return ("none", False)
 
 
 def build_sub_queries(

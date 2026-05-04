@@ -1601,6 +1601,7 @@ async def _run_pipeline(
                 # doesn't crash when the post-rerank quota check references them.
                 # See docs/superpowers/specs/2026-05-03-retrieval-quality-fix-design.md §1.4.
                 _do_decompose: bool = False
+                _decompose_mode: str = "none"
                 _entities: list[str] = []
                 _entity_floor: int = 0
                 # Tier 2 routing — metadata queries are answered entirely
@@ -1766,8 +1767,9 @@ async def _run_pipeline(
                             from .multi_query import should_decompose
 
                             _entities = extract_entities(query, qu_result=_hybrid)
-                            _do_decompose = should_decompose(
+                            _decompose_mode, _do_decompose = should_decompose(
                                 entities=_entities,
+                                subtopics=[],          # Phase 3 plumbs real subtopics; for now empty
                                 flag_on=True,
                                 intent=_intent,
                             )

@@ -2,7 +2,7 @@
 
 Three pure functions:
 
-* ``should_decompose(entities, flag_on, intent) -> bool`` — gate.
+* ``should_decompose(entities, subtopics, flag_on, intent) -> (mode, bool)`` — gate.
 * ``build_sub_queries(query, entities) -> list[(entity, sub_query)]`` —
   builds focus-shifted sub-queries.
 * ``merge_with_quota(per_entity_hits, k_min_per_entity, k_total) ->
@@ -26,42 +26,49 @@ class _FakeHit:
 
 class TestShouldDecompose:
     def test_flag_off_returns_false(self) -> None:
-        assert multi_query.should_decompose(
+        mode, on = multi_query.should_decompose(
             entities=["A", "B", "C"], flag_on=False, intent="specific",
-        ) is False
+        )
+        assert on is False
 
     def test_zero_entities_returns_false(self) -> None:
-        assert multi_query.should_decompose(
+        mode, on = multi_query.should_decompose(
             entities=[], flag_on=True, intent="specific",
-        ) is False
+        )
+        assert on is False
 
     def test_one_entity_returns_false(self) -> None:
         # Single-entity queries go through the existing path.
-        assert multi_query.should_decompose(
+        mode, on = multi_query.should_decompose(
             entities=["A"], flag_on=True, intent="specific",
-        ) is False
+        )
+        assert on is False
 
     def test_metadata_intent_returns_false(self) -> None:
         # Catalog questions never decompose.
-        assert multi_query.should_decompose(
+        mode, on = multi_query.should_decompose(
             entities=["A", "B"], flag_on=True, intent="metadata",
-        ) is False
+        )
+        assert on is False
 
     def test_two_entities_flag_on_returns_true(self) -> None:
-        assert multi_query.should_decompose(
+        mode, on = multi_query.should_decompose(
             entities=["A", "B"], flag_on=True, intent="specific",
-        ) is True
+        )
+        assert (mode, on) == ("entity", True)
 
     def test_intent_none_treated_as_specific(self) -> None:
         # Defensive: if intent classifier didn't run, decompose anyway.
-        assert multi_query.should_decompose(
+        mode, on = multi_query.should_decompose(
             entities=["A", "B"], flag_on=True, intent=None,
-        ) is True
+        )
+        assert on is True
 
     def test_global_intent_decomposes(self) -> None:
-        assert multi_query.should_decompose(
+        mode, on = multi_query.should_decompose(
             entities=["A", "B"], flag_on=True, intent="global",
-        ) is True
+        )
+        assert on is True
 
 
 class TestBuildSubQueries:
@@ -220,3 +227,45 @@ class TestMergeWithQuota:
         )
         # Quota satisfied (1 each); final list sorted by score desc.
         assert [h.id for h in out] == ["B1", "C1", "A1"]
+
+
+class TestShouldDecomposeTwoAxis:
+    """Phase 3 — two-axis return: ('none' | 'entity' | 'subtopic' | 'both', bool)."""
+
+    def test_no_entities_no_subtopics_returns_none(self) -> None:
+        mode, on = multi_query.should_decompose(
+            entities=[], subtopics=[], flag_on=True, intent="specific",
+        )
+        assert (mode, on) == ("none", False)
+
+    def test_two_entities_no_subtopics_returns_entity(self) -> None:
+        mode, on = multi_query.should_decompose(
+            entities=["A", "B"], subtopics=[], flag_on=True, intent="specific",
+        )
+        assert (mode, on) == ("entity", True)
+
+    def test_no_entities_two_subtopics_returns_subtopic(self) -> None:
+        mode, on = multi_query.should_decompose(
+            entities=[], subtopics=["visits", "ops"], flag_on=True, intent="specific",
+        )
+        assert (mode, on) == ("subtopic", True)
+
+    def test_two_entities_two_subtopics_returns_both(self) -> None:
+        mode, on = multi_query.should_decompose(
+            entities=["A", "B"], subtopics=["x", "y"], flag_on=True, intent="specific",
+        )
+        assert (mode, on) == ("both", True)
+
+    def test_metadata_intent_returns_none(self) -> None:
+        mode, on = multi_query.should_decompose(
+            entities=["A", "B"], subtopics=["x", "y"],
+            flag_on=True, intent="metadata",
+        )
+        assert (mode, on) == ("none", False)
+
+    def test_flag_off_returns_none(self) -> None:
+        mode, on = multi_query.should_decompose(
+            entities=["A", "B"], subtopics=["x", "y"],
+            flag_on=False, intent="specific",
+        )
+        assert (mode, on) == ("none", False)
